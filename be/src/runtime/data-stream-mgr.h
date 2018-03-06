@@ -22,12 +22,12 @@
 #include <list>
 #include <set>
 #include <boost/thread/mutex.hpp>
-#include <boost/thread/condition_variable.hpp>
 #include <boost/unordered_map.hpp>
 #include <boost/unordered_set.hpp>
 
 #include "common/status.h"
 #include "common/object-pool.h"
+#include "runtime/data-stream-mgr-base.h"
 #include "runtime/descriptors.h"  // for PlanNodeId
 #include "util/metrics.h"
 #include "util/promise.h"
@@ -63,21 +63,23 @@ class TRowBatch;
 ///
 /// TODO: The recv buffers used in DataStreamRecvr should count against
 /// per-query memory limits.
-class DataStreamMgr {
+class DataStreamMgr : public DataStreamMgrBase {
  public:
   DataStreamMgr(MetricGroup* metrics);
+  virtual ~DataStreamMgr() override;
 
   /// Create a receiver for a specific fragment_instance_id/node_id destination;
   /// If is_merging is true, the receiver maintains a separate queue of incoming row
   /// batches for each sender and merges the sorted streams from each sender into a
-  /// single stream.
+  /// single stream. 'parent_tracker' is the MemTracker of the exchange node which owns
+  /// this receiver. It's the parent of the MemTracker of the newly created receiver.
   /// Ownership of the receiver is shared between this DataStream mgr instance and the
-  /// caller.
-  std::shared_ptr<DataStreamRecvr> CreateRecvr(
-      RuntimeState* state, const RowDescriptor& row_desc,
-      const TUniqueId& fragment_instance_id, PlanNodeId dest_node_id,
-      int num_senders, int buffer_size, RuntimeProfile* profile,
-      bool is_merging);
+  /// caller. 'client' is the BufferPool's client handle for allocating buffers.
+  /// It's owned by the parent exchange node.
+  std::shared_ptr<DataStreamRecvrBase> CreateRecvr(const RowDescriptor* row_desc,
+      const TUniqueId& fragment_instance_id, PlanNodeId dest_node_id, int num_senders,
+      int64_t buffer_size, bool is_merging, RuntimeProfile* profile,
+      MemTracker* parent_tracker, BufferPool::ClientHandle* client) override;
 
   /// Adds a row batch to the recvr identified by fragment_instance_id/dest_node_id
   /// if the recvr has not been cancelled. sender_id identifies the sender instance
@@ -98,7 +100,7 @@ class DataStreamMgr {
       int sender_id);
 
   /// Closes all receivers registered for fragment_instance_id immediately.
-  void Cancel(const TUniqueId& fragment_instance_id);
+  void Cancel(const TUniqueId& fragment_instance_id) override;
 
  private:
   friend class DataStreamRecvr;

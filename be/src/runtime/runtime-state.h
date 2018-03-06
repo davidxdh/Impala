@@ -32,26 +32,29 @@
 
 namespace impala {
 
-class BufferedBlockMgr;
+class BufferPool;
 class DataStreamRecvr;
 class DescriptorTbl;
-class DiskIoMgr;
-class DiskIoRequestContext;
 class Expr;
 class LlvmCodeGen;
 class MemTracker;
 class ObjectPool;
+class ReservationTracker;
 class RuntimeFilterBank;
 class ScalarFnCall;
 class Status;
 class TimestampValue;
 class TUniqueId;
 class ExecEnv;
-class DataStreamMgr;
+class DataStreamMgrBase;
 class HBaseTableFactory;
 class TPlanFragmentCtx;
 class TPlanFragmentInstanceCtx;
 class QueryState;
+
+namespace io {
+  class DiskIoMgr;
+}
 
 /// TODO: move the typedefs into a separate .h (and fix the includes for that)
 
@@ -80,23 +83,22 @@ class RuntimeState {
   RuntimeState(QueryState* query_state, const TPlanFragmentCtx& fragment_ctx,
       const TPlanFragmentInstanceCtx& instance_ctx, ExecEnv* exec_env);
 
-  /// RuntimeState for executing expr in fe-support.
+  /// RuntimeState for test execution and fe-support.cc. Creates its own QueryState and
+  /// installs desc_tbl, if set. If query_ctx.request_pool isn't set, sets it to "test-pool".
   RuntimeState(
-      const TQueryCtx& query_ctx, ExecEnv* exec_env, const std::string& request_pool);
+      const TQueryCtx& query_ctx, ExecEnv* exec_env, DescriptorTbl* desc_tbl = nullptr);
 
   /// Empty d'tor to avoid issues with scoped_ptr.
   ~RuntimeState();
 
-  /// Initializes the runtime filter bank.
-  void InitFilterBank();
-
-  /// Gets/Creates the query wide block mgr.
-  Status CreateBlockMgr();
+  /// Initializes the runtime filter bank and claims the initial buffer reservation
+  /// for it.
+  Status InitFilterBank(long runtime_filters_reservation_bytes);
 
   QueryState* query_state() const { return query_state_; }
-  ObjectPool* obj_pool() const { return obj_pool_.get(); }
-  const DescriptorTbl& desc_tbl() const { return *desc_tbl_; }
-  void set_desc_tbl(DescriptorTbl* desc_tbl) { desc_tbl_ = desc_tbl; }
+  /// Return the query's ObjectPool
+  ObjectPool* obj_pool() const;
+  const DescriptorTbl& desc_tbl() const;
   const TQueryOptions& query_options() const;
   int batch_size() const { return query_options().batch_size; }
   bool abort_on_error() const { return query_options().abort_on_error; }
@@ -113,6 +115,7 @@ class RuntimeState {
     return query_ctx().session.connected_user;
   }
   const TimestampValue* now() const { return now_.get(); }
+  const TimestampValue* utc_timestamp() const { return utc_timestamp_.get(); }
   void set_now(const TimestampValue* now);
   const TUniqueId& query_id() const { return query_ctx().query_id; }
   const TUniqueId& fragment_instance_id() const {
@@ -121,13 +124,16 @@ class RuntimeState {
         : no_instance_id_;
   }
   ExecEnv* exec_env() { return exec_env_; }
-  DataStreamMgr* stream_mgr();
+  DataStreamMgrBase* stream_mgr();
   HBaseTableFactory* htable_factory();
   ImpalaBackendClientCache* impalad_client_cache();
   CatalogServiceClientCache* catalogd_client_cache();
-  DiskIoMgr* io_mgr();
+  io::DiskIoMgr* io_mgr();
   MemTracker* instance_mem_tracker() { return instance_mem_tracker_.get(); }
-  MemTracker* query_mem_tracker() { return query_mem_tracker_; }
+  MemTracker* query_mem_tracker();  // reference to the query_state_'s memtracker
+  ReservationTracker* instance_buffer_reservation() {
+    return instance_buffer_reservation_.get();
+  }
   ThreadResourceMgr::ResourcePool* resource_pool() { return resource_pool_; }
 
   FileMoveMap* hdfs_files_to_move() { return &hdfs_files_to_move_; }
@@ -146,7 +152,7 @@ class RuntimeState {
   PartitionStatusMap* per_partition_status() { return &per_partition_status_; }
 
   /// Returns runtime state profile
-  RuntimeProfile* runtime_profile() { return &profile_; }
+  RuntimeProfile* runtime_profile() { return profile_; }
 
   /// Returns the LlvmCodeGen object for this fragment instance.
   LlvmCodeGen* codegen() { return codegen_.get(); }
@@ -190,19 +196,6 @@ class RuntimeState {
   ///    which cannot be interpreted.
   inline bool ShouldCodegen() const {
     return !CodegenDisabledByQueryOption() && !CodegenDisabledByHint();
-  }
-
-  /// Takes ownership of a scan node's reader context and plan fragment executor will call
-  /// UnregisterReaderContexts() to unregister it when the fragment is closed. The IO
-  /// buffers may still be in use and thus the deferred unregistration.
-  void AcquireReaderContext(DiskIoRequestContext* reader_context);
-
-  /// Unregisters all reader contexts acquired through AcquireReaderContext().
-  void UnregisterReaderContexts();
-
-  BufferedBlockMgr* block_mgr() {
-    DCHECK(block_mgr_.get() != NULL);
-    return block_mgr_.get();
   }
 
   inline Status GetQueryStatus() {
@@ -249,7 +242,7 @@ class RuntimeState {
   Status LogOrReturnError(const ErrorMsg& message);
 
   bool is_cancelled() const { return is_cancelled_; }
-  void set_is_cancelled(bool v) { is_cancelled_ = v; }
+  void set_is_cancelled() { is_cancelled_ = true; }
 
   RuntimeProfile::Counter* total_storage_wait_timer() {
     return total_storage_wait_timer_;
@@ -274,13 +267,8 @@ class RuntimeState {
     query_status_ = Status(err_msg);
   }
 
-  /// Function for logging memory usages to the error log when memory limit is exceeded.
-  /// If 'failed_allocation_size' is greater than zero, logs the allocation size. If
-  /// 'failed_allocation_size' is zero, nothing about the allocation size is logged.
-  void LogMemLimitExceeded(const MemTracker* tracker, int64_t failed_allocation_size);
-
   /// Sets query_status_ to MEM_LIMIT_EXCEEDED and logs all the registered trackers.
-  /// Subsequent calls to this will be no-ops. Returns query_status_.
+  /// Subsequent calls to this will be no-ops.
   /// If 'failed_allocation_size' is not 0, then it is the size of the allocation (in
   /// bytes) that would have exceeded the limit allocated for 'tracker'.
   /// This value and tracker are only used for error reporting.
@@ -288,13 +276,13 @@ class RuntimeState {
   /// generic "Memory limit exceeded" error.
   /// Note that this interface is deprecated and MemTracker::LimitExceeded() should be
   /// used and the error status should be returned.
-  Status SetMemLimitExceeded(MemTracker* tracker = NULL,
+  void SetMemLimitExceeded(MemTracker* tracker,
       int64_t failed_allocation_size = 0, const ErrorMsg* msg = NULL);
 
   /// Returns a non-OK status if query execution should stop (e.g., the query was
   /// cancelled or a mem limit was exceeded). Exec nodes should check this periodically so
-  /// execution doesn't continue if the query terminates abnormally. This can be called
-  /// after ReleaseResources().
+  /// execution doesn't continue if the query terminates abnormally. This should not be
+  /// called after ReleaseResources().
   Status CheckQueryState();
 
   /// Create a codegen object accessible via codegen() if it doesn't exist already.
@@ -306,23 +294,20 @@ class RuntimeState {
   /// TODO: Fix IMPALA-4233
   Status CodegenScalarFns();
 
-  /// Release resources and prepare this object for destruction.
+  /// Helper to call QueryState::StartSpilling().
+  Status StartSpilling(MemTracker* mem_tracker);
+
+  /// Release resources and prepare this object for destruction. Can only be called once.
   void ReleaseResources();
 
+  static const char* LLVM_CLASS_NAME;
+
  private:
-  /// Allow TestEnv to set block_mgr manually for testing.
+  /// Allow TestEnv to use private methods for testing.
   friend class TestEnv;
 
   /// Set per-fragment state.
   void Init();
-
-  /// Use a custom block manager for the query for testing purposes.
-  void set_block_mgr(const std::shared_ptr<BufferedBlockMgr>& block_mgr) {
-    block_mgr_ = block_mgr;
-  }
-
-  DescriptorTbl* desc_tbl_ = nullptr;
-  boost::scoped_ptr<ObjectPool> obj_pool_;
 
   /// Lock protecting error_log_
   SpinLock error_log_lock_;
@@ -331,20 +316,22 @@ class RuntimeState {
   ErrorLogMap error_log_;
 
   /// Global QueryState and original thrift descriptors for this fragment instance.
-  /// Not set by the (const TQueryCtx&) c'tor.
   QueryState* const query_state_;
   const TPlanFragmentCtx* const fragment_ctx_;
   const TPlanFragmentInstanceCtx* const instance_ctx_;
 
-  /// Provides query ctx if query_state_ == nullptr.
-  TQueryCtx local_query_ctx_;
+  /// only populated by the (const QueryCtx&, ExecEnv*, DescriptorTbl*) c'tor
+  boost::scoped_ptr<QueryState> local_query_state_;
 
   /// Provides instance id if instance_ctx_ == nullptr
   TUniqueId no_instance_id_;
 
-  /// Query-global timestamp, e.g., for implementing now(). Set from query_globals_.
-  /// Use pointer to avoid inclusion of timestampvalue.h and avoid clang issues.
+  /// Query-global timestamps for implementing now() and utc_timestamp(). Both represent
+  /// the same point in time but now_ is in local time and utc_timestamp_ is in UTC.
+  /// Set from query_globals_. Use pointer to avoid inclusion of timestampvalue.h and
+  /// avoid clang issues.
   boost::scoped_ptr<TimestampValue> now_;
+  boost::scoped_ptr<TimestampValue> utc_timestamp_;
 
   /// TODO: get rid of this and use ExecEnv::GetInstance() instead
   ExecEnv* exec_env_;
@@ -364,7 +351,7 @@ class RuntimeState {
   /// Records summary statistics for the results of inserts into Hdfs partitions.
   PartitionStatusMap per_partition_status_;
 
-  RuntimeProfile profile_;
+  RuntimeProfile* const profile_;
 
   /// Total time waiting in storage (across all threads)
   RuntimeProfile::Counter* total_storage_wait_timer_;
@@ -378,32 +365,24 @@ class RuntimeState {
   /// Total CPU utilization for all threads in this plan fragment.
   RuntimeProfile::ThreadCounters* total_thread_statistics_;
 
-  /// Reference to the query MemTracker, owned by 'query_state_' if that is non-NULL
-  /// or stored in 'obj_pool_' otherwise.
-  MemTracker* query_mem_tracker_;
-
   /// Memory usage of this fragment instance, a child of 'query_mem_tracker_'.
   boost::scoped_ptr<MemTracker> instance_mem_tracker_;
 
+  /// Buffer reservation for this fragment instance - a child of the query buffer
+  /// reservation. Non-NULL if 'query_state_' is not NULL.
+  boost::scoped_ptr<ReservationTracker> instance_buffer_reservation_;
+
   /// if true, execution should stop with a CANCELLED status
-  bool is_cancelled_;
+  bool is_cancelled_ = false;
+
+  /// if true, ReleaseResources() was called.
+  bool released_resources_ = false;
 
   /// Non-OK if an error has occurred and query execution should abort. Used only for
   /// asynchronously reporting such errors (e.g., when a UDF reports an error), so this
   /// will not necessarily be set in all error cases.
   SpinLock query_status_lock_;
   Status query_status_;
-
-  /// Reader contexts that need to be closed when the fragment is closed.
-  /// Synchronization is needed if there are multiple scan nodes in a plan fragment and
-  /// Close() may be called on them concurrently (see IMPALA-4180).
-  SpinLock reader_contexts_lock_;
-  std::vector<DiskIoRequestContext*> reader_contexts_;
-
-  /// BufferedBlockMgr object used to allocate and manage blocks of input data in memory
-  /// with a fixed memory budget.
-  /// The block mgr is shared by all fragments for this query.
-  std::shared_ptr<BufferedBlockMgr> block_mgr_;
 
   /// This is the node id of the root node for this plan fragment. This is used as the
   /// hash seed and has two useful properties:
@@ -412,7 +391,7 @@ class RuntimeState {
   /// 2) It is different between different fragments, so we do not run into hash
   /// collisions after data partitioning (across fragments). See IMPALA-219 for more
   /// details.
-  PlanNodeId root_node_id_;
+  PlanNodeId root_node_id_ = -1;
 
   /// Manages runtime filters that are either produced or consumed (or both!) by plan
   /// nodes that share this runtime state.

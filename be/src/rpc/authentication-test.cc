@@ -20,7 +20,9 @@
 #include "common/logging.h"
 #include "rpc/authentication.h"
 #include "rpc/thrift-server.h"
+#include "util/auth-util.h"
 #include "util/network-util.h"
+#include "util/openssl-util.h"
 #include "util/thread.h"
 
 #include <ldap.h>
@@ -31,6 +33,7 @@ DECLARE_string(keytab_file);
 DECLARE_string(principal);
 DECLARE_string(ssl_client_ca_certificate);
 DECLARE_string(ssl_server_certificate);
+DECLARE_string(ssl_private_key);
 DECLARE_string(internal_principals_whitelist);
 
 // These are here so that we can grab them early in main() - the kerberos
@@ -52,13 +55,19 @@ TEST(Auth, PrincipalSubstitution) {
   string hostname;
   ASSERT_OK(GetHostname(&hostname));
   SaslAuthProvider sa(false);  // false means it's external
-  ASSERT_OK(sa.InitKerberos("service_name/_HOST@some.realm", "/etc/hosts"));
+
+  FLAGS_principal = "service_name/_HOST@some.realm";
+  string principal;
+  ASSERT_OK(GetExternalKerberosPrincipal(&principal));
+
+  ASSERT_OK(sa.InitKerberos(principal, "/etc/hosts"));
   ASSERT_OK(sa.Start());
   ASSERT_EQ(string::npos, sa.principal().find("_HOST"));
   ASSERT_NE(string::npos, sa.principal().find(hostname));
   ASSERT_EQ("service_name", sa.service_name());
   ASSERT_EQ(hostname, sa.hostname());
   ASSERT_EQ("some.realm", sa.realm());
+  FLAGS_principal.clear();
 }
 
 void AuthOk(const string& name, SaslAuthProvider* sa) {
@@ -165,7 +174,8 @@ TEST(Auth, KerbAndSslEnabled) {
   ASSERT_OK(GetHostname(&hostname));
   FLAGS_ssl_client_ca_certificate = "some_path";
   FLAGS_ssl_server_certificate = "some_path";
-  ASSERT_TRUE(EnableInternalSslConnections());
+  FLAGS_ssl_private_key = "some_path";
+  ASSERT_TRUE(IsInternalTlsConfigured());
   SaslAuthProvider sa_internal(true);
   ASSERT_OK(
       sa_internal.InitKerberos("service_name/_HOST@some.realm", "/etc/hosts"));

@@ -38,12 +38,14 @@ import org.apache.impala.thrift.TCatalogObject;
 import org.apache.impala.thrift.TDatabase;
 import org.apache.impala.thrift.TDdlExecRequest;
 import org.apache.impala.thrift.TFunction;
-import org.apache.impala.thrift.TGetAllCatalogObjectsResponse;
+import org.apache.impala.thrift.TGetCatalogDeltaResponse;
+import org.apache.impala.thrift.TGetCatalogDeltaRequest;
 import org.apache.impala.thrift.TGetDbsParams;
 import org.apache.impala.thrift.TGetDbsResult;
 import org.apache.impala.thrift.TGetFunctionsRequest;
 import org.apache.impala.thrift.TGetFunctionsResponse;
 import org.apache.impala.thrift.TGetTablesParams;
+import org.apache.impala.thrift.TGetTableMetricsParams;
 import org.apache.impala.thrift.TGetTablesResult;
 import org.apache.impala.thrift.TLogLevel;
 import org.apache.impala.thrift.TPrioritizeLoadRequest;
@@ -54,6 +56,7 @@ import org.apache.impala.thrift.TUpdateCatalogRequest;
 import org.apache.impala.thrift.TBackendGflags;
 import org.apache.impala.util.GlogAppender;
 import org.apache.impala.util.PatternMatcher;
+import org.apache.sentry.hdfs.ThriftSerializer;
 import org.apache.thrift.TException;
 import org.apache.thrift.TSerializer;
 import org.apache.thrift.protocol.TBinaryProtocol;
@@ -87,6 +90,8 @@ public class JniCatalog {
     BackendConfig.create(cfg);
 
     Preconditions.checkArgument(cfg.num_metadata_loading_threads > 0);
+    Preconditions.checkArgument(cfg.max_hdfs_partitions_parallel_load > 0);
+    Preconditions.checkArgument(cfg.max_nonhdfs_partitions_parallel_load > 0);
     Preconditions.checkArgument(cfg.initial_hms_cnxn_timeout_s > 0);
     // This trick saves having to pass a TLogLevel enum, which is an object and more
     // complex to pass through JNI.
@@ -114,14 +119,13 @@ public class JniCatalog {
 
   public static TUniqueId getServiceId() { return catalogServiceId_; }
 
-  /**
-   * Gets all catalog objects
-   */
-  public byte[] getCatalogObjects(long from_version) throws ImpalaException, TException {
-    TGetAllCatalogObjectsResponse resp =
-        catalog_.getCatalogObjects(from_version);
-    TSerializer serializer = new TSerializer(protocolFactory_);
-    return serializer.serialize(resp);
+  public byte[] getCatalogDelta(byte[] thriftGetCatalogDeltaReq) throws
+      ImpalaException, TException {
+    TGetCatalogDeltaRequest params = new TGetCatalogDeltaRequest();
+    JniUtil.deserializeThrift(protocolFactory_, params, thriftGetCatalogDeltaReq);
+    return new TSerializer(protocolFactory_).serialize(new TGetCatalogDeltaResponse(
+        catalog_.getCatalogDelta(params.getNative_catalog_server_ptr(),
+        params.getFrom_version())));
   }
 
   /**
@@ -192,6 +196,16 @@ public class JniCatalog {
   }
 
   /**
+   * Returns the collected metrics of a table.
+   */
+  public String getTableMetrics(byte[] getTableMetricsParams) throws ImpalaException,
+      TException {
+    TGetTableMetricsParams params = new TGetTableMetricsParams();
+    JniUtil.deserializeThrift(protocolFactory_, params, getTableMetricsParams);
+    return catalog_.getTableMetrics(params.table_name);
+  }
+
+  /**
    * Gets the thrift representation of a catalog object.
    */
   public byte[] getCatalogObject(byte[] thriftParams) throws ImpalaException,
@@ -256,5 +270,13 @@ public class JniCatalog {
     JniUtil.deserializeThrift(protocolFactory_, request, thriftUpdateCatalog);
     TSerializer serializer = new TSerializer(protocolFactory_);
     return serializer.serialize(catalogOpExecutor_.updateCatalog(request));
+  }
+
+  /**
+   * Returns information about the current catalog usage.
+   */
+  public byte[] getCatalogUsage() throws ImpalaException, TException {
+    TSerializer serializer = new TSerializer(protocolFactory_);
+    return serializer.serialize(catalog_.getCatalogUsage());
   }
 }

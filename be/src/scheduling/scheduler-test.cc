@@ -43,13 +43,34 @@ TEST_F(SchedulerTest, SingleHostSingleFile) {
 
   Result result(plan);
   SchedulerWrapper scheduler(plan);
-  scheduler.Compute(&result);
+  ASSERT_OK(scheduler.Compute(&result));
 
   EXPECT_EQ(1, result.NumTotalAssignments());
   EXPECT_EQ(1 * Block::DEFAULT_BLOCK_SIZE, result.NumTotalAssignedBytes());
   EXPECT_EQ(1, result.NumTotalAssignments(0));
   EXPECT_EQ(1 * Block::DEFAULT_BLOCK_SIZE, result.NumTotalAssignedBytes(0));
   EXPECT_EQ(0, result.NumCachedAssignments());
+}
+
+/// Test cluster configuration with one coordinator that can't process scan ranges.
+TEST_F(SchedulerTest, SingleCoordinatorNoExecutor) {
+  Cluster cluster;
+  cluster.AddHost(true, true, false);
+  cluster.AddHost(true, true, true);
+  cluster.AddHost(true, true, true);
+
+  Schema schema(cluster);
+  schema.AddMultiBlockTable("T1", 10, ReplicaPlacement::LOCAL_ONLY, 3);
+
+  Plan plan(schema);
+  plan.AddTableScan("T1");
+
+  Result result(plan);
+  SchedulerWrapper scheduler(plan);
+  ASSERT_OK(scheduler.Compute(&result));
+
+  EXPECT_EQ(2, result.NumDistinctBackends());
+  EXPECT_EQ(0, result.NumDiskAssignments(0));
 }
 
 /// Test assigning all scan ranges to the coordinator.
@@ -66,7 +87,7 @@ TEST_F(SchedulerTest, ExecAtCoord) {
   Result result(plan);
   SchedulerWrapper scheduler(plan);
   bool exec_at_coord = true;
-  scheduler.Compute(exec_at_coord, &result);
+  ASSERT_OK(scheduler.Compute(exec_at_coord, &result));
 
   EXPECT_EQ(3 * Block::DEFAULT_BLOCK_SIZE, result.NumTotalAssignedBytes(0));
   EXPECT_EQ(0, result.NumTotalAssignedBytes(1));
@@ -87,7 +108,7 @@ TEST_F(SchedulerTest, ScanTableTwice) {
 
   Result result(plan);
   SchedulerWrapper scheduler(plan);
-  scheduler.Compute(&result);
+  ASSERT_OK(scheduler.Compute(&result));
 
   EXPECT_EQ(4 * Block::DEFAULT_BLOCK_SIZE, result.NumTotalAssignedBytes());
   EXPECT_EQ(4 * Block::DEFAULT_BLOCK_SIZE, result.NumDiskAssignedBytes());
@@ -109,7 +130,7 @@ TEST_F(SchedulerTest, RandomReads) {
 
   Result result(plan);
   SchedulerWrapper scheduler(plan);
-  for (int i = 0; i < 100; ++i) scheduler.Compute(&result);
+  for (int i = 0; i < 100; ++i) ASSERT_OK(scheduler.Compute(&result));
 
   ASSERT_EQ(100, result.NumAssignments());
   EXPECT_EQ(100, result.NumTotalAssignments());
@@ -133,7 +154,7 @@ TEST_F(SchedulerTest, LocalReadsPickFirstReplica) {
 
   Result result(plan);
   SchedulerWrapper scheduler(plan);
-  for (int i = 0; i < 3; ++i) scheduler.Compute(&result);
+  for (int i = 0; i < 3; ++i) ASSERT_OK(scheduler.Compute(&result));
 
   EXPECT_EQ(3, result.NumTotalAssignments());
   EXPECT_EQ(3, result.NumDiskAssignments(0));
@@ -158,7 +179,7 @@ TEST_F(SchedulerTest, TestMediumSizedCluster) {
 
   Result result(plan);
   SchedulerWrapper scheduler(plan);
-  scheduler.Compute(&result);
+  ASSERT_OK(scheduler.Compute(&result));
 
   EXPECT_EQ(16, result.NumTotalAssignments());
   EXPECT_EQ(16, result.NumDiskAssignments());
@@ -177,7 +198,7 @@ TEST_F(SchedulerTest, RemoteOnlyPlacement) {
 
   Result result(plan);
   SchedulerWrapper scheduler(plan);
-  scheduler.Compute(&result);
+  ASSERT_OK(scheduler.Compute(&result));
 
   EXPECT_EQ(10, result.NumTotalAssignments());
   EXPECT_EQ(10, result.NumRemoteAssignments());
@@ -198,7 +219,7 @@ TEST_F(SchedulerTest, ManyScanRanges) {
 
   Result result(plan);
   SchedulerWrapper scheduler(plan);
-  scheduler.Compute(&result);
+  ASSERT_OK(scheduler.Compute(&result));
 
   EXPECT_EQ(1000, result.NumTotalAssignments());
   EXPECT_EQ(1000, result.NumDiskAssignments());
@@ -224,7 +245,7 @@ TEST_F(SchedulerTest, DisjointClusterWithRemoteReads) {
 
   Result result(plan);
   SchedulerWrapper scheduler(plan);
-  scheduler.Compute(&result);
+  ASSERT_OK(scheduler.Compute(&result));
 
   EXPECT_EQ(10, result.NumTotalAssignments());
   EXPECT_EQ(10, result.NumRemoteAssignments());
@@ -246,14 +267,14 @@ TEST_F(SchedulerTest, TestCachedReadPreferred) {
 
   Result result(plan);
   SchedulerWrapper scheduler(plan);
-  scheduler.Compute(&result);
+  ASSERT_OK(scheduler.Compute(&result));
   EXPECT_EQ(1 * Block::DEFAULT_BLOCK_SIZE, result.NumCachedAssignedBytes());
   EXPECT_EQ(1 * Block::DEFAULT_BLOCK_SIZE, result.NumCachedAssignedBytes(1));
   EXPECT_EQ(0, result.NumDiskAssignedBytes());
   EXPECT_EQ(0, result.NumRemoteAssignedBytes());
 
   // Compute additional assignments.
-  for (int i = 0; i < 8; ++i) scheduler.Compute(&result);
+  for (int i = 0; i < 8; ++i) ASSERT_OK(scheduler.Compute(&result));
   EXPECT_EQ(9 * Block::DEFAULT_BLOCK_SIZE, result.NumCachedAssignedBytes());
   EXPECT_EQ(9 * Block::DEFAULT_BLOCK_SIZE, result.NumCachedAssignedBytes(1));
   EXPECT_EQ(0, result.NumDiskAssignedBytes());
@@ -275,13 +296,13 @@ TEST_F(SchedulerTest, TestDisableCachedReads) {
 
   Result result(plan);
   SchedulerWrapper scheduler(plan);
-  scheduler.Compute(&result);
+  ASSERT_OK(scheduler.Compute(&result));
   EXPECT_EQ(0, result.NumCachedAssignedBytes());
   EXPECT_EQ(1 * Block::DEFAULT_BLOCK_SIZE, result.NumDiskAssignedBytes());
   EXPECT_EQ(0, result.NumRemoteAssignedBytes());
 
   // Compute additional assignments.
-  for (int i = 0; i < 8; ++i) scheduler.Compute(&result);
+  for (int i = 0; i < 8; ++i) ASSERT_OK(scheduler.Compute(&result));
   EXPECT_EQ(0, result.NumCachedAssignedBytes());
   EXPECT_EQ(9 * Block::DEFAULT_BLOCK_SIZE, result.NumDiskAssignedBytes());
   EXPECT_EQ(0, result.NumRemoteAssignedBytes());
@@ -305,7 +326,7 @@ TEST_F(SchedulerTest, EmptyStatestoreMessage) {
   Result result(plan);
   SchedulerWrapper scheduler(plan);
 
-  scheduler.Compute(&result);
+  ASSERT_OK(scheduler.Compute(&result));
   EXPECT_EQ(0, result.NumTotalAssignedBytes(0));
   EXPECT_EQ(1 * Block::DEFAULT_BLOCK_SIZE, result.NumTotalAssignedBytes(1));
   EXPECT_EQ(0, result.NumTotalAssignedBytes(2));
@@ -314,7 +335,7 @@ TEST_F(SchedulerTest, EmptyStatestoreMessage) {
   result.Reset();
 
   scheduler.SendEmptyUpdate();
-  scheduler.Compute(&result);
+  ASSERT_OK(scheduler.Compute(&result));
   EXPECT_EQ(1 * Block::DEFAULT_BLOCK_SIZE, result.NumTotalAssignedBytes(0));
   EXPECT_EQ(0, result.NumTotalAssignedBytes(1));
   EXPECT_EQ(0, result.NumTotalAssignedBytes(2));
@@ -338,7 +359,7 @@ TEST_F(SchedulerTest, TestSendUpdates) {
   Result result(plan);
   SchedulerWrapper scheduler(plan);
 
-  scheduler.Compute(&result);
+  ASSERT_OK(scheduler.Compute(&result));
   // Two backends are registered, so the scheduler will pick a random one.
   EXPECT_EQ(0, result.NumTotalAssignedBytes(0));
   EXPECT_EQ(1 * Block::DEFAULT_BLOCK_SIZE, result.NumTotalAssignedBytes(1));
@@ -347,7 +368,7 @@ TEST_F(SchedulerTest, TestSendUpdates) {
   scheduler.RemoveBackend(cluster.hosts()[1]);
   result.Reset();
 
-  scheduler.Compute(&result);
+  ASSERT_OK(scheduler.Compute(&result));
   EXPECT_EQ(1 * Block::DEFAULT_BLOCK_SIZE, result.NumTotalAssignedBytes(0));
   EXPECT_EQ(0, result.NumTotalAssignedBytes(1));
 
@@ -355,15 +376,18 @@ TEST_F(SchedulerTest, TestSendUpdates) {
   scheduler.AddBackend(cluster.hosts()[1]);
   result.Reset();
 
-  scheduler.Compute(&result);
+  ASSERT_OK(scheduler.Compute(&result));
   // Two backends are registered, so the scheduler will pick a random one.
   EXPECT_EQ(1 * Block::DEFAULT_BLOCK_SIZE, result.NumTotalAssignedBytes(0));
   EXPECT_EQ(0, result.NumTotalAssignedBytes(1));
 }
 
 /// IMPALA-4329: Test scheduling with no backends.
-/// With the fix for IMPALA-4494, the scheduler will always register its local backend
-/// with itself, so scheduling with no backends will still succeed.
+/// With the fix for IMPALA-5058, the scheduler is no longer responsible for
+/// registering the local backend with itself. This functionality is moved to
+/// ImpalaServer::MembershipCallback() and the scheduler will receive the local
+/// backend info through the statestore update, so until that happens, scheduling
+/// should fail.
 TEST_F(SchedulerTest, TestEmptyBackendConfig) {
   Cluster cluster;
   cluster.AddHost(false, true);
@@ -377,7 +401,7 @@ TEST_F(SchedulerTest, TestEmptyBackendConfig) {
   Result result(plan);
   SchedulerWrapper scheduler(plan);
   Status status = scheduler.Compute(&result);
-  EXPECT_TRUE(status.ok());
+  EXPECT_TRUE(!status.ok());
 }
 
 /// IMPALA-4494: Test scheduling with no backends but exec_at_coord.

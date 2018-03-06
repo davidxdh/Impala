@@ -15,21 +15,26 @@
 // specific language governing permissions and limitations
 // under the License.
 
-
 #ifndef IMPALA_RUNTIME_ROW_BATCH_H
 #define IMPALA_RUNTIME_ROW_BATCH_H
 
-#include <vector>
 #include <cstring>
+#include <vector>
 #include <boost/scoped_ptr.hpp>
 
 #include "codegen/impala-ir.h"
 #include "common/compiler-util.h"
 #include "common/logging.h"
-#include "runtime/buffered-block-mgr.h" // for BufferedBlockMgr::Block
+#include "gen-cpp/row_batch.pb.h"
+#include "kudu/util/slice.h"
+#include "runtime/bufferpool/buffer-pool.h"
 #include "runtime/descriptors.h"
-#include "runtime/disk-io-mgr.h"
+#include "runtime/io/disk-io-mgr.h"
 #include "runtime/mem-pool.h"
+
+namespace kudu {
+class Slice;
+} // namespace kudu
 
 namespace impala {
 
@@ -42,34 +47,77 @@ class Tuple;
 class TupleRow;
 class TupleDescriptor;
 
+/// A KRPC outbound row batch which contains the serialized row batch header and buffers
+/// for holding the tuple offsets and tuple data.
+class OutboundRowBatch {
+ public:
+  const RowBatchHeaderPB* header() const { return &header_; }
+
+  /// Returns the serialized tuple offsets' vector as a kudu::Slice.
+  /// The tuple offsets vector is sent as KRPC sidecar.
+  kudu::Slice TupleOffsetsAsSlice() const {
+    return kudu::Slice((uint8_t*)tuple_offsets_.data(),
+        tuple_offsets_.size() * sizeof(tuple_offsets_[0]));
+  }
+
+  /// Returns the serialized tuple data's buffer as a kudu::Slice.
+  /// The tuple data is sent as KRPC sidecar.
+  kudu::Slice TupleDataAsSlice() const {
+    return kudu::Slice((uint8_t*)tuple_data_.data(), tuple_data_.length());
+  }
+
+  /// Returns true if the header has been intialized and ready to be sent.
+  /// This entails setting some fields initialized in RowBatch::Serialize().
+  bool IsInitialized() const {
+     return header_.has_num_rows() && header_.has_uncompressed_size() &&
+         header_.has_compression_type();
+  }
+
+ private:
+  friend class RowBatch;
+
+  /// The serialized header which contains the meta-data of the row batch such as the
+  /// number of rows and compression scheme used etc.
+  RowBatchHeaderPB header_;
+
+  /// Contains offsets into 'tuple_data_' of all tuples in a row batch. -1 refers to
+  /// a NULL tuple.
+  vector<int32_t> tuple_offsets_;
+
+  /// Contains the actual data of all the tuples. The data could be compressed.
+  string tuple_data_;
+};
+
 /// A RowBatch encapsulates a batch of rows, each composed of a number of tuples.
 /// The maximum number of rows is fixed at the time of construction.
-/// The row batch reference a few different sources of memory.
-///   1. TupleRow ptrs - may be malloc'd and owned by the RowBatch or allocated from
-///      the tuple pool, depending on whether legacy joins and aggs are enabled.
-///      See the comment on tuple_ptrs_ for more details.
-///   2. Tuple memory - this is allocated (or transferred to) the row batches tuple pool.
-///   3. Auxiliary tuple memory (e.g. string data) - this can either be stored externally
-///      (don't copy strings) or from the tuple pool (strings are copied).  If external,
-///      the data is in an io buffer that may not be attached to this row batch.  The
-///      creator of that row batch has to make sure that the io buffer is not recycled
-///      until all batches that reference the memory have been consumed.
-/// In order to minimize memory allocations, RowBatches and TRowBatches that have been
-/// serialized and sent over the wire should be reused (this prevents compression_scratch_
-/// from being needlessly reallocated).
-//
+/// The row batch can reference various types of memory.
+///   1. TupleRow ptrs - malloc'd and owned by the RowBatch. See the comment on
+///      tuple_ptrs_ for more details.
+///   2. Fixed and variable-length tuple data. This memory may be directly attached to
+///      the batch: either in the batch's MemPool or in an attached buffer. Or it may
+///      live elsewhere - either in a subsequent batch returned by an ExecNode or
+///      still be owned by the ExecNode that produced the batch. In those cases the
+///      owner of this RowBatch must be careful not to close the producing ExecNode
+///      or free resources from trailing batches while the batch's data is still being
+///      used.
+///     TODO: IMPALA-4179: simplify the ownership transfer model.
+///
+/// In order to minimize memory allocations, RowBatches and TRowBatches or
+/// OutboundRowBatch that have been serialized and sent over the wire should be reused
+/// (this prevents compression_scratch_ from being needlessly reallocated).
+///
 /// Row batches and memory usage: We attempt to stream row batches through the plan
 /// tree without copying the data. This means that row batches are often not-compact
 /// and reference memory outside of the row batch. This results in most row batches
 /// having a very small memory footprint and in some row batches having a very large
 /// one (it contains all the memory that other row batches are referencing). An example
-/// is IoBuffers which are only attached to one row batch. Only when the row batch reaches
+/// is buffers which are only attached to one row batch. Only when the row batch reaches
 /// a blocking operator or the root of the fragment is the row batch memory freed.
 /// This means that in some cases (e.g. very selective queries), we still need to
 /// pass the row batch through the exec nodes (even if they have no rows) to trigger
-/// memory deletion. AtCapacity() encapsulates the check that we are not accumulating
-/// excessive memory.
-//
+/// memory deletion. AtCapacity() encapsulates the check that the batch does not have
+/// excessive memory attached to it.
+///
 /// A row batch is considered at capacity if all the rows are full or it has accumulated
 /// auxiliary memory up to a soft cap. (See at_capacity_mem_usage_ comment).
 class RowBatch {
@@ -85,15 +133,26 @@ class RowBatch {
   /// Create RowBatch for a maximum of 'capacity' rows of tuples specified
   /// by 'row_desc'.
   /// tracker cannot be NULL.
-  RowBatch(const RowDescriptor& row_desc, int capacity, MemTracker* tracker);
+  RowBatch(const RowDescriptor* row_desc, int capacity, MemTracker* tracker);
 
-  /// Populate a row batch from input_batch by copying input_batch's
-  /// tuple_data into the row batch's mempool and converting all offsets
-  /// in the data back into pointers.
+  /// Populate a row batch from a serialized thrift input_batch by copying
+  /// input_batch's tuple_data into the row batch's mempool and converting all
+  /// offsets in the data back into pointers.
   /// TODO: figure out how to transfer the data from input_batch to this RowBatch
   /// (so that we don't need to make yet another copy)
-  RowBatch(const RowDescriptor& row_desc, const TRowBatch& input_batch,
+  RowBatch(const RowDescriptor* row_desc, const TRowBatch& input_batch,
       MemTracker* tracker);
+
+  /// Creates a row batch from the protobuf row batch header, decompress / copy
+  /// 'input_tuple_data' into a buffer and convert all offsets in 'input_tuple_offsets'
+  /// back into pointers. The tuple pointers and data's buffers are allocated from the
+  /// buffer pool with 'client' as client handle. The newly created row batch is
+  /// stored in 'row_batch_ptr'. Returns error status on failure. Returns ok otherwise.
+  static Status FromProtobuf(const RowDescriptor* row_desc,
+      const RowBatchHeaderPB& header, const kudu::Slice& input_tuple_data,
+      const kudu::Slice& input_tuple_offsets, MemTracker* mem_tracker,
+      BufferPool::ClientHandle* client, std::unique_ptr<RowBatch>* row_batch_ptr)
+      WARN_UNUSED_RESULT;
 
   /// Releases all resources accumulated at this row batch.  This includes
   ///  - tuple_ptrs
@@ -139,7 +198,7 @@ class RowBatch {
     // MarkFlushResources().
     DCHECK((!needs_deep_copy_ && flush_ == FlushMode::NO_FLUSH_RESOURCES)
         || num_rows_ == capacity_);
-    int64_t mem_usage = auxiliary_mem_usage_ + tuple_data_pool_.total_allocated_bytes();
+    int64_t mem_usage = attached_buffer_bytes_ + tuple_data_pool_.total_allocated_bytes();
     return num_rows_ == capacity_ || mem_usage >= AT_CAPACITY_MEM_USAGE;
   }
 
@@ -204,25 +263,20 @@ class RowBatch {
   };
 
   int num_tuples_per_row() { return num_tuples_per_row_; }
-  int row_byte_size() { return num_tuples_per_row_ * sizeof(Tuple*); }
   MemPool* tuple_data_pool() { return &tuple_data_pool_; }
-  int num_io_buffers() const { return io_buffers_.size(); }
-  int num_blocks() const { return blocks_.size(); }
+  int num_buffers() const { return buffers_.size(); }
 
   /// Resets the row batch, returning all resources it has accumulated.
   void Reset();
 
-  /// Add io buffer to this row batch.
-  void AddIoBuffer(DiskIoMgr::BufferDescriptor* buffer);
-
-  /// Adds a block to this row batch. The block must be pinned. The blocks must be
-  /// deleted when freeing resources. The block's memory remains accounted against
-  /// the original owner, even when the ownership of batches is transferred. If the
-  /// original owner wants the memory to be released, it should call this with 'mode'
-  /// FLUSH_RESOURCES (see MarkFlushResources() for further explanation).
-  /// TODO: after IMPALA-3200, make the ownership transfer model consistent between
-  /// Blocks and I/O buffers.
-  void AddBlock(BufferedBlockMgr::Block* block, FlushMode flush);
+  /// Adds a buffer to this row batch. The buffer is deleted when freeing resources.
+  /// The buffer's memory remains accounted against the original owner, even when the
+  /// ownership of batches is transferred. If the original owner wants the memory to be
+  /// released, it should call this with 'mode' FLUSH_RESOURCES (see MarkFlushResources()
+  /// for further explanation).
+  /// TODO: IMPALA-4179: simplify the ownership transfer model.
+  void AddBuffer(BufferPool::ClientHandle* client, BufferPool::BufferHandle&& buffer,
+      FlushMode flush);
 
   /// Used by an operator to indicate that it cannot produce more rows until the
   /// resources that it has attached to the row batch are freed or acquired by an
@@ -230,10 +284,10 @@ class RowBatch {
   /// can be added. The "flush" mark is transferred by TransferResourceOwnership(). This
   /// ensures that batches are flushed by streaming operators all the way up the operator
   /// tree. Blocking operators can still accumulate batches with this flag.
-  /// TODO: IMPALA-3200: blocking operators should acquire all memory resources including
-  /// attached blocks/buffers, so that MarkFlushResources() can guarantee that the
+  /// TODO: IMPALA-4179: blocking operators should acquire all memory resources including
+  /// attached buffers, so that MarkFlushResources() can guarantee that the
   /// resources will not be accounted against the original operator (this is currently
-  /// not true for Blocks, which can't be transferred).
+  /// not true for buffers, which aren't transferred).
   void MarkFlushResources() {
     DCHECK_LE(num_rows_, capacity_);
     capacity_ = num_rows_;
@@ -256,7 +310,7 @@ class RowBatch {
   bool needs_deep_copy() { return needs_deep_copy_; }
 
   /// Transfer ownership of resources to dest.  This includes tuple data in mem
-  /// pool and io buffers.
+  /// pool and buffers.
   void TransferResourceOwnership(RowBatch* dest);
 
   void CopyRow(TupleRow* src, TupleRow* dest) {
@@ -277,7 +331,7 @@ class RowBatch {
     memset(row, 0, num_tuples_per_row_ * sizeof(Tuple*));
   }
 
-  /// Acquires state from the 'src' row batch into this row batch. This includes all IO
+  /// Acquires state from the 'src' row batch into this row batch. This includes all
   /// buffers and tuple data.
   /// This row batch must be empty and have the same row descriptor as the src batch.
   /// This is used for scan nodes which produce RowBatches asynchronously.  Typically,
@@ -292,16 +346,24 @@ class RowBatch {
   void DeepCopyTo(RowBatch* dst);
 
   /// Create a serialized version of this row batch in output_batch, attaching all of the
-  /// data it references to output_batch.tuple_data. This function attempts to
-  /// detect duplicate tuples in the row batch to reduce the serialized size.
-  /// output_batch.tuple_data will be snappy-compressed unless the compressed data is
-  /// larger than the uncompressed data. Use output_batch.is_compressed to determine
+  /// data it references to output_batch.tuple_data. This function attempts to detect
+  /// duplicate tuples in the row batch to reduce the serialized size.
+  /// output_batch.tuple_data will be LZ4-compressed unless the compressed data is larger
+  /// larger than the uncompressed data. Use output_batch.compression_type to determine
   /// whether tuple_data is compressed. If an in-flight row is present in this row batch,
   /// it is ignored. This function does not Reset().
+  Status Serialize(OutboundRowBatch* output_batch);
   Status Serialize(TRowBatch* output_batch);
 
-  /// Utility function: returns total size of batch.
-  static int GetBatchSize(const TRowBatch& batch);
+  /// Utility function: returns total byte size of a batch in either serialized or
+  /// deserialized form. If a row batch is compressed, its serialized size can be much
+  /// less than the deserialized size.
+  static int64_t GetSerializedSize(const TRowBatch& batch);
+  static int64_t GetDeserializedSize(const TRowBatch& batch);
+  static int64_t GetSerializedSize(const OutboundRowBatch& batch);
+  static int64_t GetDeserializedSize(const OutboundRowBatch& batch);
+  static int64_t GetDeserializedSize(const RowBatchHeaderPB& header,
+      const kudu::Slice& tuple_offsets);
 
   int ALWAYS_INLINE num_rows() const { return num_rows_; }
   int ALWAYS_INLINE capacity() const { return capacity_; }
@@ -312,7 +374,7 @@ class RowBatch {
     return tuple_ptrs_size_ / (num_tuples_per_row_ * sizeof(Tuple*));
   }
 
-  const RowDescriptor& row_desc() const { return row_desc_; }
+  const RowDescriptor* row_desc() const { return row_desc_; }
 
   /// Max memory that this row batch can accumulate before it is considered at capacity.
   /// This is a soft capacity: row batches may exceed the capacity, preferably only by a
@@ -323,14 +385,23 @@ class RowBatch {
   // in order to leave room for variable-length data.
   static const int FIXED_LEN_BUFFER_LIMIT = AT_CAPACITY_MEM_USAGE / 2;
 
+  // Batch size to compute hash, keep it small to avoid large stack allocations.
+  // 16 provided the same speedup compared to operating over a full batch.
+  static const int HASH_BATCH_SIZE = 16;
+
   /// Allocates a buffer large enough for the fixed-length portion of 'capacity_' rows in
   /// this batch from 'tuple_data_pool_'. 'capacity_' is reduced if the allocation would
   /// exceed FIXED_LEN_BUFFER_LIMIT. Always returns enough space for at least one row.
   /// Returns Status::MEM_LIMIT_EXCEEDED and sets 'buffer' to NULL if a memory limit would
   /// have been exceeded. 'state' is used to log the error.
   /// On success, sets 'buffer_size' to the size in bytes and 'buffer' to the buffer.
-  Status ResizeAndAllocateTupleBuffer(RuntimeState* state, int64_t* buffer_size,
-       uint8_t** buffer);
+  Status ResizeAndAllocateTupleBuffer(
+      RuntimeState* state, int64_t* buffer_size, uint8_t** buffer);
+
+  /// Same as above except allocates buffer for 'capacity' rows with fixed-length portions
+  /// of 'row_size' bytes each from 'pool', instead of using RowBatch's member variables.
+  static Status ResizeAndAllocateTupleBuffer(RuntimeState* state, MemPool* pool,
+      int row_size, int* capacity, int64_t* buffer_size, uint8_t** buffer);
 
   /// Helper function to log the batch's rows if VLOG_ROW is enabled. 'context' is a
   /// string to prepend to the log message.
@@ -341,6 +412,22 @@ class RowBatch {
   friend class RowBatchSerializeBenchmark;
   friend class RowBatchSerializeTest;
 
+  /// Creates an empty row batch based on the serialized row batch header. Called from
+  /// FromProtobuf() above before desrialization of a protobuf row batch.
+  RowBatch(const RowDescriptor* row_desc, const RowBatchHeaderPB& header,
+      MemTracker* mem_tracker);
+
+  /// Allocate from buffer pool a buffer of 'len' using the client handle 'client'.
+  /// The actual buffer size is 'len' rounded up to power of 2 or minimum buffer size,
+  /// whichever is larger. The reservation of 'client' may be increased. On success,
+  /// the newly allocated buffer is returned in 'buffer_handle'. Return error status
+  /// if allocation failed. In which case, 'buffer_handle' is not opened.
+  Status AllocateBuffer(BufferPool::ClientHandle* client, int64_t len,
+      BufferPool::BufferHandle* buffer_handle);
+
+  /// Free all BufferInfo and the associated buffers in 'buffers_'.
+  void FreeBuffers();
+
   /// Decide whether to do full tuple deduplication based on row composition. Full
   /// deduplication is enabled only when there is risk of the serialized size being
   /// much larger than in-memory size due to non-adjacent duplicate tuples.
@@ -348,6 +435,41 @@ class RowBatch {
 
   /// Overload for testing that allows the test to force the deduplication level.
   Status Serialize(TRowBatch* output_batch, bool full_dedup);
+
+  /// Shared implementation between thrift and protobuf to serialize this row batch.
+  ///
+  /// 'full_dedup': true if full deduplication is used.
+  /// 'tuple_offsets': Updated to contain offsets of all tuples into 'tuple_data' upon
+  ///                  return. There are a total of num_rows * num_tuples_per_row offsets.
+  ///                  An offset of -1 records a NULL.
+  /// 'tuple_data': Updated to hold the serialized tuples' data. If 'is_compressed'
+  ///               is true, this is LZ4 compressed.
+  /// 'uncompressed_size': Updated with the uncompressed size of 'tuple_data'.
+  /// 'is_compressed': true if compression is applied on 'tuple_data'.
+  ///
+  /// Returns error status if serialization failed. Returns OK otherwise.
+  /// TODO: clean this up once the thrift RPC implementation is removed.
+  Status Serialize(bool full_dedup, vector<int32_t>* tuple_offsets, string* tuple_data,
+      int64_t* uncompressed_size, bool* is_compressed);
+
+  /// Shared implementation between thrift and protobuf to deserialize a row batch.
+  ///
+  /// 'input_tuple_offsets': an int32_t array of tuples; offsets into 'input_tuple_data'.
+  /// Used for populating the tuples in the row batch with actual pointers.
+  ///
+  /// 'input_tuple_data': contains pointer and size of tuples' data buffer.
+  /// If 'is_compressed' is true, the data is compressed.
+  ///
+  /// 'uncompressed_size': the uncompressed size of 'input_tuple_data' if it's compressed.
+  ///
+  /// 'is_compressed': True if 'input_tuple_data' is compressed.
+  ///
+  /// 'tuple_data': buffer of 'uncompressed_size' bytes for holding tuple data.
+  ///
+  /// TODO: clean this up once the thrift RPC implementation is removed.
+  void Deserialize(const kudu::Slice& input_tuple_offsets,
+      const kudu::Slice& input_tuple_data, int64_t uncompressed_size, bool is_compressed,
+      uint8_t* tuple_data);
 
   typedef FixedSizeHashTable<Tuple*, int> DedupMap;
 
@@ -358,8 +480,8 @@ class RowBatch {
   /// enabled. The distinct_tuples map must be empty.
   int64_t TotalByteSize(DedupMap* distinct_tuples);
 
-  void SerializeInternal(int64_t size, DedupMap* distinct_tuples,
-      TRowBatch* output_batch);
+  Status SerializeInternal(int64_t size, DedupMap* distinct_tuples,
+      vector<int32_t>* tuple_offsets, string* tuple_data);
 
   /// All members below need to be handled in RowBatch::AcquireState()
 
@@ -384,25 +506,15 @@ class RowBatch {
   /// Array of pointers with InitialCapacity() * num_tuples_per_row_ elements.
   /// The memory ownership depends on whether legacy joins and aggs are enabled.
   ///
-  /// Memory is malloc'd and owned by RowBatch:
-  /// If enable_partitioned_hash_join=true and enable_partitioned_aggregation=true
-  /// then the memory is owned by this RowBatch and is freed upon its destruction.
-  /// This mode is more performant especially with SubplanNodes in the ExecNode tree
-  /// because the tuple pointers are not transferred and do not have to be re-created
-  /// in every Reset().
-  ///
-  /// Memory is allocated from MemPool:
-  /// Otherwise, the memory is allocated from tuple_data_pool_. As a result, the
-  /// pointer memory is transferred just like tuple data, and must be re-created
-  /// in Reset(). This mode is required for the legacy join and agg which rely on
-  /// the tuple pointers being allocated from the tuple_data_pool_, so they can
-  /// acquire ownership of the tuple pointers.
-  int tuple_ptrs_size_;
-  Tuple** tuple_ptrs_;
+  /// Memory is malloc'd and owned by RowBatch and is freed upon its destruction. This is
+  /// more performant that allocating the pointers from 'tuple_data_pool_' especially
+  /// with SubplanNodes in the ExecNode tree because the tuple pointers are not
+  /// transferred and do not have to be re-created in every Reset().
+  const int tuple_ptrs_size_;
+  Tuple** tuple_ptrs_ = nullptr;
 
-  /// Sum of all auxiliary bytes. This includes IoBuffers and memory from
-  /// TransferResourceOwnership().
-  int64_t auxiliary_mem_usage_;
+  /// Total bytes of BufferPool buffers attached to this batch.
+  int64_t attached_buffer_bytes_;
 
   /// holding (some of the) data referenced by rows
   MemPool tuple_data_pool_;
@@ -410,25 +522,29 @@ class RowBatch {
   // Less frequently used members that are not accessed on performance-critical paths
   // should go below here.
 
-  /// Full row descriptor for rows in this batch.
-  RowDescriptor row_desc_;
+  /// Full row descriptor for rows in this batch. Owned by the exec node that produced
+  /// this batch.
+  const RowDescriptor* row_desc_;
 
   MemTracker* mem_tracker_;  // not owned
 
-  /// IO buffers current owned by this row batch. Ownership of IO buffers transfer
-  /// between row batches. Any IO buffer will be owned by at most one row batch
-  /// (i.e. they are not ref counted) so most row batches don't own any.
-  std::vector<DiskIoMgr::BufferDescriptor*> io_buffers_;
+  struct BufferInfo {
+    BufferPool::ClientHandle* client = nullptr;
+    BufferPool::BufferHandle buffer;
+  };
 
-  /// Blocks attached to this row batch. The underlying memory and block manager client
-  /// are owned by the BufferedBlockMgr.
-  std::vector<BufferedBlockMgr::Block*> blocks_;
+  /// Pages attached to this row batch. See AddBuffer() for ownership semantics.
+  std::vector<BufferInfo> buffers_;
+
+  /// The BufferInfo for the 'tuple_ptrs_' which are allocated from the buffer pool.
+  std::unique_ptr<BufferInfo> tuple_ptrs_info_;
 
   /// String to write compressed tuple data to in Serialize().
-  /// This is a string so we can swap() with the string in the TRowBatch we're serializing
-  /// to (we don't compress directly into the TRowBatch in case the compressed data is
-  /// longer than the uncompressed data). Swapping avoids copying data to the TRowBatch and
-  /// avoids excess memory allocations: since we reuse RowBatchs and TRowBatchs, and
+  /// This is a string so we can swap() with the string in the serialized row batch
+  /// (i.e. TRowBatch or OutboundRowBatch) we're serializing to (we don't compress
+  /// directly into the serialized row batch in case the compressed data is longer than
+  /// the uncompressed data). Swapping avoids copying data to the serialized row batch
+  /// and avoids excess memory allocations: since we reuse the serialized row batches, and
   /// assuming all row batches are roughly the same size, all strings will eventually be
   /// allocated to the right size.
   std::string compression_scratch_;

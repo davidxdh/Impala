@@ -31,13 +31,15 @@
 #include "codegen/llvm-codegen.h"
 #include "common/init.h"
 #include "common/object-pool.h"
-#include "exprs/expr-context.h"
 #include "exprs/is-null-predicate.h"
 #include "exprs/like-predicate.h"
 #include "exprs/literal.h"
 #include "exprs/null-literal.h"
+#include "exprs/scalar-expr.h"
+#include "exprs/scalar-expr-evaluator.h"
 #include "exprs/string-functions.h"
 #include "exprs/timestamp-functions.h"
+#include "exprs/timezone_db.h"
 #include "gen-cpp/Exprs_types.h"
 #include "gen-cpp/hive_metastore_types.h"
 #include "rpc/thrift-client.h"
@@ -47,7 +49,9 @@
 #include "runtime/mem-tracker.h"
 #include "runtime/raw-value.inline.h"
 #include "runtime/string-value.h"
+#include "runtime/timestamp-parse-util.h"
 #include "runtime/timestamp-value.h"
+#include "runtime/timestamp-value.inline.h"
 #include "service/fe-support.h"
 #include "service/impala-server.h"
 #include "testutil/impalad-query-executor.h"
@@ -73,7 +77,6 @@ using boost::posix_time::to_tm;
 using std::numeric_limits;
 using namespace Apache::Hadoop::Hive;
 using namespace impala;
-using namespace llvm;
 
 namespace impala {
 ImpaladQueryExecutor* executor_;
@@ -210,7 +213,7 @@ class ExprTest : public testing::Test {
     default_decimal_str_ = "1.23";
     default_bool_val_ = false;
     default_string_val_ = "abc";
-    default_timestamp_val_ = TimestampValue(1293872461);
+    default_timestamp_val_ = TimestampValue::FromUnixTime(1293872461);
     default_type_strs_[TYPE_TINYINT] =
         lexical_cast<string>(min_int_values_[TYPE_TINYINT]);
     default_type_strs_[TYPE_SMALLINT] =
@@ -275,70 +278,123 @@ class ExprTest : public testing::Test {
     return results;
   }
 
+  void TestLastDayFunction() {
+    // Test common months (with and without time component).
+    TestTimestampValue("last_day('2003-01-02 04:24:04.1579')",
+      TimestampValue::Parse("2003-01-31 00:00:00", 19));
+    TestTimestampValue("last_day('2003-02-02')",
+      TimestampValue::Parse("2003-02-28 00:00:00"));
+    TestTimestampValue("last_day('2003-03-02 03:21:12.0058')",
+      TimestampValue::Parse("2003-03-31 00:00:00"));
+    TestTimestampValue("last_day('2003-04-02')",
+      TimestampValue::Parse("2003-04-30 00:00:00"));
+    TestTimestampValue("last_day('2003-05-02')",
+      TimestampValue::Parse("2003-05-31 00:00:00"));
+    TestTimestampValue("last_day('2003-06-02')",
+      TimestampValue::Parse("2003-06-30 00:00:00"));
+    TestTimestampValue("last_day('2003-07-02 00:01:01.125')",
+      TimestampValue::Parse("2003-07-31 00:00:00"));
+    TestTimestampValue("last_day('2003-08-02')",
+      TimestampValue::Parse("2003-08-31 00:00:00"));
+    TestTimestampValue("last_day('2003-09-02')",
+      TimestampValue::Parse("2003-09-30 00:00:00"));
+    TestTimestampValue("last_day('2003-10-02')",
+      TimestampValue::Parse("2003-10-31 00:00:00"));
+    TestTimestampValue("last_day('2003-11-02 12:30:16')",
+      TimestampValue::Parse("2003-11-30 00:00:00"));
+    TestTimestampValue("last_day('2003-12-02')",
+      TimestampValue::Parse("2003-12-31 00:00:00"));
+
+    // Test leap years and special cases.
+    TestTimestampValue("last_day('2004-02-13')",
+      TimestampValue::Parse("2004-02-29 00:00:00"));
+    TestTimestampValue("last_day('2008-02-13')",
+      TimestampValue::Parse("2008-02-29 00:00:00"));
+    TestTimestampValue("last_day('2000-02-13')",
+      TimestampValue::Parse("2000-02-29 00:00:00"));
+    TestTimestampValue("last_day('1900-02-13')",
+      TimestampValue::Parse("1900-02-28 00:00:00"));
+    TestTimestampValue("last_day('2100-02-13')",
+      TimestampValue::Parse("2100-02-28 00:00:00"));
+
+    // Test corner cases.
+    TestTimestampValue("last_day('1400-01-01 00:00:00')",
+      TimestampValue::Parse("1400-01-31 00:00:00"));
+    TestTimestampValue("last_day('9999-12-31 23:59:59')",
+      TimestampValue::Parse("9999-12-31 00:00:00"));
+
+    // Test invalid input.
+    TestIsNull("last_day('12202010')", TYPE_TIMESTAMP);
+    TestIsNull("last_day('')", TYPE_TIMESTAMP);
+    TestIsNull("last_day(NULL)", TYPE_TIMESTAMP);
+    TestIsNull("last_day('02-13-2014')", TYPE_TIMESTAMP);
+    TestIsNull("last_day('00:00:00')", TYPE_TIMESTAMP);
+  }
+
   void TestNextDayFunction() {
     // Sequential test cases
     TestTimestampValue("next_day('2016-05-01','Sunday')",
-      TimestampValue("2016-05-08 00:00:00", 19));
+      TimestampValue::Parse("2016-05-08 00:00:00", 19));
     TestTimestampValue("next_day('2016-05-01','Monday')",
-      TimestampValue("2016-05-02 00:00:00", 19));
+      TimestampValue::Parse("2016-05-02 00:00:00", 19));
     TestTimestampValue("next_day('2016-05-01','Tuesday')",
-      TimestampValue("2016-05-03 00:00:00", 19));
+      TimestampValue::Parse("2016-05-03 00:00:00", 19));
     TestTimestampValue("next_day('2016-05-01','Wednesday')",
-      TimestampValue("2016-05-04 00:00:00", 19));
+      TimestampValue::Parse("2016-05-04 00:00:00", 19));
     TestTimestampValue("next_day('2016-05-01','Thursday')",
-      TimestampValue("2016-05-05 00:00:00", 19));
+      TimestampValue::Parse("2016-05-05 00:00:00", 19));
     TestTimestampValue("next_day('2016-05-01','Friday')",
-      TimestampValue("2016-05-06 00:00:00", 19));
+      TimestampValue::Parse("2016-05-06 00:00:00", 19));
     TestTimestampValue("next_day('2016-05-01','Saturday')",
-      TimestampValue("2016-05-07 00:00:00", 19));
+      TimestampValue::Parse("2016-05-07 00:00:00", 19));
 
     // Random test cases
     TestTimestampValue("next_day('1910-01-18','SunDay')",
-      TimestampValue("1910-01-23 00:00:00", 19));
+      TimestampValue::Parse("1910-01-23 00:00:00", 19));
     TestTimestampValue("next_day('1916-06-05', 'SUN')",
-      TimestampValue("1916-06-11 00:00:00", 19));
+      TimestampValue::Parse("1916-06-11 00:00:00", 19));
     TestTimestampValue("next_day('1932-11-08','monday')",
-      TimestampValue("1932-11-14 00:00:00", 19));
+      TimestampValue::Parse("1932-11-14 00:00:00", 19));
     TestTimestampValue("next_day('1933-09-11','Mon')",
-      TimestampValue("1933-09-18 00:00:00", 19));
+      TimestampValue::Parse("1933-09-18 00:00:00", 19));
     TestTimestampValue("next_day('1934-03-21','TUeSday')",
-      TimestampValue("1934-03-27 00:00:00", 19));
+      TimestampValue::Parse("1934-03-27 00:00:00", 19));
     TestTimestampValue("next_day('1954-02-25','tuE')",
-      TimestampValue("1954-03-02 00:00:00", 19));
+      TimestampValue::Parse("1954-03-02 00:00:00", 19));
     TestTimestampValue("next_day('1965-04-18','WeDneSdaY')",
-      TimestampValue("1965-04-21 00:00:00", 19));
+      TimestampValue::Parse("1965-04-21 00:00:00", 19));
     TestTimestampValue("next_day('1966-08-29','wed')",
-      TimestampValue("1966-08-31 00:00:00", 19));
+      TimestampValue::Parse("1966-08-31 00:00:00", 19));
     TestTimestampValue("next_day('1968-07-23','tHurSday')",
-      TimestampValue("1968-07-25 00:00:00", 19));
+      TimestampValue::Parse("1968-07-25 00:00:00", 19));
     TestTimestampValue("next_day('1969-05-28','thu')",
-      TimestampValue("1969-05-29 00:00:00", 19));
+      TimestampValue::Parse("1969-05-29 00:00:00", 19));
     TestTimestampValue("next_day('1989-10-12','fRIDay')",
-      TimestampValue("1989-10-13 00:00:00", 19));
+      TimestampValue::Parse("1989-10-13 00:00:00", 19));
     TestTimestampValue("next_day('1973-10-02','frI')",
-      TimestampValue("1973-10-05 00:00:00", 19));
+      TimestampValue::Parse("1973-10-05 00:00:00", 19));
     TestTimestampValue("next_day('2000-02-29','saTUrDaY')",
-      TimestampValue("2000-03-04 00:00:00", 19));
+      TimestampValue::Parse("2000-03-04 00:00:00", 19));
     TestTimestampValue("next_day('2013-04-12','sat')",
-      TimestampValue("2013-04-13 00:00:00", 19));
+      TimestampValue::Parse("2013-04-13 00:00:00", 19));
     TestTimestampValue("next_day('2013-12-25','Saturday')",
-      TimestampValue("2013-12-28 00:00:00", 19));
+      TimestampValue::Parse("2013-12-28 00:00:00", 19));
 
     // Explicit timestamp conversion tests
     TestTimestampValue("next_day(to_timestamp('12-27-2008', 'MM-dd-yyyy'), 'moN')",
-      TimestampValue("2008-12-29 00:00:00", 19));
+      TimestampValue::Parse("2008-12-29 00:00:00", 19));
     TestTimestampValue("next_day(to_timestamp('2007-20-10 11:22', 'yyyy-dd-MM HH:mm'),\
-      'TUeSdaY')", TimestampValue("2007-10-23 11:22:00", 19));
+      'TUeSdaY')", TimestampValue::Parse("2007-10-23 11:22:00", 19));
     TestTimestampValue("next_day(to_timestamp('18-11-2070 09:12', 'dd-MM-yyyy HH:mm'),\
-      'WeDneSdaY')", TimestampValue("2070-11-19 09:12:00", 19));
+      'WeDneSdaY')", TimestampValue::Parse("2070-11-19 09:12:00", 19));
     TestTimestampValue("next_day(to_timestamp('12-1900-05', 'dd-yyyy-MM'), 'tHurSday')",
-      TimestampValue("1900-05-17 00:00:00", 19));
+      TimestampValue::Parse("1900-05-17 00:00:00", 19));
     TestTimestampValue("next_day(to_timestamp('08-1987-21', 'MM-yyyy-dd'), 'FRIDAY')",
-      TimestampValue("1987-08-28 00:00:00", 19));
+      TimestampValue::Parse("1987-08-28 00:00:00", 19));
     TestTimestampValue("next_day(to_timestamp('02-04-2001', 'dd-MM-yyyy'), 'SAT')",
-      TimestampValue("2001-04-07 00:00:00", 19));
+      TimestampValue::Parse("2001-04-07 00:00:00", 19));
     TestTimestampValue("next_day(to_timestamp('1970-01-31 00:00:00',\
-      'yyyy-MM-dd HH:mm:ss'), 'SunDay')", TimestampValue("1970-02-01 00:00:00", 19));
+      'yyyy-MM-dd HH:mm:ss'), 'SunDay')", TimestampValue::Parse("1970-02-01 00:00:00", 19));
 
     // Invalid input: unacceptable date parameter
     TestIsNull("next_day('12202010','Saturday')", TYPE_TIMESTAMP);
@@ -438,15 +494,15 @@ class ExprTest : public testing::Test {
     switch (expected_type.GetByteSize()) {
       case 4:
         EXPECT_EQ(expected_result.value(), StringParser::StringToDecimal<int32_t>(
-            &value[0], value.size(), expected_type, &result).value()) << query;
+            value.data(), value.size(), expected_type, false, &result).value()) << query;
         break;
       case 8:
         EXPECT_EQ(expected_result.value(), StringParser::StringToDecimal<int64_t>(
-            &value[0], value.size(), expected_type, &result).value()) << query;
+            value.data(), value.size(), expected_type, false, &result).value()) << query;
         break;
       case 16:
         EXPECT_EQ(expected_result.value(), StringParser::StringToDecimal<int128_t>(
-            &value[0], value.size(), expected_type, &result).value()) << query;
+            value.data(), value.size(), expected_type, false, &result).value()) << query;
         break;
       default:
         EXPECT_TRUE(false) << expected_type << " " << expected_type.GetByteSize();
@@ -954,6 +1010,24 @@ class ExprTest : public testing::Test {
     // Check factorial function exists as alias
     TestValue("factorial(3!)", TYPE_BIGINT, 720);
   }
+
+  template<typename T>
+  TimestampValue CreateTestTimestamp(T val);
+
+  // Parse the given string representation of a value into 'val' of type T.
+  // Returns false on parse failure.
+  template<class T>
+  bool ParseString(const string& str, T* val);
+
+  // Create a Literal expression out of 'str'.
+  Literal* CreateLiteral(const ColumnType& type, const string& str);
+
+  // Helper function for LiteralConstruction test. Creates a Literal expression
+  // of 'type' from 'str' and verifies it compares equally to 'value'.
+  template <typename T>
+  void TestSingleLiteralConstruction(
+      const ColumnType& type, const T& value, const string& string_val);
+
   // Test casting stmt to all types.  Expected result is val.
   template<typename T>
   void TestCast(const string& stmt, T val, bool timestamp_out_of_range = false) {
@@ -968,12 +1042,37 @@ class ExprTest : public testing::Test {
     TestValue("cast(" + stmt + " as real)", TYPE_DOUBLE, static_cast<double>(val));
     TestStringValue("cast(" + stmt + " as string)", lexical_cast<string>(val));
     if (!timestamp_out_of_range) {
-      TestTimestampValue("cast(" + stmt + " as timestamp)", TimestampValue(val));
+      TestTimestampValue("cast(" + stmt + " as timestamp)", CreateTestTimestamp(val));
     } else {
       TestIsNull("cast(" + stmt + " as timestamp)", TYPE_TIMESTAMP);
     }
   }
 };
+
+template<>
+TimestampValue ExprTest::CreateTestTimestamp(const string& val) {
+  return TimestampValue::Parse(val);
+}
+
+template<>
+TimestampValue ExprTest::CreateTestTimestamp(float val) {
+  return TimestampValue::FromSubsecondUnixTime(val);
+}
+
+template<>
+TimestampValue ExprTest::CreateTestTimestamp(double val) {
+  return TimestampValue::FromSubsecondUnixTime(val);
+}
+
+template<>
+TimestampValue ExprTest::CreateTestTimestamp(int val) {
+  return TimestampValue::FromUnixTime(val);
+}
+
+template<>
+TimestampValue ExprTest::CreateTestTimestamp(int64_t val) {
+  return TimestampValue::FromUnixTime(val);
+}
 
 // Test casting 'stmt' to each of the native types.  The result should be 'val'
 // 'stmt' is a partial stmt that could be of any valid type.
@@ -1011,30 +1110,36 @@ bool ExprTest::ConvertValue<bool>(const string& value) {
 template <>
 int8_t ExprTest::ConvertValue<int8_t>(const string& value) {
   StringParser::ParseResult result;
-  return StringParser::StringToInt<int8_t>(&value[0], value.size(), &result);
+  return StringParser::StringToInt<int8_t>(value.data(), value.size(), &result);
 }
 
 template <>
 int16_t ExprTest::ConvertValue<int16_t>(const string& value) {
   StringParser::ParseResult result;
-  return StringParser::StringToInt<int16_t>(&value[0], value.size(), &result);
+  return StringParser::StringToInt<int16_t>(value.data(), value.size(), &result);
 }
 
 template <>
 int32_t ExprTest::ConvertValue<int32_t>(const string& value) {
   StringParser::ParseResult result;
-  return StringParser::StringToInt<int32_t>(&value[0], value.size(), &result);
+  return StringParser::StringToInt<int32_t>(value.data(), value.size(), &result);
 }
 
 template <>
 int64_t ExprTest::ConvertValue<int64_t>(const string& value) {
   StringParser::ParseResult result;
-  return StringParser::StringToInt<int64_t>(&value[0], value.size(), &result);
+  return StringParser::StringToInt<int64_t>(value.data(), value.size(), &result);
+}
+
+template <>
+double ExprTest::ConvertValue<double>(const string& value) {
+  StringParser::ParseResult result;
+  return StringParser::StringToFloat<double>(value.data(), value.size(), &result);
 }
 
 template <>
 TimestampValue ExprTest::ConvertValue<TimestampValue>(const string& value) {
-  return TimestampValue(&value[0], value.size());
+  return TimestampValue::Parse(value.data(), value.size());
 }
 
 // We can't put this into TestValue() because GTest can't resolve
@@ -1051,34 +1156,114 @@ void ExprTest::TestValidTimestampValue(const string& expr) {
       ConvertValue<TimestampValue>(GetValue(expr, TYPE_TIMESTAMP)).HasDateOrTime());
 }
 
+template<class T>
+bool ExprTest::ParseString(const string& str, T* val) {
+  istringstream stream(str);
+  stream >> *val;
+  return !stream.fail();
+}
+
+template<>
+bool ExprTest::ParseString(const string& str, TimestampValue* val) {
+  boost::gregorian::date date;
+  boost::posix_time::time_duration time;
+  bool success = TimestampParser::Parse(str.data(), str.length(), &date, &time);
+  val->set_date(date);
+  val->set_time(time);
+  return success;
+}
+
+Literal* ExprTest::CreateLiteral(const ColumnType& type, const string& str) {
+  switch (type.type) {
+    case TYPE_BOOLEAN: {
+      bool v = false;
+      EXPECT_TRUE(ParseString<bool>(str, &v));
+      return new Literal(type, v);
+    }
+    case TYPE_TINYINT: {
+      int8_t v = 0;
+      EXPECT_TRUE(ParseString<int8_t>(str, &v));
+      return new Literal(type, v);
+    }
+    case TYPE_SMALLINT: {
+      int16_t v = 0;
+      EXPECT_TRUE(ParseString<int16_t>(str, &v));
+      return new Literal(type, v);
+    }
+    case TYPE_INT: {
+      int32_t v = 0;
+      EXPECT_TRUE(ParseString<int32_t>(str, &v));
+      return new Literal(type, v);
+    }
+    case TYPE_BIGINT: {
+      int64_t v = 0;
+      EXPECT_TRUE(ParseString<int64_t>(str, &v));
+      return new Literal(type, v);
+    }
+    case TYPE_FLOAT: {
+      float v = 0;
+      EXPECT_TRUE(ParseString<float>(str, &v));
+      return new Literal(type, v);
+    }
+    case TYPE_DOUBLE: {
+      double v = 0;
+      EXPECT_TRUE(ParseString<double>(str, &v));
+      return new Literal(type, v);
+    }
+    case TYPE_STRING:
+    case TYPE_VARCHAR:
+    case TYPE_CHAR:
+      return new Literal(type, str);
+    case TYPE_TIMESTAMP: {
+      TimestampValue v;
+      EXPECT_TRUE(ParseString<TimestampValue>(str, &v));
+      return new Literal(type, v);
+    }
+    case TYPE_DECIMAL: {
+      double v = 0;
+      EXPECT_TRUE(ParseString<double>(str, &v));
+      return new Literal(type, v);
+    }
+    default:
+      DCHECK(false) << "Invalid type: " << type.DebugString();
+      return nullptr;
+  }
+}
+
 template <typename T>
-void TestSingleLiteralConstruction(
+void ExprTest::TestSingleLiteralConstruction(
     const ColumnType& type, const T& value, const string& string_val) {
   ObjectPool pool;
-  RowDescriptor desc;
-  RuntimeState state{TQueryCtx(), ExecEnv::GetInstance(), "test-pool"};
+  RuntimeState state(TQueryCtx(), ExecEnv::GetInstance());
   MemTracker tracker;
+  MemPool mem_pool(&tracker);
 
-  Expr* expr = pool.Add(new Literal(type, value));
-  ExprContext ctx(expr);
-  EXPECT_OK(ctx.Prepare(&state, desc, &tracker));
-  EXPECT_OK(ctx.Open(&state));
-  EXPECT_EQ(0, RawValue::Compare(ctx.GetValue(NULL), &value, type))
+  Literal* expr = CreateLiteral(type, string_val);
+  ScalarExprEvaluator* eval;
+  EXPECT_OK(
+      ScalarExprEvaluator::Create(*expr, &state, &pool, &mem_pool, &mem_pool, &eval));
+  EXPECT_OK(eval->Open(&state));
+  EXPECT_EQ(0, RawValue::Compare(eval->GetValue(nullptr), &value, type))
       << "type: " << type << ", value: " << value;
-  ctx.Close(&state);
+  eval->Close(&state);
+  expr->Close();
   state.ReleaseResources();
 }
 
 TEST_F(ExprTest, NullLiteral) {
   for (int type = TYPE_BOOLEAN; type != TYPE_DATE; ++type) {
-    NullLiteral expr(static_cast<PrimitiveType>(type));
-    ExprContext ctx(&expr);
-    RuntimeState state{TQueryCtx(), ExecEnv::GetInstance(), "test-pool"};
+    RuntimeState state(TQueryCtx(), ExecEnv::GetInstance());
+    ObjectPool pool;
     MemTracker tracker;
-    EXPECT_OK(ctx.Prepare(&state, RowDescriptor(), &tracker));
-    EXPECT_OK(ctx.Open(&state));
-    EXPECT_TRUE(ctx.GetValue(NULL) == NULL);
-    ctx.Close(&state);
+    MemPool mem_pool(&tracker);
+
+    NullLiteral expr(static_cast<PrimitiveType>(type));
+    ScalarExprEvaluator* eval;
+    EXPECT_OK(
+        ScalarExprEvaluator::Create(expr, &state, &pool, &mem_pool, &mem_pool, &eval));
+    EXPECT_OK(eval->Open(&state));
+    EXPECT_TRUE(eval->GetValue(nullptr) == nullptr);
+    eval->Close(&state);
     state.ReleaseResources();
   }
 }
@@ -1152,6 +1337,42 @@ TEST_F(ExprTest, LiteralExprs) {
   TestValue("false", TYPE_BOOLEAN, false);
   TestStringValue("'test'", "test");
   TestIsNull("null", TYPE_NULL);
+}
+
+// IMPALA-3942: Test escaping string literal for single/double quotes
+TEST_F(ExprTest, EscapeStringLiteral) {
+  TestStringValue(R"('"')", R"(")");
+  TestStringValue(R"("'")", R"(')");
+  TestStringValue(R"("\"")", R"(")");
+  TestStringValue(R"('\'')", R"(')");
+  TestStringValue(R"('\\"')", R"(\")");
+  TestStringValue(R"("\\'")", R"(\')");
+  TestStringValue(R"("\\\"")", R"(\")");
+  TestStringValue(R"('\\\'')", R"(\')");
+  TestStringValue(R"("\\\"\\'\\\"")", R"(\"\'\")");
+  TestStringValue(R"('\\\'\\"\\\'')", R"(\'\"\')");
+  TestStringValue(R"("\\")", R"(\)");
+  TestStringValue(R"('\\')", R"(\)");
+  TestStringValue(R"("\\\\")", R"(\\)");
+  TestStringValue(R"('\\\\')", R"(\\)");
+  TestStringValue(R"('a"b')", R"(a"b)");
+  TestStringValue(R"("a'b")", R"(a'b)");
+  TestStringValue(R"('a\"b')", R"(a"b)");
+  TestStringValue(R"('a\'b')", R"(a'b)");
+  TestStringValue(R"("a\"b")", R"(a"b)");
+  TestStringValue(R"("a\'b")", R"(a'b)");
+  TestStringValue(R"('a\\"b')", R"(a\"b)");
+  TestStringValue(R"("a\\'b")", R"(a\'b)");
+  TestStringValue(R"('a\\\'b')", R"(a\'b)");
+  TestStringValue(R"("a\\\"b")", R"(a\"b)");
+  TestStringValue(R"(concat("a'b", "c'd"))", R"(a'bc'd)");
+  TestStringValue(R"(concat('a"b', 'c"d'))", R"(a"bc"d)");
+  TestStringValue(R"(concat("a'b", 'c"d'))", R"(a'bc"d)");
+  TestStringValue(R"(concat('a"b', "c'd"))", R"(a"bc'd)");
+  TestStringValue(R"(concat("a\"b", 'c\'d'))", R"(a"bc'd)");
+  TestStringValue(R"(concat('a\'b', "c\"d"))", R"(a'bc"d)");
+  TestStringValue(R"(concat("a\\\"b", 'c\\\'d'))", R"(a\"bc\'d)");
+  TestStringValue(R"(concat('a\\\'b', "c\\\"d"))", R"(a\'bc\"d)");
 }
 
 TEST_F(ExprTest, ArithmeticExprs) {
@@ -1296,6 +1517,7 @@ TEST_F(ExprTest, ArithmeticExprs) {
 // Use a table-driven approach to test DECIMAL expressions to make it easier to test
 // both the old (decimal_v2=false) and new (decimal_v2=true) DECIMAL semantics.
 struct DecimalExpectedResult {
+  bool error;
   bool null;
   int128_t scaled_val;
   int precision;
@@ -1323,734 +1545,1342 @@ struct DecimalTestCase {
   DecimalExpectedResult expected[2];
 };
 
+// Utility function to construct int128 types.
+int128_t StringToInt128(string s) {
+  int128_t result = 0;
+  int sign = 1;
+  int digit = 0;
+  for (int i = 0; i < s.length(); ++i) {
+    switch (s[i]) {
+      case '-':
+        digit = -1;
+        break;
+      case '0':
+        digit = 0;
+        break;
+      case '1':
+        digit = 1;
+        break;
+      case '2':
+        digit = 2;
+        break;
+      case '3':
+        digit = 3;
+        break;
+      case '4':
+        digit = 4;
+        break;
+      case '5':
+        digit = 5;
+        break;
+      case '6':
+        digit = 6;
+        break;
+      case '7':
+        digit = 7;
+        break;
+      case '8':
+        digit = 8;
+        break;
+      case '9':
+        digit = 9;
+        break;
+      default:
+        DCHECK(false) << "Unexpected character.";
+    }
+    if (digit == -1) {
+      DCHECK_EQ(sign, 1) << "Minus symbol appears multiple times.";
+      sign = -1;
+    } else {
+      result = result * 10 + digit;
+    }
+  }
+  return sign * result;
+}
+
 // Format is:
 // { Test Expression (as a string),
-//  { expected null, scaled_val, precision, scale for V1
-//    expected null, scaled_val, precision, scale for V2 }}
+//  { expected error, expected null, scaled_val, precision, scale for V1
+//    expected error, expected null, scaled_val, precision, scale for V2 }}
 DecimalTestCase decimal_cases[] = {
   // Test add/subtract operators
-  { "1.23 + cast(1 as decimal(4,3))", {{ false, 2230, 5, 3 }}},
-  { "1.23 - cast(0.23 as decimal(10,3))", {{ false, 1000, 11, 3 }}},
-  { "cast(1.23 as decimal(8,2)) + cast(1 as decimal(20,3))", {{ false, 2230, 21, 3 }}},
-  { "cast(1.23 as decimal(30,2)) - cast(1 as decimal(4,3))", {{ false, 230, 32, 3 }}},
-  { "cast(1 as decimal(38,0)) + cast(.2 as decimal(38,1))", {{ false, 12, 38, 1 }}},
+  { "1.23 + cast(1 as decimal(4,3))", {{ false, false, 2230, 5, 3 }}},
+  { "1.23 - cast(0.23 as decimal(10,3))", {{ false, false, 1000, 11, 3 }}},
+  { "cast(1.23 as decimal(8,2)) + cast(1 as decimal(20,3))",
+      {{ false, false, 2230, 21, 3 }}},
+  { "cast(1.23 as decimal(30,2)) - cast(1 as decimal(4,3))",
+      {{ false, false, 230, 32, 3 }}},
+  { "cast(1 as decimal(38,0)) + cast(0.2 as decimal(38,1))",
+      {{ false, false, 12, 38, 1 }}},
+  { "cast(88928 as decimal(11,2)) + cast(0 as decimal(9,1))",
+      {{ false, false, 8892800, 12, 2 }}},
+  { "cast(100000000000000000000000000000000 as decimal(38,0)) + "
+    "cast(0 as decimal(38,38))",
+    {{ false, true, 0, 38, 38 },
+     { true, false, 0, 38, 6 }}},
+  { "cast(-100000000000000000000000000000000 as decimal(38,0)) + "
+    "cast(0 as decimal(38,38))",
+    {{ false, true, 0, 38, 38 },
+     { true, false, 0, 38, 6 }}},
+  { "cast(99999999999999999999999999999999 as decimal(38,0)) + "
+    "cast(0 as decimal(38,38))",
+    {{ false, true, 0, 38, 38 },
+     { false, false, StringToInt128("99999999999999999999999999999999000000"), 38, 6 }}},
+  { "cast(-99999999999999999999999999999999 as decimal(38,0)) + "
+    "cast(0 as decimal(38,38))",
+    {{ false, true, 0, 38, 38 },
+     { false, false, StringToInt128("-99999999999999999999999999999999000000"), 38, 6 }}},
+  { "cast(99999999999999999999999999.9999999999 as decimal(36,10)) + "
+    "cast(99999999999999999999999999.9999999999 as decimal(36,10))",
+    {{ false, false, StringToInt128("1999999999999999999999999999999999998"), 37, 10 }}},
+  { "cast(99999999999999999999999999.9999999999 as decimal(36,10)) + "
+    "cast(-99999999999999999999999999.9999999999 as decimal(36,10))",
+    {{ false, false, 0, 37, 10 }}},
+  { "cast(999999999999999999999999999.9999999999 as decimal(37,10)) + "
+    "cast(999999999999999999999999999.9999999999 as decimal(37,10))",
+    {{ false, false, StringToInt128("19999999999999999999999999999999999998"), 38, 10 }}},
+  { "cast(999999999999999999999999999.9999999999 as decimal(37,10)) + "
+    "cast(-999999999999999999999999999.9999999999 as decimal(37,10))",
+    {{ false, false, 0, 38, 10 }}},
+  // Largest simple case where we don't call AddLarge() or AubtractLarge().
+  // We are adding (2^125 - 1) + (2^125 - 1) here.
+  { "cast(42535295865117307932921825928971026431 as decimal(38,0)) + "
+    "cast(42535295865117307932921825928971026431 as decimal(38,0))",
+    {{ false, false, StringToInt128("85070591730234615865843651857942052862"), 38, 0 }}},
+  { "cast(-42535295865117307932921825928971026431 as decimal(38,0)) + "
+    "cast(-42535295865117307932921825928971026431 as decimal(38,0))",
+    {{ false, false, StringToInt128("-85070591730234615865843651857942052862"), 38, 0 }}},
+  { "cast(42535295865117307932921825928971026431 as decimal(38,0)) + "
+    "cast(-42535295865117307932921825928971026431 as decimal(38,0))",
+    {{ false, false, 0, 38, 0 }}},
+  // Smallest case where we call AddLarge(). We are adding (2^125) + (2^125 - 1) here.
+  { "cast(42535295865117307932921825928971026432 as decimal(38,0)) + "
+    "cast(42535295865117307932921825928971026431 as decimal(38,0))",
+    {{ false, false, StringToInt128("85070591730234615865843651857942052863"), 38, 0 }}},
+  { "cast(-42535295865117307932921825928971026432 as decimal(38,0)) + "
+    "cast(-42535295865117307932921825928971026431 as decimal(38,0))",
+    {{ false, false, StringToInt128("-85070591730234615865843651857942052863"), 38, 0 }}},
+  { "cast(42535295865117307932921825928971026432 as decimal(38,0)) + "
+    "cast(-42535295865117307932921825928971026431 as decimal(38,0))",
+    {{ false, false, 1, 38, 0 }}},
+  { "cast(99999999999999999999999999999999.999999 as decimal(38,6)) + "
+    "cast(8899999999999999999999999999999.999999 as decimal(38,6))",
+    {{ false, true, 0, 38, 6 },
+     { true, false, 0, 38, 6 }}},
+  { "cast(-99999999999999999999999999999999.999999 as decimal(38,6)) + "
+    "cast(-8899999999999999999999999999999.999999 as decimal(38,6))",
+    {{ false, true, 0, 38, 6 },
+     { true, false, 0, 38, 6 }}},
+  { "cast(-99999999999999999999999999999999.999999 as decimal(38,6)) + "
+    "cast(8899999999999999999999999999999.999999 as decimal(38,6))",
+    {{ false, false, StringToInt128("-91100000000000000000000000000000000000"), 38, 6 }}},
+  // Close to the maximum value.
+  { "cast(77777777777777777777777777777777.777777 as decimal(38,6)) + "
+    "cast(22222222222222222222222222222222.222222 as decimal(38,6))",
+    {{ false, false, StringToInt128("99999999999999999999999999999999999999"), 38, 6 }}},
+  { "cast(-77777777777777777777777777777777.777777 as decimal(38,6)) + "
+    "cast(22222222222222222222222222222222.222222 as decimal(38,6))",
+    {{ false, false, StringToInt128("-55555555555555555555555555555555555555"), 38, 6 }}},
+  { "cast(-77777777777777777777777777777777.777777 as decimal(38,6)) + "
+    "cast(-22222222222222222222222222222222.222222 as decimal(38,6))",
+    {{ false, false, StringToInt128("-99999999999999999999999999999999999999"), 38, 6 }}},
+  // Smallest result that overflows.
+  { "cast(77777777777777777777777777777777.777777 as decimal(38,6)) + "
+    "cast(22222222222222222222222222222222.222223 as decimal(38,6))",
+    {{ false, true, 0, 38, 6 },
+     { true, false, 0, 38, 6 }}},
+  { "cast(-77777777777777777777777777777777.777777 as decimal(38,6)) + "
+    "cast(-22222222222222222222222222222222.222223 as decimal(38,6))",
+    {{ false, true, 0, 38, 6 },
+     { true, false, 0, 38, 6 }}},
+  { "cast(11111111111111111111111111111111.777777 as decimal(38,6)) + "
+    "cast(11111111111111111111111111111111.555555 as decimal(38,6))",
+    {{ false, false, StringToInt128("22222222222222222222222222222223333332"), 38, 6 }}},
+  { "cast(-11111111111111111111111111111111.777777 as decimal(38,6)) + "
+    "cast(11111111111111111111111111111111.555555 as decimal(38,6))",
+    {{ false, false, -222222, 38, 6 }}},
+  { "cast(11111111111111111111111111111111.777777 as decimal(38,6)) + "
+    "cast(-11111111111111111111111111111111.555555 as decimal(38,6))",
+    {{ false, false, 222222, 38, 6 }}},
+  { "cast(-11111111111111111111111111111111.777777 as decimal(38,6)) + "
+    "cast(-11111111111111111111111111111111.555555 as decimal(38,6))",
+    {{ false, false, StringToInt128("-22222222222222222222222222222223333332"), 38, 6 }}},
+  { "cast(3333333333333333333333333333333.8888884 as decimal(38,7)) + "
+    "cast(3333333333333333333333333333333.1111111 as decimal(38,7))",
+    {{ false, false, StringToInt128("66666666666666666666666666666669999995"), 38, 7 },
+     { false, false, StringToInt128("6666666666666666666666666666667000000"), 38, 6 }}},
+  { "cast(-3333333333333333333333333333333.8888884 as decimal(38,7)) + "
+    "cast(-3333333333333333333333333333333.1111111 as decimal(38,7))",
+    {{ false, false, StringToInt128("-66666666666666666666666666666669999995"), 38, 7 },
+     { false, false, StringToInt128("-6666666666666666666666666666667000000"), 38, 6 }}},
+  { "cast(3333333333333333333333333333333.9999995 as decimal(38,7)) + "
+    "cast(0 as decimal(38,7))",
+    {{ false, false, StringToInt128("33333333333333333333333333333339999995"), 38, 7 },
+     { false, false, StringToInt128("3333333333333333333333333333334000000"), 38, 6 }}},
+  { "cast(-3333333333333333333333333333333.9999995 as decimal(38,7)) + "
+    "cast(0 as decimal(38,7))",
+    {{ false, false, StringToInt128("-33333333333333333333333333333339999995"), 38, 7 },
+     { false, false, StringToInt128("-3333333333333333333333333333334000000"), 38, 6 }}},
+  // overflow due to rounding
+  { "cast(99999999999999999999999999999999.999999 as decimal(38,6)) + "
+    "cast(0.0000005 as decimal(38,7))",
+    {{ false, true, 0, 38, 7 },
+     { true, false, 0, 38, 6 }}},
+  { "cast(-99999999999999999999999999999999.999999 as decimal(38,6)) + "
+    "cast(-0.0000005 as decimal(38,7))",
+    {{ false, true, 0, 38, 7 },
+     { true, false, 0, 38, 6 }}},
+  { "cast(99999999999999999999999999999999.999999 as decimal(38,6)) + "
+    "cast(-0.0000006 as decimal(38,7))",
+    {{ false, true, 0, 38, 7 },
+     { false, false, StringToInt128("99999999999999999999999999999999999998"), 38, 6 }}},
+  { "cast(99999999999999999999999999999999.999999 as decimal(38,6)) + "
+    "cast(0.0000004 as decimal(38,7))",
+    {{ false, true, 0, 38, 7 },
+     { false, false, StringToInt128("99999999999999999999999999999999999999"), 38, 6 }}},
+  { "cast(-99999999999999999999999999999999.999999 as decimal(38,6)) + "
+    "cast(-0.0000004 as decimal(38,7))",
+    {{ false, true, 0, 38, 7 },
+     { false, false, StringToInt128("-99999999999999999999999999999999999999"), 38, 6 }}},
+  { "cast(99999999999999999999999999999999 as decimal(38,0)) + "
+    "cast(0.9999994 as decimal(38,38))",
+    {{ false, true, 0, 38, 38 },
+     { false, false, StringToInt128("99999999999999999999999999999999999999"), 38, 6 }}},
+  { "cast(-99999999999999999999999999999999 as decimal(38,0)) + "
+    "cast(-0.9999994 as decimal(38,38))",
+    {{ false, true, 0, 38, 38 },
+     { false, false, StringToInt128("-99999999999999999999999999999999999999"), 38, 6 }}},
+  { "cast(99999999999999999999999999999999 as decimal(38,0)) + "
+    "cast(0.9999995 as decimal(38,38))",
+    {{ false, true, 0, 38, 38 },
+     { true, false, 0, 38, 6 }}},
+  { "cast(-99999999999999999999999999999999 as decimal(38,0)) + "
+    "cast(-0.9999995 as decimal(38,38))",
+    {{ false, true, 0, 38, 38 },
+     { true, false, 0, 38, 6 }}},
+  { "cast(0.99999999999999999999999999999999999999 as decimal(38,38)) + "
+    "cast(-5e-38 as decimal(38,38))",
+    {{ false, false, StringToInt128("99999999999999999999999999999999999994"), 38, 38 },
+     { false, false, StringToInt128("9999999999999999999999999999999999999"), 38, 37 }}},
+  { "cast(0.99999999999999999999999999999999999999 as decimal(38,38)) + "
+    "cast(-4e-38 as decimal(38,38))",
+    {{ false, false, StringToInt128("99999999999999999999999999999999999995"), 38, 38 },
+     { false, false, StringToInt128("10000000000000000000000000000000000000"), 38, 37 }}},
+  { "cast(0.99999999999999999999999999999999999999 as decimal(38,38)) + "
+    "cast(0.99999999999999999999999999999999999999 as decimal(38,38))",
+    {{ false, true, 0, 38, 38 },
+     { false, false, StringToInt128("20000000000000000000000000000000000000"), 38, 37 }}},
+  { "cast(-0.99999999999999999999999999999999999999 as decimal(38,38)) + "
+    "cast(0.99999999999999999999999999999999999999 as decimal(38,38))",
+    {{ false, false, 0, 38, 38 },
+     { false, false, 0, 38, 37 }}},
+  { "cast(0 as decimal(38,38)) + cast(0 as decimal(38,38))",
+    {{ false, false, 0, 38, 38 },
+     { false, false, 0, 38, 37 }}},
+  // IMPALA-6292
+  { "cast(1 as decimal(13,12)) - "
+    "cast(0.99999999999999999999999999999999999999 as decimal(38,38))",
+     {{ false, false, 1, 38, 38 },
+      { false, false, 0, 38, 36 }}},
+  { "cast(0.1 as decimal(13,12)) - "
+    "cast(99999999999999999999999999999999999999 as decimal(38,0))",
+     {{ false, true, 0, 38, 12 },
+      { true, false, 0, 38, 6 }}},
   // Test multiply operator
-  { "cast(1.23 as decimal(30,2)) * cast(1 as decimal(10,3))", {{ false, 123000, 38, 5 }}},
-  { "1.23 * cast(1 as decimal(20,3))", {{ false, 123000, 23, 5 }}},
+  { "cast(1.23 as decimal(30,2)) * cast(1 as decimal(10,3))",
+    {{ false, false, 123000, 38, 5 }}},
+  { "cast(1.23 as decimal(3,2)) * cast(1 as decimal(20,3))",
+    {{ false, false, 123000, 23, 5 },
+     { false, false, 123000, 24, 5 }}},
+  { "cast(0.1 as decimal(20,20)) * cast(1 as decimal(20,19))",
+    {{ false, false, StringToInt128("10000000000000000000000000000000000000"), 38, 38 },
+     { false, false, StringToInt128("100000000000000000000000000000000000"), 38, 36 }}},
+  { "cast(111.22 as decimal(5,2)) * cast(3333.444 as decimal(7,3))",
+    {{ false, false, 37074564168, 12, 5 },
+     { false, false, 37074564168, 13, 5 }}},
+  { "cast(0.01 as decimal(38,38)) * cast(25 as decimal(38,0))",
+    {{ false, false, StringToInt128("25000000000000000000000000000000000000"), 38, 38 },
+     { false, false, 250000, 38, 6 }}},
+  { "cast(-0.01 as decimal(38,38)) * cast(25 as decimal(38,0))",
+    {{ false, false, StringToInt128("-25000000000000000000000000000000000000"), 38, 38 },
+     { false, false, -250000, 38, 6 }}},
+  { "cast(-0.01 as decimal(38,38)) * cast(-25 as decimal(38,0))",
+    {{ false, false, StringToInt128("25000000000000000000000000000000000000"), 38, 38 },
+     { false, false, 250000, 38, 6 }}},
+  { "cast(0.1 as decimal(38,38)) * cast(25 as decimal(38,0))",
+    {{ false, true, 0, 38, 38 },
+     { false, false, 2500000, 38, 6 }}},
+  { "cast(-0.1 as decimal(38,38)) * cast(25 as decimal(38,0))",
+    {{ false, true, 0, 38, 38 },
+     { false, false, -2500000, 38, 6 }}},
+  { "cast(-0.1 as decimal(38,38)) * cast(-25 as decimal(38,0))",
+    {{ false, true, 0, 38, 38 },
+     { false, false, 2500000, 38, 6 }}},
+  { "cast(9999999999999999.9999 as decimal(20,4)) * "
+      "cast(9999999999999999.994 as decimal(19,3))",
+    {{ false, true, 0, 38, 7 },
+     { false, false, StringToInt128("99999999999999999939000000000000000001"), 38, 6 }}},
+  { "cast(9.99999 as decimal(6,5)) * "
+      "cast(9999999999999999999999999999999.94 as decimal(33,2))",
+    {{ false, true, 0, 38, 7 },
+     { false, false, StringToInt128("99999899999999999999999999999999400001"), 38, 6 }}},
+  { "cast(0 as decimal(38,38)) * cast(1 as decimal(5,2))",
+    {{ false, false, 0, 38, 38 },
+     { false, false, 0, 38, 34 }}},
+  { "cast(12345.67 as decimal(7,2)) * cast(12345.67 as decimal(7,2))",
+    {{ false, false, 1524155677489, 14, 4 },
+     { false, false, 1524155677489, 15, 4 }}},
+  { "cast(2643918831543678.5772617359442611897419 as decimal(38,22)) * "
+      "cast(3972211379387512.6946776728996748717839 as decimal(38,22))",
+    {{ false, true, 0, 38, 38 },
+     { false, false, StringToInt128("10502204468834736291038133384309593605"), 38, 6 }}},
+  { "cast(-2643918831543678.5772617359442611897419 as decimal(38,22)) * "
+      "cast(3972211379387512.6946776728996748717839 as decimal(38,22))",
+    {{ false, true, 0, 38, 38 },
+     { false, false, StringToInt128("-10502204468834736291038133384309593605"), 38, 6 }}},
+  { "cast(-2643918831543678.5772617359442611897419 as decimal(38,22)) * "
+      "cast(-3972211379387512.6946776728996748717839 as decimal(38,22))",
+    {{ false, true, 0, 38, 38 },
+     { false, false, StringToInt128("10502204468834736291038133384309593605"), 38, 6 }}},
+  { "cast(2545664579818579.6268123468146829994472 as decimal(38,22)) * "
+      "cast(8862165565622381.6689679519457799681439 as decimal(38,22))",
+    {{ false, true, 0, 38, 38 },
+     { false, false, StringToInt128("22560100980892785285767018366785939200"), 38, 6 }}},
+  { "cast(2575543652687181.7412422395638291836214 as decimal(38,22)) * "
+      "cast(9142529549684737.3986798331295277312253 as decimal(38,22))",
+    {{ false, true, 0, 38, 38 },
+     { false, false, StringToInt128("23546983951195523383767823614338114083"), 38, 6 }}},
+  { "cast(6188696551164477.9944646378584981371524 as decimal(38,22)) * "
+      "cast(9234914917975734.1781526147879384775182 as decimal(38,22))",
+    {{ false, true, 0, 38, 38 },
+     { false, false, StringToInt128("57152086103173814294786121078946977968"), 38, 6 }}},
+  { "cast(-6188696551164477.9944646378584981371524 as decimal(38,22)) * "
+      "cast(9234914917975734.1781526147879384775182 as decimal(38,22))",
+    {{ false, true, 0, 38, 38 },
+     { false, false, StringToInt128("-57152086103173814294786121078946977968"), 38, 6 }}},
+  { "cast(1.006 as decimal(4,2)) * cast(1.1 as decimal(4,2))",
+    {{ false, false, 11000, 8, 4 },
+     { false, false, 11110, 9, 4 }}},
+  { "cast(0.9994 as decimal(38,4)) * cast(0.999 as decimal(38,3))",
+    {{ false, false, 9984006, 38, 7 },
+     { false, false, 998401, 38, 6 }}},
+  { "cast(0.000000000000000000000000000000000001 as decimal(38,38)) * "
+      "cast(0.000000000000000000000000000000000001 as decimal(38,38))",
+    {{ false, false, 0, 38, 38 },
+     { false, false, 0, 38, 37 }}},
+  { "cast(0.00000000000000000000000000000000001 as decimal(38,37)) * "
+      "cast(0.00000000000000000000000000000000001 as decimal(38,37))",
+    {{ false, false, 0, 38, 38 },
+     { false, false, 0, 38, 35 }}},
+  { "cast(0.00000000000000001 as decimal(38,37)) * "
+      "cast(0.000000000000000001 as decimal(38,37))",
+    {{ false, false, 1000, 38, 38 },
+     { false, false, 1, 38, 35 }}},
+  { "cast(9e-18 as decimal(38,38)) * cast(1e-21 as decimal(38,38))",
+    {{ false, false, 0, 38, 38 },
+     { false, false, 0, 38, 37 }}},
+  { "cast(1e-37 as decimal(38,38)) * cast(0.1 as decimal(38,38))",
+    {{ false, false, 1, 38, 38 },
+     { false, false, 0, 38, 37 }}},
+  { "cast(1e-37 as decimal(38,38)) * cast(-0.1 as decimal(38,38))",
+    {{ false, false, -1, 38, 38 },
+     { false, false, 0, 38, 37 }}},
+  { "cast(9e-36 as decimal(38,38)) * cast(0.1 as decimal(38,38))",
+    {{ false, false, 90, 38, 38 },
+     { false, false, 9, 38, 37 }}},
+  { "cast(9e-37 as decimal(38,38)) * cast(0.1 as decimal(38,38))",
+    {{ false, false, 9, 38, 38 },
+     { false, false, 1, 38, 37 }}},
+  // We are multiplying (2^64 - 1) * (2^63 - 1), which produces the largest intermediate
+  // result that does not require int256. It overflows because the result is larger than
+  // MAX_UNSCALED_DECIMAL16.
+  { "cast(18446744073709551615 as decimal(38,0)) * "
+    "cast(9223372036854775807 as decimal(38,0))",
+    {{ false, true, 0, 38, 0 },
+     { true, false, 0, 38, 0 }}},
+  { "cast(-18446744073709551615 as decimal(38,0)) * "
+    "cast(9223372036854775807 as decimal(38,0))",
+    {{ false, true, 0, 38, 0 },
+     { true, false, 0, 38, 0 }}},
+  // int256 is required. We are multiplying (2^64 - 1) * (2^63) here.
+  { "cast(18446744073709551615 as decimal(38,0)) * "
+    "cast(9223372036854775808 as decimal(38,0))",
+    {{ false, true, 0, 38, 0 },
+     { true, false, 0, 38, 0 }}},
+  { "cast(-18446744073709551615 as decimal(38,0)) * "
+    "cast(9223372036854775808 as decimal(38,0))",
+    {{ false, true, 0, 38, 0 },
+     { true, false, 0, 38, 0 }}},
+  // Largest intermediate result that does not require int256.
+  { "cast(1844674407370.9551615 as decimal(38,7)) * "
+    "cast(9223372036854775807 as decimal(38,0))",
+    {{ false, true, 0, 38, 7 },
+     { false, false, StringToInt128("17014118346046923170401718760531977831"), 38, 6 }}},
+  { "cast(-1844674407370.9551615 as decimal(38,7)) * "
+    "cast(9223372036854775807 as decimal(38,0))",
+    {{ false, true, 0, 38, 7 },
+     { false, false, StringToInt128("-17014118346046923170401718760531977831"), 38, 6 }}},
+  // int256 is required.
+  { "cast(1844674407370.9551615 as decimal(38,7)) * "
+    "cast(9223372036854775808 as decimal(38,0))",
+    {{ false, true, 0, 38, 7 },
+     { false, false, StringToInt128("17014118346046923172246393167902932992"), 38, 6 }}},
+  { "cast(-1844674407370.9551615 as decimal(38,7)) * "
+    "cast(9223372036854775808 as decimal(38,0))",
+    {{ false, true, 0, 38, 7 },
+     { false, false, StringToInt128("-17014118346046923172246393167902932992"), 38, 6 }}},
+  // Smallest intermediate value that requires double checking if int256 is required.
+  { "cast(9223372036854775808 as decimal(38,0)) * "
+    "cast(9223372036854775808 as decimal(38,0))",
+    {{ false, false, StringToInt128("85070591730234615865843651857942052864"), 38, 0 }}},
+  { "cast(-9223372036854775808 as decimal(38,0)) * "
+    "cast(9223372036854775808 as decimal(38,0))",
+    {{ false, false, StringToInt128("-85070591730234615865843651857942052864"), 38, 0 }}},
+  // Scale down the intermediate value by 10^39.
+  { "cast(0.33333333333333333333333333333333333333 as decimal(38,38)) * "
+      "cast(0.00000000000000000000000000000000000003 as decimal(38,38))",
+    {{ false, false, 0, 38, 38 },
+     { false, false, 0, 38, 37 }}},
+  { "cast(0.33333333333333333333333333333333333333 as decimal(38,38)) * "
+      "cast(0.3 as decimal(38,38))",
+    {{ false, false, StringToInt128("9999999999999999999999999999999999999"), 38, 38 },
+     { false, false, StringToInt128("1000000000000000000000000000000000000"), 38, 37 }}},
+  { "cast(10000000000000000000 as decimal(21,0)) * "
+      "cast(10000000000000000000 as decimal(21,0))",
+    {{ false, true, 0, 38, 0 },
+     { true, false, 0, 38, 0 }}},
+  { "cast(1000000000000000.0000 as decimal(38,4)) * "
+      "cast(1000000000000000.0000 as decimal(38,4))",
+    {{ false, true, 0, 38, 8 },
+     { false, false, StringToInt128("1000000000000000000000000000000000000"), 38, 6 }}},
+  { "cast(-1000000000000000.0000 as decimal(38,4)) * "
+      "cast(1000000000000000.0000 as decimal(38,4))",
+    {{ false, true, 0, 38, 8 },
+     { false, false, StringToInt128("-1000000000000000000000000000000000000"), 38, 6 }}},
+  // Smallest 256 bit intermediate result that can't be scaled down to 128 bits.
+  { "cast(10000000000000000.0000 as decimal(38,4)) * "
+      "cast(10000000000000000.0000 as decimal(38,4))",
+    {{ false, true, 0, 38, 8 },
+     { true, false, 0, 38, 6 }}},
+  { "cast(-10000000000000000.0000 as decimal(38,4)) * "
+      "cast(10000000000000000.0000 as decimal(38,4))",
+    {{ false, true, 0, 38, 8 },
+     { true, false, 0, 38, 6 }}},
+  // The reason why the result of (38,38) * (38,38) is (38,37).
+  { "cast(0.99999999999999999999999999999999999999 as decimal(38,38)) * "
+      "cast(0.99999999999999999999999999999999999999 as decimal(38,38))",
+    {{ false, false, StringToInt128("99999999999999999999999999999999999998"), 38, 38 },
+     { false, false, StringToInt128("10000000000000000000000000000000000000"), 38, 37 }}},
+  { "cast(-0.99999999999999999999999999999999999999 as decimal(38,38)) * "
+      "cast(0.99999999999999999999999999999999999999 as decimal(38,38))",
+    {{ false, false, StringToInt128("-99999999999999999999999999999999999998"), 38, 38 },
+     { false, false, StringToInt128("-10000000000000000000000000000000000000"), 38, 37 }}},
+  { "cast(99999999999999999999999999999999999999 as decimal(38,0)) * "
+      "cast(1 as decimal(38,0))",
+    {{ false, false, StringToInt128("99999999999999999999999999999999999999"), 38, 0 }}},
+  { "cast(99999999999999999999999999999999999999 as decimal(38,0)) * "
+      "cast(-1 as decimal(38,0))",
+    {{ false, false, StringToInt128("-99999999999999999999999999999999999999"), 38, 0 }}},
+  // Rounding.
+  { "cast(0.000005 as decimal(38,6)) * cast(0.1 as decimal(38,1))",
+    {{ false, false, 5, 38, 7 },
+     { false, false, 1, 38, 6 }}},
+  { "cast(-0.000005 as decimal(38,6)) * cast(0.1 as decimal(38,1))",
+    {{ false, false, -5, 38, 7 },
+     { false, false, -1, 38, 6 }}},
+  { "cast(0.000004 as decimal(38,6)) * cast(0.1 as decimal(38,1))",
+    {{ false, false, 4, 38, 7 },
+     { false, false, 0, 38, 6 }}},
+  { "cast(-0.000004 as decimal(38,6)) * cast(0.1 as decimal(38,1))",
+    {{ false, false, -4, 38, 7 },
+     { false, false, 0, 38, 6 }}},
   // Test divide operator
-  { "cast(1.23 as decimal(8,2)) / cast(1 as decimal(4,3))", {{ false, 12300000, 16, 7}}},
+  { "cast(1.23 as decimal(8,2)) / cast(1 as decimal(4,3))",
+    {{ false, false, 12300000, 16, 7}}},
   { "cast(1.23 as decimal(30,2)) / cast(1 as decimal(20,3))",
-    {{ false,     1230, 38, 3 },
-     { false, 12300000, 38, 7 }}},
+    {{ false, false,     1230, 38, 3 },
+     { false, false, 12300000, 38, 7 }}},
   { "cast(1 as decimal(38,0)) / cast(.2 as decimal(38,1))",
-    {{ false,      50, 38, 1 },
-     { false, 5000000, 38, 6 }}},
+    {{ false, false,      50, 38, 1 },
+     { false, false, 5000000, 38, 6 }}},
   { "cast(1 as decimal(38,0)) / cast(3 as decimal(38,0))",
-    {{ false,      0, 38, 0 },
-     { false, 333333, 38, 6 }}},
+    {{ false, false,      0, 38, 0 },
+     { false, false, 333333, 38, 6 }}},
   { "cast(99999999999999999999999999999999999999 as decimal(38,0)) / "
     "cast(99999999999999999999999999999999999999 as decimal(38,0))",
-    {{ false,       1, 38, 0 },
-     { false, 1000000, 38, 6 }}},
+    {{ false, false,       1, 38, 0 },
+     { false, false, 1000000, 38, 6 }}},
   { "cast(99999999999999999999999999999999999999 as decimal(38,0)) / "
     "cast(0.00000000000000000000000000000000000001 as decimal(38,38))",
-    {{ true, 0, 38, 38 },
-     { true, 0, 38,  6 }}},
+    {{ false, true, 0, 38, 38 },
+     { true, false, 0, 38,  6 }}},
   { "cast(0.00000000000000000000000000000000000001 as decimal(38,38)) / "
     "cast(99999999999999999999999999999999999999 as decimal(38,0))",
-    {{ false, 0, 38, 38 }}},
+    {{ false, false, 0, 38, 38 }}},
   { "cast(0.00000000000000000000000000000000000001 as decimal(38,38)) / "
     "cast(0.00000000000000000000000000000000000001 as decimal(38,38))",
-    {{ true,        0, 38, 38 },
-     { false, 1000000, 38,  6 }}},
+    {{ false, true,        0, 38, 38 },
+     { false, false, 1000000, 38,  6 }}},
   { "cast(9999999999999999999.9999999999999999999 as decimal(38,19)) / "
     "cast(99999999999999999999999999999.999999999 as decimal(38,9))",
-    {{ false, 1000000000, 38, 19 },
-     { false,          1, 38, 10 }}},
+    {{ false, false, 1000000000, 38, 19 },
+     { false, false,          1, 38, 10 }}},
   { "cast(999999999999999999999999999999999999.99 as decimal(38,2)) / "
     "cast(99999999999.999999999999999999999999999 as decimal(38,27))",
-    {{ true,  0, 38, 27 },
-     { false, static_cast<int128_t>(10) * 10000000000ll *
+    {{ false, true,  0, 38, 27 },
+     { false, false, static_cast<int128_t>(10) * 10000000000ll *
        10000000000ll * 10000000000ll, 38, 6 }}},
   { "cast(-2.12 as decimal(17,2)) / cast(12515.95 as decimal(17,2))",
-    {{ false, -16938386618674571, 37, 20 }}},
+    {{ false, false, -16938386618674571, 37, 20 }}},
   { "cast(-2.12 as decimal(18,2)) / cast(12515.95 as decimal(18,2))",
-    {{ false,                  0, 38,  2 },
-     { false, -16938386618674571, 38, 20 }}},
+    {{ false, false,                  0, 38,  2 },
+     { false, false, -16938386618674571, 38, 20 }}},
   { "cast(737373 as decimal(6,0)) / cast(.52525252 as decimal(38,38))",
-    {{ true,              0, 38, 38 },
-     { false, 1403844764038, 38,  6 }}},
+    {{ false, true,              0, 38, 38 },
+     { false, false, 1403844764038, 38,  6 }}},
   { "cast(0.000001 as decimal(6,6)) / "
     "cast(0.0000000000000000000000000000000000001 as decimal(38,38))",
-    {{ true, 0, 38, 38 },
-     { false, static_cast<int128_t>(10000000ll) *
+    {{ false, true, 0, 38, 38 },
+     { false, false, static_cast<int128_t>(10000000ll) *
        10000000000ll * 10000000000ll * 10000000000ll, 38, 6 }}},
   { "cast(98765432109876543210 as decimal(20,0)) / "
     "cast(98765432109876543211 as decimal(20,0))",
-    {{ false,                   0, 38,  0 },
-     { false, 1000000000000000000, 38, 18 }}},
+    {{ false, false,                   0, 38,  0 },
+     { false, false, 1000000000000000000, 38, 18 }}},
   { "cast(111111.1111 as decimal(20, 10)) / cast(.7777 as decimal(38, 38))",
-    {{ true,             0, 38, 38 },
-     { false, 142871429986, 38,  6 }}},
+    {{ false, true,             0, 38, 38 },
+     { false, false, 142871429986, 38,  6 }}},
   { "2.0 / 3.0",
-    {{ false,   6666, 6, 4},
-     { false, 666667, 8, 6}}},
+    {{ false, false,   6666, 6, 4},
+     { false, false, 666667, 8, 6}}},
   { "-2.0 / 3.0",
-    {{ false,   -6666, 6, 4},
-     { false, -666667, 8, 6}}},
+    {{ false, false,   -6666, 6, 4},
+     { false, false, -666667, 8, 6}}},
   { "2.0 / -3.0",
-    {{ false,   -6666, 6, 4},
-     { false, -666667, 8, 6}}},
+    {{ false, false,   -6666, 6, 4},
+     { false, false, -666667, 8, 6}}},
   { "-2.0 / -3.0",
-    {{ false,   6666, 6, 4},
-     { false, 666667, 8, 6}}},
+    {{ false, false,   6666, 6, 4},
+     { false, false, 666667, 8, 6}}},
   // Test divide rounding
   { "10.10 / 3.0",
-    {{ false, 336666, 8, 5 },
-     { false, 3366667, 9, 6 }}},
+    {{ false, false, 336666, 8, 5 },
+     { false, false, 3366667, 9, 6 }}},
   { "cast(-10.10 as decimal(4,2)) / 3.0", // XXX JIRA: IMPALA-4877
-    {{ false, -336666, 8, 5 },
-     { false, -3366667, 9, 6 }}},
+    {{ false, false, -336666, 8, 5 },
+     { false, false, -3366667, 9, 6 }}},
   { "10.10 / 20.3",
-    {{ false, 497536, 9, 6 },
-     { false, 497537, 9, 6 }}},
+    {{ false, false, 497536, 9, 6 },
+     { false, false, 497537, 9, 6 }}},
   { "10.10 / -20.3",
-    {{ false, -497536, 9, 6 },
-     { false, -497537, 9, 6 }}},
+    {{ false, false, -497536, 9, 6 },
+     { false, false, -497537, 9, 6 }}},
   // N.B. - Google and python both insist that 999999.998 / 999 is 1001.000999
   // However, multiplying the result back, 999 * 1001.000998999 gives the
   // original value exactly, while their answer does not, 999 * 10001.000999 =
   // 999999.998001. The same issue comes up many times during the following
   // computations.  Division is hard, let's go shopping.
   { "cast(999999.998 as decimal(9,3)) / 999",
-    {{ false, 1001000998998, 15, 9 },
-     { false, 1001000998999, 15, 9 }}},
+    {{ false, false, 1001000998998, 15, 9 },
+     { false, false, 1001000998999, 15, 9 }}},
   { "cast(999.999998 as decimal(9,3)) / 999",
-    {{ false, 1001000000, 15, 9 },
-     { false, 1001001001, 15, 9 }}},
+    {{ false, false, 1001000000, 15, 9 },
+     { false, false, 1001001001, 15, 9 }}},
   { "cast(999.999998 as decimal(9,6)) / 999",
-    {{ false, 1001000998998, 15, 12 },
-     { false, 1001000998999, 15, 12 }}},
+    {{ false, false, 1001000998998, 15, 12 },
+     { false, false, 1001000998999, 15, 12 }}},
   { "cast(0.999999998 as decimal(9,6)) / 999",
-    {{ false, 1001000000, 15, 12 },
-     { false, 1001001001, 15, 12 }}},
+    {{ false, false, 1001000000, 15, 12 },
+     { false, false, 1001001001, 15, 12 }}},
   { "cast(0.999999998 as decimal(9,9)) / 999",
-    {{ false, 1001000998998, 15, 15 },
-     { false, 1001000998999, 15, 15 }}},
+    {{ false, false, 1001000998998, 15, 15 },
+     { false, false, 1001000998999, 15, 15 }}},
   { "cast(-999999.998 as decimal(9,3)) / 999",
-    {{ false, -1001000998998, 15, 9 },
-     { false, -1001000998999, 15, 9 }}},
+    {{ false, false, -1001000998998, 15, 9 },
+     { false, false, -1001000998999, 15, 9 }}},
   { "cast(-999.999998 as decimal(9,3)) / 999",
-    {{ false, -1001000000, 15, 9 },
-     { false, -1001001001, 15, 9 }}},
+    {{ false, false, -1001000000, 15, 9 },
+     { false, false, -1001001001, 15, 9 }}},
   { "cast(-999.999998 as decimal(9,6)) / 999",
-    {{ false, -1001000998998, 15, 12 },
-     { false, -1001000998999, 15, 12 }}},
+    {{ false, false, -1001000998998, 15, 12 },
+     { false, false, -1001000998999, 15, 12 }}},
   { "cast(-0.999999998 as decimal(9,6)) / 999",
-    {{ false, -1001000000, 15, 12 },
-     { false, -1001001001, 15, 12 }}},
+    {{ false, false, -1001000000, 15, 12 },
+     { false, false, -1001001001, 15, 12 }}},
   { "cast(-0.999999998 as decimal(9,9)) / 999",
-    {{ false, -1001000998998, 15, 15 },
-     { false, -1001000998999, 15, 15 }}},
+    {{ false, false, -1001000998998, 15, 15 },
+     { false, false, -1001000998999, 15, 15 }}},
   { "cast(-999999.998 as decimal(9,3)) / -999",
-    {{ false, 1001000998998, 15, 9 },
-     { false, 1001000998999, 15, 9 }}},
+    {{ false, false, 1001000998998, 15, 9 },
+     { false, false, 1001000998999, 15, 9 }}},
   { "cast(-999.999998 as decimal(9,3)) / -999",
-    {{ false, 1001000000, 15, 9 },
-     { false, 1001001001, 15, 9 }}},
+    {{ false, false, 1001000000, 15, 9 },
+     { false, false, 1001001001, 15, 9 }}},
   { "cast(-999.999998 as decimal(9,6)) / -999",
-    {{ false, 1001000998998, 15, 12 },
-     { false, 1001000998999, 15, 12 }}},
+    {{ false, false, 1001000998998, 15, 12 },
+     { false, false, 1001000998999, 15, 12 }}},
   { "cast(-0.999999998 as decimal(9,6)) / -999",
-    {{ false, 1001000000, 15, 12 },
-     { false, 1001001001, 15, 12 }}},
+    {{ false, false, 1001000000, 15, 12 },
+     { false, false, 1001001001, 15, 12 }}},
   { "cast(-0.999999998 as decimal(9,9)) / -999",
-    {{ false, 1001000998998, 15, 15 },
-     { false, 1001000998999, 15, 15 }}},
+    {{ false, false, 1001000998998, 15, 15 },
+     { false, false, 1001000998999, 15, 15 }}},
   { "cast(999999.998 as decimal(9,3)) / -999",
-    {{ false, -1001000998998, 15, 9 },
-     { false, -1001000998999, 15, 9 }}},
+    {{ false, false, -1001000998998, 15, 9 },
+     { false, false, -1001000998999, 15, 9 }}},
   { "cast(999.999998 as decimal(9,3)) / -999",
-    {{ false, -1001000000, 15, 9 },
-     { false, -1001001001, 15, 9 }}},
+    {{ false, false, -1001000000, 15, 9 },
+     { false, false, -1001001001, 15, 9 }}},
   { "cast(999.999998 as decimal(9,6)) / -999",
-    {{ false, -1001000998998, 15, 12 },
-     { false, -1001000998999, 15, 12 }}},
+    {{ false, false, -1001000998998, 15, 12 },
+     { false, false, -1001000998999, 15, 12 }}},
   { "cast(0.999999998 as decimal(9,6)) / -999",
-    {{ false, -1001000000, 15, 12 },
-     { false, -1001001001, 15, 12 }}},
+    {{ false, false, -1001000000, 15, 12 },
+     { false, false, -1001001001, 15, 12 }}},
   { "cast(0.999999998 as decimal(9,9)) / -999",
-    {{ false, -1001000998998, 15, 15 },
-     { false, -1001000998999, 15, 15 }}},
+    {{ false, false, -1001000998998, 15, 15 },
+     { false, false, -1001000998999, 15, 15 }}},
   { "cast(999.999998 as decimal(9,3)) / 999999999",
-    {{ false, 99999900, 20, 14 },
-     { false, 100000000, 20, 14 }}},
+    {{ false, false, 99999900, 20, 14 },
+     { false, false, 100000000, 20, 14 }}},
   { "cast(999.999998 as decimal(9,6)) / 999999999",
-    {{ false, 99999999899, 20, 17 },
-     { false, 99999999900, 20, 17 }}},
+    {{ false, false, 99999999899, 20, 17 },
+     { false, false, 99999999900, 20, 17 }}},
   { "cast(0.999999998 as decimal(9,6)) / 999999999",
-    {{ false, 99999900, 20, 17 },
-     { false, 100000000, 20, 17 }}},
+    {{ false, false, 99999900, 20, 17 },
+     { false, false, 100000000, 20, 17 }}},
   { "cast(0.999999998 as decimal(9,9)) / 999999999",
-    {{ false, 99999999899, 20, 20 },
-     { false, 99999999900, 20, 20 }}},
+    {{ false, false, 99999999899, 20, 20 },
+     { false, false, 99999999900, 20, 20 }}},
   { "cast(-999999.998 as decimal(9,3)) / 999999999",
-    {{ false, -99999999899, 20, 14 },
-     { false, -99999999900, 20, 14 }}},
+    {{ false, false, -99999999899, 20, 14 },
+     { false, false, -99999999900, 20, 14 }}},
   { "cast(-999.999998 as decimal(9,3)) / 999999999",
-    {{ false, -99999900, 20, 14 },
-     { false, -100000000, 20, 14 }}},
+    {{ false, false, -99999900, 20, 14 },
+     { false, false, -100000000, 20, 14 }}},
   { "cast(-999.999998 as decimal(9,6)) / 999999999",
-    {{ false, -99999999899, 20, 17 },
-     { false, -99999999900, 20, 17 }}},
+    {{ false, false, -99999999899, 20, 17 },
+     { false, false, -99999999900, 20, 17 }}},
   { "cast(-0.999999998 as decimal(9,6)) / 999999999",
-    {{ false, -99999900, 20, 17 },
-     { false, -100000000, 20, 17 }}},
+    {{ false, false, -99999900, 20, 17 },
+     { false, false, -100000000, 20, 17 }}},
   { "cast(-0.999999998 as decimal(9,9)) / 999999999",
-    {{ false, -99999999899, 20, 20 },
-     { false, -99999999900, 20, 20 }}},
+    {{ false, false, -99999999899, 20, 20 },
+     { false, false, -99999999900, 20, 20 }}},
   { "cast(-999999.998 as decimal(9,3)) / 999999999",
-    {{ false, -99999999899, 20, 14 },
-     { false, -99999999900, 20, 14 }}},
+    {{ false, false, -99999999899, 20, 14 },
+     { false, false, -99999999900, 20, 14 }}},
   { "cast(-999.999998 as decimal(9,3)) / 999999999",
-    {{ false, -99999900, 20, 14 },
-     { false, -100000000, 20, 14 }}},
+    {{ false, false, -99999900, 20, 14 },
+     { false, false, -100000000, 20, 14 }}},
   { "cast(-999.999998 as decimal(9,6)) / 999999999",
-    {{ false, -99999999899, 20, 17 },
-     { false, -99999999900, 20, 17 }}},
+    {{ false, false, -99999999899, 20, 17 },
+     { false, false, -99999999900, 20, 17 }}},
   { "cast(-0.999999998 as decimal(9,6)) / 999999999",
-    {{ false, -99999900, 20, 17 },
-     { false, -100000000, 20, 17 }}},
+    {{ false, false, -99999900, 20, 17 },
+     { false, false, -100000000, 20, 17 }}},
   { "cast(-0.999999998 as decimal(9,9)) / 999999999",
-    {{ false, -99999999899, 20, 20 },
-     { false, -99999999900, 20, 20 }}},
+    {{ false, false, -99999999899, 20, 20 },
+     { false, false, -99999999900, 20, 20 }}},
   { "cast(999999.998 as decimal(9,3)) / -999999999",
-    {{ false, -99999999899, 20, 14 },
-     { false, -99999999900, 20, 14 }}},
+    {{ false, false, -99999999899, 20, 14 },
+     { false, false, -99999999900, 20, 14 }}},
   { "cast(999.999998 as decimal(9,3)) / -999999999",
-    {{ false, -99999900, 20, 14 },
-     { false, -100000000, 20, 14 }}},
+    {{ false, false, -99999900, 20, 14 },
+     { false, false, -100000000, 20, 14 }}},
   { "cast(999.999998 as decimal(9,6)) / -999999999",
-    {{ false, -99999999899, 20, 17 },
-     { false, -99999999900, 20, 17 }}},
+    {{ false, false, -99999999899, 20, 17 },
+     { false, false, -99999999900, 20, 17 }}},
   { "cast(0.999999998 as decimal(9,6)) / -999999999",
-    {{ false, -99999900, 20, 17 },
-     { false, -100000000, 20, 17 }}},
+    {{ false, false, -99999900, 20, 17 },
+     { false, false, -100000000, 20, 17 }}},
   { "cast(0.999999998 as decimal(9,9)) / -999999999",
-    {{ false, -99999999899, 20, 20 },
-     { false, -99999999900, 20, 20 }}},
+    {{ false, false, -99999999899, 20, 20 },
+     { false, false, -99999999900, 20, 20 }}},
   { "17014118346046923173168730371588.410/17014118346046923173168730371588.410",
-    {{ false, 1000, 38, 3 },
-     { false, 1000000, 38, 6 }}},
+    {{ false, false, 1000, 38, 3 },
+     { false, false, 1000000, 38, 6 }}},
   { "17014118346046923173168730371588.410/17014118346046923173168730371588.409",
-    {{ false, 1000, 38, 3 },
-     { false, 1000000, 38, 6 }}},
+    {{ false, false, 1000, 38, 3 },
+     { false, false, 1000000, 38, 6 }}},
   { "17014118346046923173168730371588.410/34028236692093846346337460743176820000",
-    {{ false, 0, 38, 3 },
-     { false, 1, 38, 6 }}},
+    {{ false, false, 0, 38, 3 },
+     { false, false, 1, 38, 6 }}},
   { "17014118346046923173168730371588.410/34028236692093846346337460743176820001",
-    {{ false, 0, 38, 3 },
-     { false, 0, 38, 6 }}},
+    {{ false, false, 0, 38, 3 },
+     { false, false, 0, 38, 6 }}},
   { "17014118346046923173168730371588.410/51042355038140769519506191114765230000",
-    {{ false, 0, 38, 3 },
-     { false, 0, 38, 6 }}},
+    {{ false, false, 0, 38, 3 },
+     { false, false, 0, 38, 6 }}},
   { "17014118346046923173168730371588.410/10208471007628153903901238222953046343",
-    {{ false, 0, 38, 3 },
-     { false, 2, 38, 6 }}},
+    {{ false, false, 0, 38, 3 },
+     { false, false, 2, 38, 6 }}},
   { "170141183460469231731687303715884.10/34028236692093846346337460743176820000",
-    {{ false, 0, 38, 2 },
-     { false, 5, 38, 6 }}},
+    {{ false, false, 0, 38, 2 },
+     { false, false, 5, 38, 6 }}},
   { "170141183460469231731687303715884.10/34028236692093846346337460743176820001",
-    {{ false, 0, 38, 2 },
-     { false, 5, 38, 6 }}},
+    {{ false, false, 0, 38, 2 },
+     { false, false, 5, 38, 6 }}},
   { "170141183460469231731687303715884.10/51042355038140769519506191114765230000",
-    {{ false, 0, 38, 2 },
-     { false, 3, 38, 6 }}},
+    {{ false, false, 0, 38, 2 },
+     { false, false, 3, 38, 6 }}},
   { "170141183460469231731687303715884.10/10208471007628153903901238222953046343",
-    {{ false, 0, 38, 2 },
-     { false, 17, 38, 6 }}},
+    {{ false, false, 0, 38, 2 },
+     { false, false, 17, 38, 6 }}},
   { "1701411834604692317316873037158841.0/34028236692093846346337460743176820000",
-    {{ false, 0, 38, 1 },
-     { false, 50, 38, 6 }}},
+    {{ false, false, 0, 38, 1 },
+     { false, false, 50, 38, 6 }}},
   { "1701411834604692317316873037158841.0/34028236692093846346337460743176820001",
-    {{ false, 0, 38, 1 },
-     { false, 50, 38, 6 }}},
+    {{ false, false, 0, 38, 1 },
+     { false, false, 50, 38, 6 }}},
   { "1701411834604692317316873037158841.0/51042355038140769519506191114765229999",
-    {{ false, 0, 38, 1 },
-     { false, 33, 38, 6 }}},
+    {{ false, false, 0, 38, 1 },
+     { false, false, 33, 38, 6 }}},
   { "1701411834604692317316873037158841.0/10208471007628153903901238222953046343",
-    {{ false, 0, 38, 1 },
-     { false, 167, 38, 6 }}},
+    {{ false, false, 0, 38, 1 },
+     { false, false, 167, 38, 6 }}},
   { "17014118346046923173168730371588410/34028236692093846346337460743176820000",
-    {{ false, 0, 38, 0 },
-     { false, 500, 38, 6 }}},
+    {{ false, false, 0, 38, 0 },
+     { false, false, 500, 38, 6 }}},
   { "17014118346046923173168730371588410/34028236692093846346337460743176820001",
-    {{ false, 0, 38, 0 },
-     { false, 500, 38, 6 }}},
+    {{ false, false, 0, 38, 0 },
+     { false, false, 500, 38, 6 }}},
   { "17014118346046923173168730371588410/51042355038140769519506191114765229999",
-    {{ false, 0, 38, 0 },
-     { false, 333, 38, 6 }}},
+    {{ false, false, 0, 38, 0 },
+     { false, false, 333, 38, 6 }}},
   { "17014118346046923173168730371588410/10208471007628153903901238222953046343",
-    {{ false, 0, 38, 0 },
-     { false, 1667, 38, 6 }}},
+    {{ false, false, 0, 38, 0 },
+     { false, false, 1667, 38, 6 }}},
   { "17014118346046923173168730371588410/3402823669209384634633746074317682000.0",
-    {{ false, 0, 38, 1 },
-     { false, 5000, 38, 6 }}},
+    {{ false, false, 0, 38, 1 },
+     { false, false, 5000, 38, 6 }}},
   { "17014118346046923173168730371588410/3402823669209384634633746074317682000.1",
-    {{ false, 0, 38, 1 },
-     { false, 5000, 38, 6 }}},
+    {{ false, false, 0, 38, 1 },
+     { false, false, 5000, 38, 6 }}},
   { "17014118346046923173168730371588410/5104235503814076951950619111476522999.9",
-    {{ false, 0, 38, 1 },
-     { false, 3333, 38, 6 }}},
+    {{ false, false, 0, 38, 1 },
+     { false, false, 3333, 38, 6 }}},
   { "17014118346046923173168730371588410/1020847100762815390390123822295304634.3",
-    {{ false, 0, 38, 1 },
-     { false, 16667, 38, 6 }}},
+    {{ false, false, 0, 38, 1 },
+     { false, false, 16667, 38, 6 }}},
   { "15014118346046923173168730371588.410/34028236692093846346337460743176820000",
-    {{ false, 0, 38, 3 },
-     { false, 0, 38, 6 }}},
+    {{ false, false, 0, 38, 3 },
+     { false, false, 0, 38, 6 }}},
   { "150141183460469231731687303715884.10/34028236692093846346337460743176820000",
-    {{ false, 0, 38, 2 },
-     { false, 4, 38, 6 }}},
+    {{ false, false, 0, 38, 2 },
+     { false, false, 4, 38, 6 }}},
   { "1501411834604692317316873037158841.0/34028236692093846346337460743176820000",
-    {{ false, 0, 38, 1 },
-     { false, 44, 38, 6 }}},
+    {{ false, false, 0, 38, 1 },
+     { false, false, 44, 38, 6 }}},
   { "15014118346046923173168730371588410/34028236692093846346337460743176820000",
-    {{ false, 0, 38, 0 },
-     { false, 441, 38, 6 }}},
+    {{ false, false, 0, 38, 0 },
+     { false, false, 441, 38, 6 }}},
   { "16014118346046923173168730371588.410/34028236692093846346337460743176820000",
-    {{ false, 0, 38, 3 },
-     { false, 0, 38, 6 }}},
+    {{ false, false, 0, 38, 3 },
+     { false, false, 0, 38, 6 }}},
   { "160141183460469231731687303715884.10/34028236692093846346337460743176820000",
-    {{ false, 0, 38, 2 },
-     { false, 5, 38, 6 }}},
+    {{ false, false, 0, 38, 2 },
+     { false, false, 5, 38, 6 }}},
   { "1601411834604692317316873037158841.0/34028236692093846346337460743176820000",
-    {{ false, 0, 38, 1 },
-     { false, 47, 38, 6 }}},
+    {{ false, false, 0, 38, 1 },
+     { false, false, 47, 38, 6 }}},
   { "16014118346046923173168730371588410/34028236692093846346337460743176820000",
-    {{ false, 0, 38, 0 },
-     { false, 471, 38, 6 }}},
+    {{ false, false, 0, 38, 0 },
+     { false, false, 471, 38, 6 }}},
   { "16014118346046923173168730371588410/3402823669209384634633746074317682000",
-    {{ false, 0, 38, 0 },
-     { false, 4706, 38, 6 }}},
+    {{ false, false, 0, 38, 0 },
+     { false, false, 4706, 38, 6 }}},
   { "18014118346046923173168730371588.410/34028236692093846346337460743176820000",
-    {{ false, 0, 38, 3 },
-     { false, 1, 38, 6 }}},
+    {{ false, false, 0, 38, 3 },
+     { false, false, 1, 38, 6 }}},
   { "180141183460469231731687303715884.10/34028236692093846346337460743176820000",
-    {{ false, 0, 38, 2 },
-     { false, 5, 38, 6 }}},
+    {{ false, false, 0, 38, 2 },
+     { false, false, 5, 38, 6 }}},
   { "1801411834604692317316873037158841.0/34028236692093846346337460743176820000",
-    {{ false, 0, 38, 1 },
-     { false, 53, 38, 6 }}},
+    {{ false, false, 0, 38, 1 },
+     { false, false, 53, 38, 6 }}},
   { "18014118346046923173168730371588410/34028236692093846346337460743176820000",
-    {{ false, 0, 38, 0 },
-     { false, 529, 38, 6 }}},
+    {{ false, false, 0, 38, 0 },
+     { false, false, 529, 38, 6 }}},
   { "18014118346046923173168730371588410/3402823669209384634633746074317682000",
-    {{ false, 0, 38, 0 },
-     { false, 5294, 38, 6 }}},
+    {{ false, false, 0, 38, 0 },
+     { false, false, 5294, 38, 6 }}},
   { "18014118346046923173168730371588410/340282366920938463463374607431768200",
-    {{ false, 0, 38, 0 },
-     { false, 52939, 38, 6 }}},
+    {{ false, false, 0, 38, 0 },
+     { false, false, 52939, 38, 6 }}},
   { "17014118346046923173168730371588.410/-17014118346046923173168730371588.410",
-    {{ false, -1000, 38, 3 },
-     { false, -1000000, 38, 6 }}},
+    {{ false, false, -1000, 38, 3 },
+     { false, false, -1000000, 38, 6 }}},
   { "17014118346046923173168730371588.410/-17014118346046923173168730371588.409",
-    {{ false, -1000, 38, 3 },
-     { false, -1000000, 38, 6 }}},
+    {{ false, false, -1000, 38, 3 },
+     { false, false, -1000000, 38, 6 }}},
   { "17014118346046923173168730371588.410/-34028236692093846346337460743176820000",
-    {{ false, 0, 38, 3 },
-     { false, -1, 38, 6 }}},
+    {{ false, false, 0, 38, 3 },
+     { false, false, -1, 38, 6 }}},
   { "17014118346046923173168730371588.410/-34028236692093846346337460743176820001",
-    {{ false, 0, 38, 3 },
-     { false, 0, 38, 6 }}},
+    {{ false, false, 0, 38, 3 },
+     { false, false, 0, 38, 6 }}},
   { "17014118346046923173168730371588.410/-51042355038140769519506191114765230000",
-    {{ false, 0, 38, 3 },
-     { false, 0, 38, 6 }}},
+    {{ false, false, 0, 38, 3 },
+     { false, false, 0, 38, 6 }}},
   { "17014118346046923173168730371588.410/-10208471007628153903901238222953046343",
-    {{ false, 0, 38, 3 },
-     { false, -2, 38, 6 }}},
+    {{ false, false, 0, 38, 3 },
+     { false, false, -2, 38, 6 }}},
   { "170141183460469231731687303715884.10/-34028236692093846346337460743176820000",
-    {{ false, 0, 38, 2 },
-     { false, -5, 38, 6 }}},
+    {{ false, false, 0, 38, 2 },
+     { false, false, -5, 38, 6 }}},
   { "170141183460469231731687303715884.10/-34028236692093846346337460743176820001",
-    {{ false, 0, 38, 2 },
-     { false, -5, 38, 6 }}},
+    {{ false, false, 0, 38, 2 },
+     { false, false, -5, 38, 6 }}},
   { "170141183460469231731687303715884.10/-51042355038140769519506191114765230000",
-    {{ false, 0, 38, 2 },
-     { false, -3, 38, 6 }}},
+    {{ false, false, 0, 38, 2 },
+     { false, false, -3, 38, 6 }}},
   { "170141183460469231731687303715884.10/-10208471007628153903901238222953046343",
-    {{ false, 0, 38, 2 },
-     { false, -17, 38, 6 }}},
+    {{ false, false, 0, 38, 2 },
+     { false, false, -17, 38, 6 }}},
   { "1701411834604692317316873037158841.0/-34028236692093846346337460743176820000",
-    {{ false, 0, 38, 1 },
-     { false, -50, 38, 6 }}},
+    {{ false, false, 0, 38, 1 },
+     { false, false, -50, 38, 6 }}},
   { "1701411834604692317316873037158841.0/-34028236692093846346337460743176820001",
-    {{ false, 0, 38, 1 },
-     { false, -50, 38, 6 }}},
+    {{ false, false, 0, 38, 1 },
+     { false, false, -50, 38, 6 }}},
   { "1701411834604692317316873037158841.0/-51042355038140769519506191114765229999",
-    {{ false, 0, 38, 1 },
-     { false, -33, 38, 6 }}},
+    {{ false, false, 0, 38, 1 },
+     { false, false, -33, 38, 6 }}},
   { "1701411834604692317316873037158841.0/-10208471007628153903901238222953046343",
-    {{ false, 0, 38, 1 },
-     { false, -167, 38, 6 }}},
+    {{ false, false, 0, 38, 1 },
+     { false, false, -167, 38, 6 }}},
   { "17014118346046923173168730371588410/-34028236692093846346337460743176820000",
-    {{ false, 0, 38, 0 },
-     { false, -500, 38, 6 }}},
+    {{ false, false, 0, 38, 0 },
+     { false, false, -500, 38, 6 }}},
   { "17014118346046923173168730371588410/-34028236692093846346337460743176820001",
-    {{ false, 0, 38, 0 },
-     { false, -500, 38, 6 }}},
+    {{ false, false, 0, 38, 0 },
+     { false, false, -500, 38, 6 }}},
   { "17014118346046923173168730371588410/-51042355038140769519506191114765229999",
-    {{ false, 0, 38, 0 },
-     { false, -333, 38, 6 }}},
+    {{ false, false, 0, 38, 0 },
+     { false, false, -333, 38, 6 }}},
   { "17014118346046923173168730371588410/-10208471007628153903901238222953046343",
-    {{ false, 0, 38, 0 },
-     { false, -1667, 38, 6 }}},
+    {{ false, false, 0, 38, 0 },
+     { false, false, -1667, 38, 6 }}},
   { "17014118346046923173168730371588410/-3402823669209384634633746074317682000.0",
-    {{ false, 0, 38, 1 },
-     { false, -5000, 38, 6 }}},
+    {{ false, false, 0, 38, 1 },
+     { false, false, -5000, 38, 6 }}},
   { "17014118346046923173168730371588410/-3402823669209384634633746074317682000.1",
-    {{ false, 0, 38, 1 },
-     { false, -5000, 38, 6 }}},
+    {{ false, false, 0, 38, 1 },
+     { false, false, -5000, 38, 6 }}},
   { "17014118346046923173168730371588410/-5104235503814076951950619111476522999.9",
-    {{ false, 0, 38, 1 },
-     { false, -3333, 38, 6 }}},
+    {{ false, false, 0, 38, 1 },
+     { false, false, -3333, 38, 6 }}},
   { "17014118346046923173168730371588410/-1020847100762815390390123822295304634.3",
-    {{ false, 0, 38, 1 },
-     { false, -16667, 38, 6 }}},
+    {{ false, false, 0, 38, 1 },
+     { false, false, -16667, 38, 6 }}},
   { "15014118346046923173168730371588.410/-34028236692093846346337460743176820000",
-    {{ false, 0, 38, 3 },
-     { false, 0, 38, 6 }}},
+    {{ false, false, 0, 38, 3 },
+     { false, false, 0, 38, 6 }}},
   { "150141183460469231731687303715884.10/-34028236692093846346337460743176820000",
-    {{ false, 0, 38, 2 },
-     { false, -4, 38, 6 }}},
+    {{ false, false, 0, 38, 2 },
+     { false, false, -4, 38, 6 }}},
   { "1501411834604692317316873037158841.0/-34028236692093846346337460743176820000",
-    {{ false, 0, 38, 1 },
-     { false, -44, 38, 6 }}},
+    {{ false, false, 0, 38, 1 },
+     { false, false, -44, 38, 6 }}},
   { "15014118346046923173168730371588410/-34028236692093846346337460743176820000",
-    {{ false, 0, 38, 0 },
-     { false, -441, 38, 6 }}},
+    {{ false, false, 0, 38, 0 },
+     { false, false, -441, 38, 6 }}},
   { "16014118346046923173168730371588.410/-34028236692093846346337460743176820000",
-    {{ false, 0, 38, 3 },
-     { false, 0, 38, 6 }}},
+    {{ false, false, 0, 38, 3 },
+     { false, false, 0, 38, 6 }}},
   { "160141183460469231731687303715884.10/-34028236692093846346337460743176820000",
-    {{ false, 0, 38, 2 },
-     { false, -5, 38, 6 }}},
+    {{ false, false, 0, 38, 2 },
+     { false, false, -5, 38, 6 }}},
   { "1601411834604692317316873037158841.0/-34028236692093846346337460743176820000",
-    {{ false, 0, 38, 1 },
-     { false, -47, 38, 6 }}},
+    {{ false, false, 0, 38, 1 },
+     { false, false, -47, 38, 6 }}},
   { "16014118346046923173168730371588410/-34028236692093846346337460743176820000",
-    {{ false, 0, 38, 0 },
-     { false, -471, 38, 6 }}},
+    {{ false, false, 0, 38, 0 },
+     { false, false, -471, 38, 6 }}},
   { "16014118346046923173168730371588410/-3402823669209384634633746074317682000",
-    {{ false, 0, 38, 0 },
-     { false, -4706, 38, 6 }}},
+    {{ false, false, 0, 38, 0 },
+     { false, false, -4706, 38, 6 }}},
   { "18014118346046923173168730371588.410/-34028236692093846346337460743176820000",
-    {{ false, 0, 38, 3 },
-     { false, -1, 38, 6 }}},
+    {{ false, false, 0, 38, 3 },
+     { false, false, -1, 38, 6 }}},
   { "180141183460469231731687303715884.10/-34028236692093846346337460743176820000",
-    {{ false, 0, 38, 2 },
-     { false, -5, 38, 6 }}},
+    {{ false, false, 0, 38, 2 },
+     { false, false, -5, 38, 6 }}},
   { "1801411834604692317316873037158841.0/-34028236692093846346337460743176820000",
-    {{ false, 0, 38, 1 },
-     { false, -53, 38, 6 }}},
+    {{ false, false, 0, 38, 1 },
+     { false, false, -53, 38, 6 }}},
   { "18014118346046923173168730371588410/-34028236692093846346337460743176820000",
-    {{ false, 0, 38, 0 },
-     { false, -529, 38, 6 }}},
+    {{ false, false, 0, 38, 0 },
+     { false, false, -529, 38, 6 }}},
   { "18014118346046923173168730371588410/-3402823669209384634633746074317682000",
-    {{ false, 0, 38, 0 },
-     { false, -5294, 38, 6 }}},
+    {{ false, false, 0, 38, 0 },
+     { false, false, -5294, 38, 6 }}},
   { "18014118346046923173168730371588410/-340282366920938463463374607431768200",
-    {{ false, 0, 38, 0 },
-     { false, -52939, 38, 6 }}},
+    {{ false, false, 0, 38, 0 },
+     { false, false, -52939, 38, 6 }}},
+  // IMPALA-6429: Test overflow detection when scaling up the dividend by more than 38.
+  // The bug can be trigerred only by these specific values. These values were generated
+  // by the fuzz test.
+  { "cast(70685438201098443655665080810945040.194 as decimal(38,3)) / "
+    "cast(0.85070591730234615865843651857942052863 as decimal(38,38))",
+    {{ false, true, 0, 38, 38 },
+     { true, false, 0, 38, 6 }}},
+  { "cast(9269574547799442144750864826042582 as decimal(38,2)) / "
+    "cast(0.2475880078570760549798248447 as decimal(38,38))",
+    {{ false, true, 0, 38, 38 },
+     { true, false, 0, 38, 6 }}},
+  { "cast(19770219132749848273961352693131418.9 as decimal(36,1)) / "
+    "cast(0.973940341920032002 as decimal(38,38))",
+    {{ false, true, 0, 38, 38 },
+     { true, false, 0, 38, 6 }}},
+  { "cast(100000000000000000000000000000000 as decimal(36,3)) / "
+    "cast(1 as decimal(1,0))",
+    {{ false, false, StringToInt128("10000000000000000000000000000000000000"), 38, 5 },
+     { true, false, 0, 38, 6 }}},
   // Test modulo operator
-  { "cast(1.23 as decimal(8,2)) % cast(1 as decimal(10,3))", {{ false, 230, 9, 3 }}},
-  { "cast(1 as decimal(38,0)) % cast(.2 as decimal(38,1))", {{ false, 0, 38, 1 }}},
-  { "cast(1 as decimal(38,0)) % cast(3 as decimal(38,0))", {{ false, 1, 38, 0 }}},
+  { "cast(1.23 as decimal(8,2)) % cast(1 as decimal(10,3))",
+    {{ false, false, 230, 9, 3 }}},
+  // The modulo operator is defined such that the following holds:
+  //     (x / y) * y + x % y == x
+  // In order to satisfy the above, the following must also hold:
+  //     x % -y == x % y
+  //     (-x) % y == -(x % y)
+  { "cast(-1.23 as decimal(8,2)) % cast(1 as decimal(10,3))",
+    {{ false, false, -230, 9, 3 }}},
+  { "cast(1.23 as decimal(8,2)) % cast(-1 as decimal(10,3))",
+    {{ false, false, 230, 9, 3 }}},
+  { "cast(-1.23 as decimal(8,2)) % cast(-1 as decimal(10,3))",
+    {{ false, false, -230, 9, 3 }}},
+  { "cast(1 as decimal(38,0)) % cast(.2 as decimal(38,1))",
+    {{ false, false, 0, 38, 1 }}},
+  { "cast(1 as decimal(38,0)) % cast(3 as decimal(38,0))",
+    {{ false, false, 1, 38, 0 }}},
   { "cast(-2.12 as decimal(17,2)) % cast(12515.95 as decimal(17,2))",
-    {{ false, -212, 17, 2 }}},
+    {{ false, false, -212, 17, 2 }}},
   { "cast(-2.12 as decimal(18,2)) % cast(12515.95 as decimal(18,2))",
-    {{ false, -212, 18, 2 }}},
+    {{ false, false, -212, 18, 2 }}},
   { "cast(99999999999999999999999999999999999999 as decimal(38,0)) % "
     "cast(99999999999999999999999999999999999999 as decimal(38,0))",
-    {{ false, 0, 38, 0 }}},
+    {{ false, false, 0, 38, 0 }}},
   { "cast(998 as decimal(38,0)) % cast(0.999 as decimal(38,38))",
-    {{ true, 0, 38, 38 },   // IMPALA-4964 - this should not overflow
-     { true, 0, 38, 38 }}},
+    {{ false, false, StringToInt128("99800000000000000000000000000000000000"), 38, 38 }}},
+  { "cast(-998 as decimal(38,0)) % cast(0.999 as decimal(38,38))",
+    {{ false, false, StringToInt128("-99800000000000000000000000000000000000"), 38, 38 }}},
+  { "cast(-998 as decimal(38,0)) % cast(-0.999 as decimal(38,38))",
+    {{ false, false, StringToInt128("-99800000000000000000000000000000000000"), 38, 38 }}},
+  { "cast(998 as decimal(38,0)) % cast(-0.999 as decimal(38,38))",
+    {{ false, false, StringToInt128("99800000000000000000000000000000000000"), 38, 38 }}},
   { "cast(0.998 as decimal(38,38)) % cast(999 as decimal(38,0))",
-    {{ true, 0, 38, 38 },   // IMPALA-4964 - this should not overflow
-     { true, 0, 38, 38 }}},
+    {{ false, false, StringToInt128("99800000000000000000000000000000000000"), 38, 38 }}},
+  { "cast(88888888888888888888888888888888888888 as decimal(38,0)) % "
+    "cast(0.33333333333333333333333333333333333333 as decimal(38,38))",
+    {{ false, false, StringToInt128("22222222222222222222222222222222222222"), 38, 38 }}},
+  { "cast(88888888888888888888888888888888888888 as decimal(38,0)) % "
+    "cast(3333333333333333333333333333.3333333333 as decimal(38,10))",
+    {{ false, false, StringToInt128("22222222222222222222222222222222222222"), 38, 10 }}},
+  { "cast(-88888888888888888888888888888888888888 as decimal(38,0)) % "
+    "cast(3333333333333333333333333333.3333333333 as decimal(38,10))",
+    {{ false, false, StringToInt128("-22222222222222222222222222222222222222"), 38, 10 }}},
+  { "cast(-88888888888888888888888888888888888888 as decimal(38,0)) % "
+    "cast(-3333333333333333333333333333.3333333333 as decimal(38,10))",
+    {{ false, false, StringToInt128("-22222222222222222222222222222222222222"), 38, 10 }}},
+  { "cast(88888888888888888888888888888888888888 as decimal(38,0)) % "
+    "cast(-3333333333333333333333333333.3333333333 as decimal(38,10))",
+    {{ false, false, StringToInt128("22222222222222222222222222222222222222"), 38, 10 }}},
+  { "cast(3333333333333333333333333333.3333333333 as decimal(38,10)) % "
+    "cast(88888888888888888888888888888888888888 as decimal(38,0))",
+    {{ false, false, StringToInt128("33333333333333333333333333333333333333"), 38, 10 }}},
   { "cast(0.00000000000000000000000000000000000001 as decimal(38,38)) % "
     "cast(0.0000000000000000000000000000000000001 as decimal(38,38))",
-    {{ false, 1, 38, 38 }}},
+    {{ false, false, 1, 38, 38 }}},
+  // Largest values that do not get converted to int256.
+  // The values are 2^126 - 1 and 2^122 - 1.
+  { "cast(8507059173023461586584365185794205286.3 as decimal(38,1)) % "
+    "cast(5316911983139663491615228241121378303 as decimal(38,0))",
+    {{ false, false, StringToInt128("31901471898837980949691369446728269833"), 38, 1 }}},
+  { "cast(-8507059173023461586584365185794205286.3 as decimal(38,1)) % "
+    "cast(5316911983139663491615228241121378303 as decimal(38,0))",
+    {{ false, false, StringToInt128("-31901471898837980949691369446728269833"), 38, 1 }}},
+  { "cast(-8507059173023461586584365185794205286.3 as decimal(38,1)) % "
+    "cast(-5316911983139663491615228241121378303 as decimal(38,0))",
+    {{ false, false, StringToInt128("-31901471898837980949691369446728269833"), 38, 1 }}},
+  { "cast(8507059173023461586584365185794205286.3 as decimal(38,1)) % "
+    "cast(-5316911983139663491615228241121378303 as decimal(38,0))",
+    {{ false, false, StringToInt128("31901471898837980949691369446728269833"), 38, 1 }}},
+  { "cast(8507059173023461586584365185794205286.4 as decimal(38,1)) % "
+    "cast(5316911983139663491615228241121378303 as decimal(38,0))",
+    {{ false, false, StringToInt128("31901471898837980949691369446728269834"), 38, 1 }}},
+  { "cast(-8507059173023461586584365185794205286.4 as decimal(38,1)) % "
+    "cast(5316911983139663491615228241121378303 as decimal(38,0))",
+    {{ false, false, StringToInt128("-31901471898837980949691369446728269834"), 38, 1 }}},
+  { "cast(-8507059173023461586584365185794205286.4 as decimal(38,1)) % "
+    "cast(-5316911983139663491615228241121378303 as decimal(38,0))",
+    {{ false, false, StringToInt128("-31901471898837980949691369446728269834"), 38, 1 }}},
+  { "cast(8507059173023461586584365185794205286.4 as decimal(38,1)) % "
+    "cast(-5316911983139663491615228241121378303 as decimal(38,0))",
+    {{ false, false, StringToInt128("31901471898837980949691369446728269834"), 38, 1 }}},
+  { "cast(8507059173023461586584365185794205286.3 as decimal(38,1)) % "
+    "cast(5316911983139663491615228241121378304 as decimal(38,0))",
+    {{ false, false, StringToInt128("31901471898837980949691369446728269823"), 38, 1 }}},
+  { "cast(5316911983139663491615228241121378303 as decimal(38,0)) % "
+    "cast(8507059173023461586584365185794205286.3 as decimal(38,1))",
+    {{ false, false, StringToInt128("53169119831396634916152282411213783030"), 38, 1 }}},
+  { "cast(5316911983139663491615228241121378303 as decimal(38,0)) % "
+    "cast(8507059173023461586584365185794205286.4 as decimal(38,1))",
+    {{ false, false, StringToInt128("53169119831396634916152282411213783030"), 38, 1 }}},
+  { "cast(5316911983139663491615228241121378304 as decimal(38,0)) % "
+    "cast(8507059173023461586584365185794205286.3 as decimal(38,1))",
+    {{ false, false, StringToInt128("53169119831396634916152282411213783040"), 38, 1 }}},
+  // IMPALA-6300: Incorrect results due to overflow when adjusting to the same scale
+  { "cast(11111 as decimal(6,1)) % cast(2 as decimal(8,6))",
+    {{ false, false, 1000000, 8, 6 }}},
+  { "cast(11111 as decimal(6,1)) % cast(2 as decimal(18,16))",
+    {{ false, false, StringToInt128("10000000000000000"), 18, 16 }}},
+  { "cast(11111 as decimal(6,1)) % cast(2 as decimal(37,35))",
+    {{ false, false, StringToInt128("100000000000000000000000000000000000"), 37, 35 }}},
   // Test MOD builtin
-  { "mod(cast('1' as decimal(2,0)), cast('10' as decimal(2,0)))", {{ false, 1, 2, 0 }}},
-  { "mod(cast('1.1' as decimal(2,1)), cast('1.0' as decimal(2,1)))", {{ false, 1, 2, 1 }}},
+  { "mod(cast('1' as decimal(2,0)), cast('10' as decimal(2,0)))",
+    {{ false, false, 1, 2, 0 }}},
+  { "mod(cast('1.1' as decimal(2,1)), cast('1.0' as decimal(2,1)))",
+    {{ false, false, 1, 2, 1 }}},
   { "mod(cast('-1.23' as decimal(5,2)), cast('1.0' as decimal(5,2)))",
-    {{ false, -23, 5, 2 }}},
-  { "mod(cast('1' as decimal(12,0)), cast('10' as decimal(12,0)))", {{ false, 1, 12, 0 }}},
+    {{ false, false, -23, 5, 2 }}},
+  { "mod(cast('1' as decimal(12,0)), cast('10' as decimal(12,0)))",
+    {{ false, false, 1, 12, 0 }}},
   { "mod(cast('1.1' as decimal(12,1)), cast('1.0' as decimal(12,1)))",
-    {{ false, 1, 12, 1 }}},
+    {{ false, false, 1, 12, 1 }}},
   { "mod(cast('-1.23' as decimal(12,2)), cast('1.0' as decimal(12,2)))",
-    {{ false, -23, 12, 2 }}},
+    {{ false, false, -23, 12, 2 }}},
   { "mod(cast('1' as decimal(32,0)), cast('10' as decimal(32,0)))",
-    {{ false, 1, 32, 0 }}},
+    {{ false, false, 1, 32, 0 }}},
   { "mod(cast('1.1' as decimal(32,1)), cast('1.0' as decimal(32,1)))",
-    {{ false, 1, 32, 1 }}},
+    {{ false, false, 1, 32, 1 }}},
   { "mod(cast('-1.23' as decimal(32,2)), cast('1.0' as decimal(32,2)))",
-    {{ false, -23, 32, 2 }}},
-  { "mod(cast(NULL as decimal(2,0)), cast('10' as decimal(2,0)))", {{ true, 0, 2, 0 }}},
-  { "mod(cast('10' as decimal(2,0)), cast(NULL as decimal(2,0)))", {{ true, 0, 2, 0 }}},
-  { "mod(cast('10' as decimal(2,0)), cast('0' as decimal(2,0)))", {{ true, 0, 2, 0 }}},
-  { "mod(cast('10' as decimal(2,0)), cast('0' as decimal(2,0)))", {{ true, 0, 2, 0 }}},
-  { "mod(cast(NULL as decimal(2,0)), NULL)", {{ true, 0, 2, 0 }}},
+    {{ false, false, -23, 32, 2 }}},
+  { "mod(cast(NULL as decimal(2,0)), cast('10' as decimal(2,0)))",
+    {{ false, true, 0, 2, 0 }}},
+  { "mod(cast('10' as decimal(2,0)), cast(NULL as decimal(2,0)))",
+    {{ false, true, 0, 2, 0 }}},
+  { "mod(cast('10' as decimal(2,0)), cast('0' as decimal(2,0)))",
+    {{ false, true, 0, 2, 0 },
+     { true, false, 0, 2, 0 }}},
+  { "mod(cast('10' as decimal(2,0)), cast('0' as decimal(2,0)))",
+    {{ false, true, 0, 2, 0 },
+     { true, false, 0, 2, 0 }}},
+  { "cast('10' as decimal(2,0)) % cast('0' as decimal(2,0))",
+    {{ false, true, 0, 2, 0 },
+     { true, false, 0, 2, 0 }}},
+  { "cast('10' as decimal(2,0)) % cast('0' as decimal(38,19))",
+    {{ false, true, 0, 21, 19 },
+     { true, false, 0, 21, 19 }}},
+  { "cast('10' as decimal(2,0)) / cast('0' as decimal(2,0))",
+    {{ false, true, 0, 6, 4 },
+     { true, false, 0, 6, 4 }}},
+  { "cast('10' as decimal(2,0)) / cast('0' as decimal(38,19))",
+    {{ false, true, 0, 38, 19 },
+     { true, false, 0, 38, 19 }}},
+  { "mod(cast(NULL as decimal(2,0)), NULL)",
+    {{ false, true, 0, 2, 0 }}},
   // Test CAST DECIMAL -> DECIMAL
   { "cast(cast(0.12344 as decimal(6,5)) as decimal(6,4))",
-    {{ false, 1234, 6, 4 }}},
+    {{ false, false, 1234, 6, 4 }}},
   { "cast(cast(0.12345 as decimal(6,5)) as decimal(6,4))",
-    {{ false, 1234, 6, 4 },
-     { false, 1235, 6, 4 }}},
+    {{ false, false, 1234, 6, 4 },
+     { false, false, 1235, 6, 4 }}},
   { "cast(cast('0.999' as decimal(4,3)) as decimal(1,0))",
-    {{ false, 0, 1, 0 },
-     { false, 1, 1, 0 }}},
+    {{ false, false, 0, 1, 0 },
+     { false, false, 1, 1, 0 }}},
   { "cast(cast(999999999.99 as DECIMAL(11,2)) as DECIMAL(9,0))",
-    {{ false, 999999999, 9, 0 },
-     { true, 0, 9, 0 }}},
+    {{ false, false, 999999999, 9, 0 },
+     { true, false, 0, 9, 0 }}},
   { "cast(cast(-999999999.99 as DECIMAL(11,2)) as DECIMAL(9,0))",
-    {{ false, -999999999, 9, 0 },
-     { true, 0, 9, 0 }}},
+    {{ false, false, -999999999, 9, 0 },
+     { true, false, 0, 9, 0 }}},
   // IMPALA-2233: Test that implicit casts do not lose precision.
   // The overload greatest(decimal(*,*)) is available and should be used.
   { "greatest(0, cast('99999.1111' as decimal(30,10)))",
-    {{ false, 999991111000000, 30, 10 },
-     { false, 999991111000000, 30, 10 }}},
+    {{ false, false, 999991111000000, 30, 10 },
+     { false, false, 999991111000000, 30, 10 }}},
   // Test AVG() with DECIMAL
   { "avg(d) from (values((cast(100000000000000000000000000000000.00000 as DECIMAL(38,5)) "
     "as d))) as t",
-    {{ false, static_cast<int128_t>(10000000ll) *
+    {{ false, false, static_cast<int128_t>(10000000ll) *
        10000000000ll * 10000000000ll * 10000000000ll, 38, 5 },
-     { true, 0, 38, 6}}},
+     { true, false, 0, 38, 6}}},
   { "avg(d) from (values((cast(1234567890 as DECIMAL(10,0)) as d))) as t",
-    {{false, 1234567890, 10, 0},
-     {false, 1234567890000000, 16, 6}}},
+    {{ false, false, 1234567890, 10, 0},
+     { false, false, 1234567890000000, 16, 6}}},
   { "avg(d) from (values((cast(1234567.89 as DECIMAL(10,2)) as d))) as t",
-    {{false, 123456789, 10, 2},
-     {false, 1234567890000, 14, 6}}},
+    {{ false, false, 123456789, 10, 2},
+     { false, false, 1234567890000, 14, 6}}},
   { "avg(d) from (values((cast(10000000000000000000000000000000 as DECIMAL(32,0)) "
     "as d))) as t",
-    {{false, static_cast<int128_t>(10) *
+    {{ false, false, static_cast<int128_t>(10) *
       10000000000ll * 10000000000ll * 10000000000ll, 32, 0},
-     {false, static_cast<int128_t>(10000000) *
+     { false, false, static_cast<int128_t>(10000000) *
       10000000000ll * 10000000000ll * 10000000000ll, 38, 6}}},
   { "avg(d) from (values((cast(100000000000000000000000000000000 as DECIMAL(33,0)) "
     "as d))) as t",
-    {{false, static_cast<int128_t>(100) *
+    {{ false, false, static_cast<int128_t>(100) *
       10000000000ll * 10000000000ll * 10000000000ll, 33, 0},
-     {true, 0, 38, 6}}},
+     { true, false, 0, 38, 6}}},
   { "avg(d) from (values((cast(100000000000000000000000000000000.0 as DECIMAL(34,1)) "
     "as d))) as t",
-    {{false, static_cast<int128_t>(1000) *
+    {{ false, false, static_cast<int128_t>(1000) *
       10000000000ll * 10000000000ll * 10000000000ll, 34, 1},
-     {true, 0, 38, 6}}},
+     { true, false, 0, 38, 6}}},
   { "avg(d) from (values((cast(100000000000000000000000000000000.00000 as DECIMAL(38,5)) "
     "as d))) as t",
-    {{false, static_cast<int128_t>(10000000) *
+    {{ false, false, static_cast<int128_t>(10000000) *
       10000000000ll * 10000000000ll * 10000000000ll, 38, 5},
-     {true, 0, 38, 6}}},
+     { true, false, 0, 38, 6}}},
   { "avg(d) from (values((cast(10000000000000000000000000000000.000000 as DECIMAL(38,6)) "
     "as d))) as t",
-    {{false, static_cast<int128_t>(10000000) *
+    {{ false, false, static_cast<int128_t>(10000000) *
       10000000000ll * 10000000000ll * 10000000000ll, 38, 6}}},
-  { "avg(d) from (values((cast(0.10000000000000000000000000000000000000 as DECIMAL(38,38)) "
-    "as d))) as t",
-    {{false, static_cast<int128_t>(10000000) *
+  { "avg(d) from (values((cast("
+    "0.10000000000000000000000000000000000000 as DECIMAL(38,38)) as d))) as t",
+    {{ false, false, static_cast<int128_t>(10000000) *
       10000000000ll * 10000000000ll * 10000000000ll, 38, 38}}},
   // Test CAST DECIMAL -> INT
   { "cast(cast(0.5999999 AS tinyint) AS decimal(10,6))",
-    {{ false, 0, 10, 6 },
-     { false, 1000000, 10, 6 }}},
+    {{ false, false, 0, 10, 6 },
+     { false, false, 1000000, 10, 6 }}},
   { "cast(cast(99999999.4999999 AS int) AS decimal(10,2))",
-    {{ false, 9999999900, 10, 2 }}},
+    {{ false, false, 9999999900, 10, 2 }}},
   { "cast(cast(99999999.5999999 AS int) AS decimal(10,2))",
-    {{ false, 9999999900, 10, 2 },
-     { true, 0, 10, 2 }}},
+    {{ false, false, 9999999900, 10, 2 },
+     { true, false, 0, 10, 2 }}},
   { "cast(cast(10000.5999999 as int) as decimal(30,6))",
-    {{ false, 10000000000, 30, 6 },
-     { false, 10001000000, 30, 6 }}},
+    {{ false, false, 10000000000, 30, 6 },
+     { false, false, 10001000000, 30, 6 }}},
   { "cast(cast(10000.5 AS int) AS decimal(6,1))",
-    {{ false, 100000, 6, 1 },
-     { false, 100010, 6, 1 }}},
+    {{ false, false, 100000, 6, 1 },
+     { false, false, 100010, 6, 1 }}},
   { "cast(cast(-10000.5 AS int) AS decimal(6,1))",
-    {{ false, -100000, 6, 1 },
-     { false, -100010, 6, 1 }}},
+    {{ false, false, -100000, 6, 1 },
+     { false, false, -100010, 6, 1 }}},
   { "cast(cast(9999.5 AS int) AS decimal(4,0))",
-    {{ false, 9999, 4, 0 },
-     { true, 0, 4, 0 }}},
+    {{ false, false, 9999, 4, 0 },
+     { true, false, 0, 4, 0 }}},
   { "cast(cast(-9999.5 AS int) AS decimal(4,0))",
-    {{ false, -9999, 4, 0 },
-     { true, 0, 4, 0 }}},
+    {{ false, false, -9999, 4, 0 },
+     { true, false, 0, 4, 0 }}},
   { "cast(cast(127.4999 AS tinyint) AS decimal(30,0))",
-    {{ false, 127, 30, 0 }}},
+    {{ false, false, 127, 30, 0 }}},
   { "cast(cast(127.5 AS tinyint) AS decimal(30,0))",
-    {{ false, 127, 30, 0 },
-     { true, 0, 30, 0 }}},
+    {{ false, false, 127, 30, 0 },
+     { true, false, 0, 30, 0 }}},
   { "cast(cast(128.0 AS tinyint) AS decimal(30,0))",
-    {{ false, -128, 30, 0 }, // BUG: JIRA: IMPALA-865
-     { true, 0, 30, 0 }}},
+    {{ false, false, -128, 30, 0 }, // BUG: JIRA: IMPALA-865
+     { true, false, 0, 30, 0 }}},
   { "cast(cast(-128.4999 AS tinyint) AS decimal(30,0))",
-    {{ false, -128, 30, 0 }}},
+    {{ false, false, -128, 30, 0 }}},
   { "cast(cast(-128.5 AS tinyint) AS decimal(30,0))",
-    {{ false, -128, 30, 0 },
-     { true, 0, 30, 0 }}},
+    {{ false, false, -128, 30, 0 },
+     { true, false, 0, 30, 0 }}},
   { "cast(cast(-129.0 AS tinyint) AS decimal(30,0))",
-    {{ false, 127, 30, 0 }, // BUG: JIRA: IMPALA-865
-     { true, 0, 30, 0 }}},
+    {{ false, false, 127, 30, 0 }, // BUG: JIRA: IMPALA-865
+     { true, false, 0, 30, 0 }}},
   { "cast(cast(32767.4999 AS smallint) AS decimal(30,0))",
-    {{ false, 32767, 30, 0 }}},
+    {{ false, false, 32767, 30, 0 }}},
   { "cast(cast(32767.5 AS smallint) AS decimal(30,0))",
-    {{ false, 32767, 30, 0 },
-     { true, 0, 30, 0 }}},
+    {{ false, false, 32767, 30, 0 },
+     { true, false, 0, 30, 0 }}},
   { "cast(cast(32768.0 AS smallint) AS decimal(30,0))",
-    {{ false, -32768, 30, 0 }, // BUG: JIRA: IMPALA-865
-     { true, 0, 30, 0 }}},
+    {{ false, false, -32768, 30, 0 }, // BUG: JIRA: IMPALA-865
+     { true, false, 0, 30, 0 }}},
   { "cast(cast(-32768.4999 AS smallint) AS decimal(30,0))",
-    {{ false, -32768, 30, 0 }}},
+    {{ false, false, -32768, 30, 0 }}},
   { "cast(cast(-32768.5 AS smallint) AS decimal(30,0))",
-    {{ false, -32768, 30, 0 },
-     { true, 0, 30, 0 }}},
+    {{ false, false, -32768, 30, 0 },
+     { true, false, 0, 30, 0 }}},
   { "cast(cast(-32769.0 AS smallint) AS decimal(30,0))",
-    {{ false, 32767, 30, 0 }, // BUG: JIRA: IMPALA-865
-     { true, 0, 30, 0 }}},
+    {{ false, false, 32767, 30, 0 }, // BUG: JIRA: IMPALA-865
+     { true, false, 0, 30, 0 }}},
   { "cast(cast(2147483647.4999 AS int) AS decimal(30,0))",
-    {{ false, 2147483647, 30, 0 }}},
+    {{ false, false, 2147483647, 30, 0 }}},
   { "cast(cast(2147483647.5 AS int) AS decimal(30,0))",
-    {{ false, 2147483647, 30, 0 },
-     { true, 0, 30, 0 }}},
+    {{ false, false, 2147483647, 30, 0 },
+     { true, false, 0, 30, 0 }}},
   { "cast(cast(2147483648.0 AS int) AS decimal(30,0))",
-    {{ false, -2147483648, 30, 0 }, // BUG: JIRA: IMPALA-865
-     { true, 0, 30, 0 }}},
+    {{ false, false, -2147483648, 30, 0 }, // BUG: JIRA: IMPALA-865
+     { true, false, 0, 30, 0 }}},
   { "cast(cast(-2147483648.4999 AS int) AS decimal(30,0))",
-    {{ false, -2147483648, 30, 0 }}},
+    {{ false, false, -2147483648, 30, 0 }}},
   { "cast(cast(-2147483648.5 AS int) AS decimal(30,0))",
-    {{ false, -2147483648, 30, 0 },
-     { true, 0, 30, 0 }}},
+    {{ false, false, -2147483648, 30, 0 },
+     { true, false, 0, 30, 0 }}},
   { "cast(cast(-2147483649.0 AS int) AS decimal(30,0))",
-    {{ false, 2147483647, 30, 0 }, // BUG: JIRA: IMPALA-865
-     { true, 0, 30, 0 }}},
+    {{ false, false, 2147483647, 30, 0 }, // BUG: JIRA: IMPALA-865
+     { true, false, 0, 30, 0 }}},
   { "cast(cast(9223372036854775807.4999 AS bigint) AS decimal(30,0))",
-    {{ false, 9223372036854775807, 30, 0 }}},
+    {{ false, false, 9223372036854775807, 30, 0 }}},
   { "cast(cast(9223372036854775807.5 AS bigint) AS decimal(30,0))",
-    {{ false, 9223372036854775807, 30, 0 },
-     { true, 0, 30, 0 }}},
+    {{ false, false, 9223372036854775807, 30, 0 },
+     { true, false, 0, 30, 0 }}},
   { "cast(cast(9223372036854775808.0 AS bigint) AS decimal(30,0))",
-    {{ false, -9223372036854775807 - 1, 30, 0 }, // BUG; also GCC workaround with -1
+    // BUG; also GCC workaround with -1
+    {{ false, false, -9223372036854775807 - 1, 30, 0 },
      // error: integer constant is so large that it is unsigned
-     { true, 0, 30, 0 }}},
+     { true, false, 0, 30, 0 }}},
   { "cast(cast(-9223372036854775808.4999 AS bigint) AS decimal(30,0))",
-    {{ false, -9223372036854775807 - 1, 30, 0 }}},
+    {{ false, false, -9223372036854775807 - 1, 30, 0 }}},
   { "cast(cast(-9223372036854775808.5 AS bigint) AS decimal(30,0))",
-    {{ false, -9223372036854775807 - 1, 30, 0 },
-     { true, 0, 30, 0 }}},
+    {{ false, false, -9223372036854775807 - 1, 30, 0 },
+     { true, false, 0, 30, 0 }}},
   { "cast(cast(-9223372036854775809.0 AS bigint) AS decimal(30,0))",
-    {{ false, 9223372036854775807, 30, 0 }, // BUG: JIRA: IMPALA-865
-     { true, 0, 30, 0 }}},
+    {{ false, false, 9223372036854775807, 30, 0 }, // BUG: JIRA: IMPALA-865
+     { true, false, 0, 30, 0 }}},
   { "cast(cast(cast(pow(1, -38) as decimal(38,38)) as bigint) as decimal(18,10))",
-    {{ false, 0, 18, 10 },
-     { false, 10000000000, 18, 10 }}},
+    {{ false, false, 0, 18, 10 },
+     { false, false, 10000000000, 18, 10 }}},
   { "cast(cast(cast(-pow(1, -38) as decimal(38,38)) as bigint) as decimal(18,10))",
-    {{ false, 0, 18, 10 },
-     { false, -10000000000, 18, 10 }}},
+    {{ false, false, 0, 18, 10 },
+     { false, false, -10000000000, 18, 10 }}},
   // Test CAST FLOAT -> DECIMAL
   { "cast(cast(power(10, 3) - power(10, -1) as float) as decimal(4,1))",
-    {{ false, 9999, 4, 1 }}},
+    {{ false, false, 9999, 4, 1 }}},
   { "cast(cast(power(10, 3) - power(10, -2) as float) as decimal(5,1))",
-    {{ false, 9999, 5, 1 },
-     { false, 10000, 5, 1 }}},
+    {{ false, false, 9999, 5, 1 },
+     { false, false, 10000, 5, 1 }}},
   { "cast(cast(power(10, 3) - power(10, -2) as float) as decimal(4,1))",
-    {{ false, 9999, 4, 1 },
-     { true, 0, 4, 1 }}},
+    {{ false, false, 9999, 4, 1 },
+     { true, false, 0, 4, 1 }}},
   { "cast(cast(-power(10, 3) + power(10, -1) as float) as decimal(4,1))",
-    {{ false, -9999, 4, 1 }}},
+    {{ false, false, -9999, 4, 1 }}},
   { "cast(cast(-power(10, 3) + power(10, -2) as float) as decimal(5,1))",
-    {{ false, -9999, 5, 1 },
-     { false, -10000, 5, 1 }}},
+    {{ false, false, -9999, 5, 1 },
+     { false, false, -10000, 5, 1 }}},
   { "cast(cast(-power(10, 3) + power(10, -2) as float) as decimal(4,1))",
-    {{ false, -9999, 4, 1 },
-     { true, 0, 4, 1 }}},
+    {{ false, false, -9999, 4, 1 },
+     { true, false, 0, 4, 1 }}},
   { "cast(cast(power(10, 3) - 0.45 as double) as decimal(4,1))",
-    {{ false, 9995, 4, 1 },
-     { false, 9996, 4, 1 }}},
+    {{ false, false, 9995, 4, 1 },
+     { false, false, 9996, 4, 1 }}},
   { "cast(cast(power(10, 3) - 0.45 as double) as decimal(5,2))",
-    {{ false, 99955, 5, 2 }}},
+    {{ false, false, 99955, 5, 2 }}},
   { "cast(cast(power(10, 3) - 0.45 as double) as decimal(5,0))",
-    {{ false, 999, 5, 0 },
-     { false, 1000, 5, 0 }}},
+    {{ false, false, 999, 5, 0 },
+     { false, false, 1000, 5, 0 }}},
   { "cast(cast(power(10, 3) - 0.45 as double) as decimal(3,0))",
-    {{ false, 999, 3, 0 },
-     { true, 0, 3, 0 }}},
+    {{ false, false, 999, 3, 0 },
+     { true, false, 0, 3, 0 }}},
   { "cast(cast(-power(10, 3) + 0.45 as double) as decimal(4,1))",
-    {{ false, -9995, 4, 1 },
-     { false, -9996, 4, 1 }}},
+    {{ false, false, -9995, 4, 1 },
+     { false, false, -9996, 4, 1 }}},
   { "cast(cast(-power(10, 3) + 0.45 as double) as decimal(5,2))",
-    {{ false, -99955, 5, 2 }}},
+    {{ false, false, -99955, 5, 2 }}},
   { "cast(cast(-power(10, 3) + 0.45 as double) as decimal(5,0))",
-    {{ false, -999, 5, 0 },
-     { false, -1000, 5, 0 }}},
+    {{ false, false, -999, 5, 0 },
+     { false, false, -1000, 5, 0 }}},
   { "cast(cast(-power(10, 3) + 0.45 as double) as decimal(3,0))",
-    {{ false, -999, 3, 0 },
-     { true, 0, 3, 0 }}},
+    {{ false, false, -999, 3, 0 },
+     { true, false, 0, 3, 0 }}},
   { "cast(cast(power(10, 3) - 0.5 as double) as decimal(4,1))",
-    {{ false, 9995, 4, 1 }}},
+    {{ false, false, 9995, 4, 1 }}},
   { "cast(cast(power(10, 3) - 0.5 as double) as decimal(5,2))",
-    {{ false, 99950, 5, 2 }}},
+    {{ false, false, 99950, 5, 2 }}},
   { "cast(cast(power(10, 3) - 0.5 as double) as decimal(5,0))",
-    {{ false, 999, 5, 0 },
-     { false, 1000, 5, 0 }}},
+    {{ false, false, 999, 5, 0 },
+     { false, false, 1000, 5, 0 }}},
   { "cast(cast(power(10, 3) - 0.5 as double) as decimal(3,0))",
-    {{ false, 999, 3, 0 },
-     { true, 0, 3, 0 }}},
+    {{ false, false, 999, 3, 0 },
+     { true, false, 0, 3, 0 }}},
   { "cast(cast(-power(10, 3) + 0.5 as double) as decimal(4,1))",
-    {{ false, -9995, 4, 1 }}},
+    {{ false, false, -9995, 4, 1 }}},
   { "cast(cast(-power(10, 3) + 0.5 as double) as decimal(5,2))",
-    {{ false, -99950, 5, 2 }}},
+    {{ false, false, -99950, 5, 2 }}},
   { "cast(cast(-power(10, 3) + 0.5 as double) as decimal(5,0))",
-    {{ false, -999, 5, 0 },
-     { false, -1000, 5, 0 }}},
+    {{ false, false, -999, 5, 0 },
+     { false, false, -1000, 5, 0 }}},
   { "cast(cast(-power(10, 3) + 0.5 as double) as decimal(3,0))",
-    {{ false, -999, 3, 0 },
-     { true, 0, 3, 0 }}},
+    {{ false, false, -999, 3, 0 },
+     { true, false, 0, 3, 0 }}},
   { "cast(cast(power(10, 3) - 0.55 as double) as decimal(4,1))",
-    {{ false, 9994, 4, 1 },
-     { false, 9995, 4, 1 }}},
+    {{ false, false, 9994, 4, 1 },
+     { false, false, 9995, 4, 1 }}},
   { "cast(cast(power(10, 3) - 0.55 as double) as decimal(5,2))",
-    {{ false, 99945, 5, 2 }}},
+    {{ false, false, 99945, 5, 2 }}},
   { "cast(cast(power(10, 3) - 0.55 as double) as decimal(5,0))",
-    {{ false, 999, 5, 0 }}},
+    {{ false, false, 999, 5, 0 }}},
   { "cast(cast(power(10, 3) - 0.55 as double) as decimal(3,0))",
-    {{ false, 999, 3, 0 }}},
+    {{ false, false, 999, 3, 0 }}},
   { "cast(cast(-power(10, 3) + 0.55 as double) as decimal(4,1))",
-    {{ false, -9994, 4, 1 },
-     { false, -9995, 4, 1 }}},
+    {{ false, false, -9994, 4, 1 },
+     { false, false, -9995, 4, 1 }}},
   { "cast(cast(-power(10, 3) + 0.55 as double) as decimal(5,2))",
-    {{ false, -99945, 5, 2 }}},
+    {{ false, false, -99945, 5, 2 }}},
   { "cast(cast(-power(10, 3) + 0.55 as double) as decimal(5,0))",
-    {{ false, -999, 5, 0 }}},
+    {{ false, false, -999, 5, 0 }}},
   { "cast(cast(-power(10, 3) + 0.55 as double) as decimal(3,0))",
-    {{ false, -999, 3, 0 }}},
+    {{ false, false, -999, 3, 0 }}},
   { "cast(power(2, 1023) * 100 as decimal(38,0))",
-    {{ true, 0, 38, 0 }}},
+    {{ false, true, 0, 38, 0 },
+     { true, false, 0, 38, 0 }}},
   { "cast(power(2, 1023) * 100 as decimal(18,0))",
-    {{ true, 0, 18, 0 }}},
+    {{ false, true, 0, 18, 0 },
+     { true, false, 0, 18, 0 }}},
   { "cast(power(2, 1023) * 100 as decimal(9,0))",
-    {{ true, 0, 9, 0 }}},
+    {{ false, true, 0, 9, 0 },
+     { true, false, 0, 9, 0 }}},
   { "cast(0/0 as decimal(38,0))",
-    {{ true, 0, 38, 0 }}},
+    {{ false, true, 0, 38, 0 },
+     { true, false, 0, 38, 0 }}},
   { "cast(0/0 as decimal(18,0))",
-    {{ true, 0, 18, 0 }}},
+    {{ false, true, 0, 18, 0 },
+     { true, false, 0, 18, 0 }}},
   { "cast(0/0 as decimal(9,0))",
-    {{ true, 0, 9, 0 }}},
+    {{ false, true, 0, 9, 0 },
+     { true, false, 0, 9, 0 }}},
   // 39 5's - legal double but will overflow in decimal
   { "cast(555555555555555555555555555555555555555 as decimal(38,0))",
-    {{ true, 0, 38, 0 }}},
+    {{ false, true, 0, 38, 0 },
+     { true, false, 0, 38, 0 }}},
 };
+
+void TestScaleBy() {
+  // IMPALA-6429: There is a shortcut in the decimal division. If we estimate that the
+  // dividend requires more than 255 bits after scaling up, we overflow right away. This
+  // test proves that it is correct to do this and no other checks are needed.
+  for (int scale_by = 0; scale_by < 38 * 2 + 1; ++scale_by) {
+    for (int num_bits = 1; num_bits < 128; ++num_bits) {
+      // We set the dividend to be the smallest number that requires a certain number of
+      // bits.
+      int128_t dividend = 1;
+      dividend <<= num_bits - 1;
+      int256_t scaled_up_dividend = DecimalUtil::MultiplyByScale<int256_t>(
+          ConvertToInt256(dividend), scale_by, true);
+      int256_t scale_multiplier = DecimalUtil::GetScaleMultiplier<int256_t>(scale_by);
+      if (detail::MaxBitsRequiredAfterScaling(dividend, scale_by) <= 255) {
+        // If we estimate that the scaled up dividend requires 255 bits or less, verify
+        // that we do not overflow when scaling up.
+        EXPECT_TRUE(scaled_up_dividend / scale_multiplier == ConvertToInt256(dividend));
+        EXPECT_TRUE(
+            (-scaled_up_dividend) / scale_multiplier == ConvertToInt256(-dividend));
+      } else {
+        // If we estimate that scaled up dividend requres more than 255 bits, we want to
+        // verify that it is safe to set the result of the division to overflow.
+        if (scaled_up_dividend / scale_multiplier == ConvertToInt256(dividend)) {
+          // In this case, scaling up did not overflow. Verify that the scaled up
+          // dividend is too large. Even if we divide it by the largest possible divisor
+          // the result is larger than MAX_UNSCALED_DECIMAL16, which means the division
+          // overflows in all cases.
+          EXPECT_TRUE((-scaled_up_dividend) / scale_multiplier ==
+              ConvertToInt256(-dividend));
+          int256_t max_divisor = ConvertToInt256(DecimalUtil::MAX_UNSCALED_DECIMAL16);
+          EXPECT_TRUE(scaled_up_dividend / max_divisor > max_divisor);
+          EXPECT_TRUE((-scaled_up_dividend) / max_divisor < -max_divisor);
+        } else {
+          // There was an overflow when scaling up.
+          EXPECT_TRUE((-scaled_up_dividend) / scale_multiplier !=
+              ConvertToInt256(-dividend));
+        }
+      }
+    }
+  }
+}
 
 TEST_F(ExprTest, DecimalArithmeticExprs) {
   // Test with both decimal_v2={false, true}
@@ -2060,7 +2890,9 @@ TEST_F(ExprTest, DecimalArithmeticExprs) {
     for (const DecimalTestCase& c : decimal_cases) {
       const DecimalExpectedResult& r = c.Expected(v2);
       const ColumnType& type = ColumnType::CreateDecimalType(r.precision, r.scale);
-      if (r.null) {
+      if (r.error) {
+        TestError(c.expr);
+      } else if (r.null) {
         TestDecimalResultType(c.expr, type);
         TestIsNull(c.expr, type);
       } else {
@@ -2082,6 +2914,48 @@ TEST_F(ExprTest, DecimalArithmeticExprs) {
     }
     executor_->PopExecOption();
   }
+  TestScaleBy();
+}
+
+// Tests for expressions that mix decimal and non-decimal arguments with DECIMAL_V2=false.
+TEST_F(ExprTest, DecimalV1MixedArithmeticExprs) {
+  executor_->PushExecOption("DECIMAL_V2=false");
+  // IMPALA-3437: decimal constants are implicitly converted to double.
+  TestValue("10.0 + 3", TYPE_DOUBLE, 13.0);
+  TestValue("10 + 3.0", TYPE_DOUBLE, 13.0);
+  TestValue("10.0 - 3", TYPE_DOUBLE, 7.0);
+  TestValue("10.0 * 3", TYPE_DOUBLE, 30.0);
+  TestValue("10.0 / 3", TYPE_DOUBLE, 10.0 / 3);
+  // Conversion to DOUBLE loses some precision.
+  TestValue("0.999999999999999999999999999999 = 1", TYPE_BOOLEAN, true);
+  TestValue("0.999999999999999999999999999999 != 1", TYPE_BOOLEAN, false);
+  TestValue("0.999999999999999999999999999999 < 1", TYPE_BOOLEAN, false);
+  TestValue("0.999999999999999999999999999999 >= 1", TYPE_BOOLEAN, true);
+  TestValue("0.999999999999999999999999999999 > 1", TYPE_BOOLEAN, false);
+  executor_->PopExecOption();
+}
+
+// Tests the same expressions as above with DECIMAL_V2=true.
+TEST_F(ExprTest, DecimalV2MixedArithmeticExprs) {
+  executor_->PushExecOption("DECIMAL_V2=true");
+  // IMPALA-3437: decimal constants remain decimal.
+  TestDecimalValue(
+      "10.0 + 3", Decimal4Value(130), ColumnType::CreateDecimalType(5, 1));
+  TestDecimalValue(
+      "10 + 3.0", Decimal4Value(130), ColumnType::CreateDecimalType(5, 1));
+  TestDecimalValue(
+      "10.0 - 3", Decimal4Value(70), ColumnType::CreateDecimalType(5, 1));
+  TestDecimalValue(
+      "10.0 * 3", Decimal4Value(300), ColumnType::CreateDecimalType(7, 1));
+  TestDecimalValue(
+      "10.0 / 3", Decimal4Value(3333333), ColumnType::CreateDecimalType(8, 6));
+  // Comparisons between DECIMAL values are precise.
+  TestValue("0.999999999999999999999999999999 = 1", TYPE_BOOLEAN, false);
+  TestValue("0.999999999999999999999999999999 != 1", TYPE_BOOLEAN, true);
+  TestValue("0.999999999999999999999999999999 < 1", TYPE_BOOLEAN, true);
+  TestValue("0.999999999999999999999999999999 >= 1", TYPE_BOOLEAN, false);
+  TestValue("0.999999999999999999999999999999 > 1", TYPE_BOOLEAN, false);
+  executor_->PopExecOption();
 }
 
 // There are two tests of ranges, the second of which requires a cast
@@ -2179,24 +3053,34 @@ TEST_F(ExprTest, CastExprs) {
 
   // IMPALA-3163: Test precise conversion from Decimal to Timestamp.
   TestTimestampValue("cast(cast(1457473016.1230 as decimal(17,4)) as timestamp)",
-      TimestampValue("2016-03-08 21:36:56.123000000", 29));
+      TimestampValue::Parse("2016-03-08 21:36:56.123000000", 29));
   // 32 bit Decimal.
   TestTimestampValue("cast(cast(123.45 as decimal(9,2)) as timestamp)",
-      TimestampValue("1970-01-01 00:02:03.450000000", 29));
+      TimestampValue::Parse("1970-01-01 00:02:03.450000000", 29));
+  TestTimestampValue("cast(cast(-123.45 as decimal(9,2)) as timestamp)",
+      TimestampValue::Parse("1969-12-31 23:57:56.550000000", 29));
   // 64 bit Decimal.
   TestTimestampValue("cast(cast(123.45 as decimal(18,2)) as timestamp)",
-      TimestampValue("1970-01-01 00:02:03.450000000", 29));
+      TimestampValue::Parse("1970-01-01 00:02:03.450000000", 29));
+  TestTimestampValue("cast(cast(-123.45 as decimal(18,2)) as timestamp)",
+      TimestampValue::Parse("1969-12-31 23:57:56.550000000", 29));
+  TestTimestampValue("cast(cast(-0.1 as decimal(18,10)) as timestamp)",
+      TimestampValue::Parse("1969-12-31 23:59:59.900000000", 29));
   TestTimestampValue("cast(cast(253402300799.99 as decimal(18, 2)) as timestamp)",
-      TimestampValue("9999-12-31 23:59:59.990000000", 29));
+      TimestampValue::Parse("9999-12-31 23:59:59.990000000", 29));
   TestIsNull("cast(cast(260000000000.00 as decimal(18, 2)) as timestamp)",
       TYPE_TIMESTAMP);
   // 128 bit Decimal.
   TestTimestampValue("cast(cast(123.45 as decimal(38,2)) as timestamp)",
-      TimestampValue("1970-01-01 00:02:03.450000000", 29));
+      TimestampValue::Parse("1970-01-01 00:02:03.450000000", 29));
+  TestTimestampValue("cast(cast(-123.45 as decimal(38,2)) as timestamp)",
+      TimestampValue::Parse("1969-12-31 23:57:56.550000000", 29));
+  TestTimestampValue("cast(cast(-0.1 as decimal(38,20)) as timestamp)",
+      TimestampValue::Parse("1969-12-31 23:59:59.900000000", 29));
   TestTimestampValue("cast(cast(253402300799.99 as decimal(38, 2)) as timestamp)",
-      TimestampValue("9999-12-31 23:59:59.990000000", 29));
+      TimestampValue::Parse("9999-12-31 23:59:59.990000000", 29));
   TestTimestampValue("cast(cast(253402300799.99 as decimal(38, 26)) as timestamp)",
-      TimestampValue("9999-12-31 23:59:59.990000000", 29));
+      TimestampValue::Parse("9999-12-31 23:59:59.990000000", 29));
   TestIsNull("cast(cast(260000000000.00 as decimal(38, 2)) as timestamp)",
       TYPE_TIMESTAMP);
   // numeric_limits<int64_t>::max()
@@ -2229,18 +3113,18 @@ TEST_F(ExprTest, CastExprs) {
   TestValue("cast(cast('2000-01-01 09:10:11.000000' as timestamp) as int)", TYPE_INT,
       946717811);
   TestTimestampValue("cast(946717811 as timestamp)",
-      TimestampValue("2000-01-01 09:10:11", 19));
+      TimestampValue::Parse("2000-01-01 09:10:11", 19));
 
   // Timestamp <--> Int conversions boundary cases
   TestValue("cast(cast('1400-01-01 00:00:00' as timestamp) as bigint)",
       TYPE_BIGINT, -17987443200);
   TestTimestampValue("cast(-17987443200 as timestamp)",
-      TimestampValue("1400-01-01 00:00:00", 19));
+      TimestampValue::Parse("1400-01-01 00:00:00", 19));
   TestIsNull("cast(-17987443201 as timestamp)", TYPE_TIMESTAMP);
   TestValue("cast(cast('9999-12-31 23:59:59' as timestamp) as bigint)",
       TYPE_BIGINT, 253402300799);
   TestTimestampValue("cast(253402300799 as timestamp)",
-      TimestampValue("9999-12-31 23:59:59", 19));
+      TimestampValue::Parse("9999-12-31 23:59:59", 19));
   TestIsNull("cast(253402300800 as timestamp)", TYPE_TIMESTAMP);
 
   // Timestamp <--> Float
@@ -2250,12 +3134,12 @@ TEST_F(ExprTest, CastExprs) {
   TestValue("cast(cast('2000-01-01 09:10:11.720000' as timestamp) as double)",
       TYPE_DOUBLE, 946717811.72);
   TestTimestampValue("cast(cast(946717811.033 as double) as timestamp)",
-      TimestampValue("2000-01-01 09:10:11.032999992", 29));
+      TimestampValue::Parse("2000-01-01 09:10:11.032999992", 29));
   TestValue("cast(cast('1400-01-01' as timestamp) as double)", TYPE_DOUBLE,
       -17987443200);
   TestIsNull("cast(cast(-17987443201.03 as double) as timestamp)", TYPE_TIMESTAMP);
   TestTimestampValue("cast(253402300799 as timestamp)",
-      TimestampValue("9999-12-31 23:59:59", 19));
+      TimestampValue::Parse("9999-12-31 23:59:59", 19));
   TestIsNull("cast(253433923200 as timestamp)", TYPE_TIMESTAMP);
   TestIsNull("cast(cast(null as bigint) as timestamp)", TYPE_TIMESTAMP);
   TestIsNull("cast(cast(null as timestamp) as bigint)", TYPE_BIGINT);
@@ -2328,6 +3212,48 @@ TEST_F(ExprTest, IsNullPredicate) {
   TestValue("5 IS NOT NULL", TYPE_BOOLEAN, true);
   TestValue("NULL IS NULL", TYPE_BOOLEAN, true);
   TestValue("NULL IS NOT NULL", TYPE_BOOLEAN, false);
+}
+
+TEST_F(ExprTest, BoolTestExpr) {
+  // Tests against constants.
+  TestValue("TRUE IS TRUE", TYPE_BOOLEAN, true);
+  TestValue("TRUE IS FALSE", TYPE_BOOLEAN, false);
+  TestValue("TRUE IS UNKNOWN", TYPE_BOOLEAN, false);
+  TestValue("TRUE IS NOT TRUE", TYPE_BOOLEAN, false);
+  TestValue("TRUE IS NOT FALSE", TYPE_BOOLEAN, true);
+  TestValue("TRUE IS NOT UNKNOWN", TYPE_BOOLEAN, true);
+  TestValue("FALSE IS TRUE", TYPE_BOOLEAN, false);
+  TestValue("FALSE IS FALSE", TYPE_BOOLEAN, true);
+  TestValue("FALSE IS UNKNOWN", TYPE_BOOLEAN, false);
+  TestValue("FALSE IS NOT TRUE", TYPE_BOOLEAN, true);
+  TestValue("FALSE IS NOT FALSE", TYPE_BOOLEAN, false);
+  TestValue("FALSE IS NOT UNKNOWN", TYPE_BOOLEAN, true);
+  TestValue("NULL IS TRUE", TYPE_BOOLEAN, false);
+  TestValue("NULL IS FALSE", TYPE_BOOLEAN, false);
+  TestValue("NULL IS UNKNOWN", TYPE_BOOLEAN, true);
+  TestValue("NULL IS NOT TRUE", TYPE_BOOLEAN, true);
+  TestValue("NULL IS NOT FALSE", TYPE_BOOLEAN, true);
+  TestValue("NULL IS NOT UNKNOWN", TYPE_BOOLEAN, false);
+
+  // Tests against expressions
+  TestValue("(2>1) IS TRUE", TYPE_BOOLEAN, true);
+  TestValue("(2>1) IS FALSE", TYPE_BOOLEAN, false);
+  TestValue("(2>1) IS UNKNOWN", TYPE_BOOLEAN, false);
+  TestValue("(2>1) IS NOT TRUE", TYPE_BOOLEAN, false);
+  TestValue("(2>1) IS NOT FALSE", TYPE_BOOLEAN, true);
+  TestValue("(2>1) IS NOT UNKNOWN", TYPE_BOOLEAN, true);
+  TestValue("(1>2) IS TRUE", TYPE_BOOLEAN, false);
+  TestValue("(1>2) IS FALSE", TYPE_BOOLEAN, true);
+  TestValue("(1>2) IS UNKNOWN", TYPE_BOOLEAN, false);
+  TestValue("(1>2) IS NOT TRUE", TYPE_BOOLEAN, true);
+  TestValue("(1>2) IS NOT FALSE", TYPE_BOOLEAN, false);
+  TestValue("(1>2) IS NOT UNKNOWN", TYPE_BOOLEAN, true);
+  TestValue("(NULL = 1) IS TRUE", TYPE_BOOLEAN, false);
+  TestValue("(NULL = 1) IS FALSE", TYPE_BOOLEAN, false);
+  TestValue("(NULL = 1) IS UNKNOWN", TYPE_BOOLEAN, true);
+  TestValue("(NULL = 1) IS NOT TRUE", TYPE_BOOLEAN, true);
+  TestValue("(NULL = 1) IS NOT FALSE", TYPE_BOOLEAN, true);
+  TestValue("(NULL = 1) IS NOT UNKNOWN", TYPE_BOOLEAN, false);
 }
 
 TEST_F(ExprTest, LikePredicate) {
@@ -2790,12 +3716,18 @@ TEST_F(ExprTest, StringFunctions) {
   StringVal bam(static_cast<uint8_t*>(short_buf->data()), StringVal::MAX_LENGTH);
   auto r4 = StringFunctions::Replace(context, bam, z, aaa);
   EXPECT_TRUE(r4.is_null);
+  // Re-create context to clear the error from failed allocation.
+  UdfTestHarness::CloseContext(context);
+  context = UdfTestHarness::CreateTestContext(str_desc, v, nullptr, &pool);
 
   // Similar test for second overflow.  This tests overflowing on re-allocation.
   (*short_buf)[4095] = 'Z';
   StringVal bam2(static_cast<uint8_t*>(short_buf->data()), StringVal::MAX_LENGTH-2);
   auto r5 = StringFunctions::Replace(context, bam2, z, aaa);
   EXPECT_TRUE(r5.is_null);
+  // Re-create context to clear the error from failed allocation.
+  UdfTestHarness::CloseContext(context);
+  context = UdfTestHarness::CreateTestContext(str_desc, v, nullptr, &pool);
 
   // Finally, test expanding to exactly MAX_LENGTH
   // There are 4 Zs in giga4 (not including the trailing one, as we truncate that)
@@ -2827,6 +3759,7 @@ TEST_F(ExprTest, StringFunctions) {
   TestIsNull("strleft(NULL, 3)", TYPE_STRING);
   TestIsNull("strleft('abcdefg', NULL)", TYPE_STRING);
   TestIsNull("strleft(NULL, NULL)", TYPE_STRING);
+  TestStringValue("left('foobar', 3)", "foo");
   TestStringValue("strright('abcdefg', 0)", "");
   TestStringValue("strright('abcdefg', 3)", "efg");
   TestStringValue("strright('abcdefg', cast(10 as bigint))", "abcdefg");
@@ -2835,6 +3768,7 @@ TEST_F(ExprTest, StringFunctions) {
   TestIsNull("strright(NULL, 3)", TYPE_STRING);
   TestIsNull("strright('abcdefg', NULL)", TYPE_STRING);
   TestIsNull("strright(NULL, NULL)", TYPE_STRING);
+  TestStringValue("right('foobar', 3)", "bar");
 
   TestStringValue("translate('', '', '')", "");
   TestStringValue("translate('abcd', '', '')", "abcd");
@@ -2874,6 +3808,46 @@ TEST_F(ExprTest, StringFunctions) {
   TestStringValue("rtrim('abc  defg')", "abc  defg");
   TestIsNull("rtrim(NULL)", TYPE_STRING);
 
+  TestStringValue("ltrim('%%%%%abcdefg%%%%%', '%')", "abcdefg%%%%%");
+  TestStringValue("ltrim('%%%%%abcdefg', '%')", "abcdefg");
+  TestStringValue("ltrim('abcdefg%%%%%', '%')", "abcdefg%%%%%");
+  TestStringValue("ltrim('%%%%%abc%%defg', '%')", "abc%%defg");
+  TestStringValue("ltrim('abcdefg', 'abc')", "defg");
+  TestStringValue("ltrim('    abcdefg', ' ')", "abcdefg");
+  TestStringValue("ltrim('abacdefg', 'abc')", "defg");
+  TestStringValue("ltrim('abacdefgcab', 'abc')", "defgcab");
+  TestStringValue("ltrim('abcacbbacbcacabcba', 'abc')", "");
+  TestStringValue("ltrim('', 'abc')", "");
+  TestStringValue("ltrim('     ', 'abc')", "     ");
+  TestIsNull("ltrim(NULL, 'abc')", TYPE_STRING);
+  TestStringValue("ltrim('abcdefg', NULL)", "abcdefg");
+  TestStringValue("ltrim('abcdefg', '')", "abcdefg");
+  TestStringValue("ltrim('abcdabcdabc', 'abc')", "dabcdabc");
+  TestStringValue("ltrim('aaaaaaaaa', 'a')", "");
+  TestStringValue("ltrim('abcdefg', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabg')", "cdefg");
+  TestStringValue("ltrim('æeioü','æü')", "eioü");
+  TestStringValue("ltrim('\\\\abcdefg', 'a\\\\')", "bcdefg");
+
+  TestStringValue("rtrim('%%%%%abcdefg%%%%%', '%')", "%%%%%abcdefg");
+  TestStringValue("rtrim('%%%%%abcdefg', '%')", "%%%%%abcdefg");
+  TestStringValue("rtrim('abcdefg%%%%%', '%')", "abcdefg");
+  TestStringValue("rtrim('abc%%defg%%%%%', '%')", "abc%%defg");
+  TestStringValue("rtrim('abcdefg', 'abc')", "abcdefg");
+  TestStringValue("rtrim('abcdefg    ', ' ')", "abcdefg");
+  TestStringValue("rtrim('abacdefg', 'efg')", "abacd");
+  TestStringValue("rtrim('abacdefgcab', 'abc')", "abacdefg");
+  TestStringValue("rtrim('abcacbbacbcacabcba', 'abc')", "");
+  TestStringValue("rtrim('', 'abc')", "");
+  TestStringValue("rtrim('     ', 'abc')", "     ");
+  TestIsNull("rtrim(NULL, 'abc')", TYPE_STRING);
+  TestStringValue("rtrim('abcdefg', NULL)", "abcdefg");
+  TestStringValue("rtrim('abcdefg', '')", "abcdefg");
+  TestStringValue("rtrim('abcdabcdabc', 'abc')", "abcdabcd");
+  TestStringValue("rtrim('aaaaaaaaa', 'a')", "");
+  TestStringValue("rtrim('abcdefg', 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeefg')", "abcd");
+  TestStringValue("rtrim('æeioü','æü')", "æeio");
+  TestStringValue("rtrim('abcdefg\\\\', 'g\\\\')", "abcdef");
+
   TestStringValue("btrim('     abcdefg   ')", "abcdefg");
   TestStringValue("btrim('     abcdefg')", "abcdefg");
   TestStringValue("btrim('abcdefg      ')", "abcdefg");
@@ -2892,11 +3866,14 @@ TEST_F(ExprTest, StringFunctions) {
   TestStringValue("btrim('abacdefgcab', 'abc')", "defg");
   TestStringValue("btrim('abcacbbacbcacabcba', 'abc')", "");
   TestStringValue("btrim('', 'abc')", "");
+  TestStringValue("btrim('     ', 'abc')", "     ");
+  TestIsNull("btrim(NULL, 'abc')", TYPE_STRING);
   TestStringValue("btrim('abcdefg', NULL)", "abcdefg");
   TestStringValue("btrim('abcdabcdabc', 'abc')", "dabcd");
   TestStringValue("btrim('aaaaaaaaa', 'a')", "");
   TestStringValue("btrim('abcdefg', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabg')", "cdef");
   TestStringValue("btrim('æeioü','æü')", "eio");
+  TestStringValue("btrim('\\\\abcdefg\\\\', 'ag\\\\')", "bcdef");
 
   TestStringValue("space(0)", "");
   TestStringValue("space(-1)", "");
@@ -3138,10 +4115,12 @@ TEST_F(ExprTest, StringFunctions) {
       "                                                                             "
       "                        ", ColumnType::CreateCharType(255));
 
+  /*
   TestCharValue("CASE cast('1.1' as char(3)) when cast('1.1' as char(3)) then "
       "cast('1' as char(1)) when cast('2.22' as char(4)) then "
       "cast('2' as char(1)) else cast('3' as char(1)) end", "1",
       ColumnType::CreateCharType(3));
+  */
 
   // Test maximum VARCHAR value
   char query[ColumnType::MAX_VARCHAR_LENGTH + 1024];
@@ -3152,9 +4131,9 @@ TEST_F(ExprTest, StringFunctions) {
   big_str[ColumnType::MAX_VARCHAR_LENGTH] = '\0';
   sprintf(query, "cast('%sxxx' as VARCHAR(%d))", big_str, ColumnType::MAX_VARCHAR_LENGTH);
   TestStringValue(query, big_str);
+}
 
-  // base64{en,de}code
-
+TEST_F(ExprTest, StringBase64Coding) {
   // Test some known values of base64{en,de}code
   TestIsNull("base64encode(NULL)", TYPE_STRING);
   TestIsNull("base64decode(NULL)", TYPE_STRING);
@@ -3169,12 +4148,12 @@ TEST_F(ExprTest, StringFunctions) {
 
   // Test random short strings.
   srand(0);
-  for (int length = 1; length < 100; ++length) {
+  // Pick some 'interesting' (i.e. random, but include some powers of two, some primes,
+  // and edge-cases) lengths to test.
+  for (int length: {1, 2, 3, 5, 8, 32, 42, 50, 64, 71, 89, 99}) {
     for (int iteration = 0; iteration < 10; ++iteration) {
       string raw(length, ' ');
-      for (int j = 0; j < length; ++j) {
-        raw[j] = rand() % 128;
-      }
+      for (int j = 0; j < length; ++j) raw[j] = rand() % 128;
       const string as_octal = StringToOctalLiteral(raw);
       TestValue("length(base64encode('" + as_octal + "')) > length('" + as_octal + "')",
           TYPE_BOOLEAN, true);
@@ -3187,7 +4166,9 @@ TEST_F(ExprTest, StringFunctions) {
 TEST_F(ExprTest, LongReverse) {
   static const int MAX_LEN = 2048;
   string to_reverse(MAX_LEN, ' '), reversed(MAX_LEN, ' ');
-  for (int i = 0; i < MAX_LEN; ++i) {
+  // Pick some 'interesting' (i.e. random, but include some powers of two, some primes,
+  // and edge-cases) lengths to test.
+  for (int i: {1, 2, 3, 5, 8, 32, 42, 512, 1024, 1357, 1788, 2012, 2047}) {
     to_reverse[i] = reversed[MAX_LEN - 1 - i] = 'a' + (rand() % 26);
     TestStringValue("reverse('" + to_reverse.substr(0, i + 1) + "')",
         reversed.substr(MAX_LEN - 1 - i));
@@ -3327,10 +4308,46 @@ TEST_F(ExprTest, StringRegexpFunctions) {
   TestIsNull("regexp_match_count(NULL, '.*')", TYPE_INT);
   TestIsNull("regexp_match_count('a123', NULL)", TYPE_INT);
   TestIsNull("regexp_match_count(NULL, NULL)", TYPE_INT);
+
+  TestIsNull("regexp_escape(NULL)", TYPE_STRING);
+  TestStringValue("regexp_escape('')", "");
+  // Test special character escape
+  // .\+*?[^]$(){}=!<>|:-
+  TestStringValue("regexp_escape('Hello.world')", R"(Hello\.world)");
+  TestStringValue(R"(regexp_escape('Hello\\world'))", R"(Hello\\world)");
+  TestStringValue("regexp_escape('Hello+world')", R"(Hello\+world)");
+  TestStringValue("regexp_escape('Hello*world')", R"(Hello\*world)");
+  TestStringValue("regexp_escape('Hello?world')", R"(Hello\?world)");
+  TestStringValue("regexp_escape('Hello[world')", R"(Hello\[world)");
+  TestStringValue("regexp_escape('Hello^world')", R"(Hello\^world)");
+  TestStringValue("regexp_escape('Hello]world')", R"(Hello\]world)");
+  TestStringValue("regexp_escape('Hello$world')", R"(Hello\$world)");
+  TestStringValue("regexp_escape('Hello(world')", R"(Hello\(world)");
+  TestStringValue("regexp_escape('Hello)world')", R"(Hello\)world)");
+  TestStringValue("regexp_escape('Hello{world')", R"(Hello\{world)");
+  TestStringValue("regexp_escape('Hello}world')", R"(Hello\}world)");
+  TestStringValue("regexp_escape('Hello=world')", R"(Hello\=world)");
+  TestStringValue("regexp_escape('Hello!world')", R"(Hello\!world)");
+  TestStringValue("regexp_escape('Hello<world')", R"(Hello\<world)");
+  TestStringValue("regexp_escape('Hello>world')", R"(Hello\>world)");
+  TestStringValue("regexp_escape('Hello|world')", R"(Hello\|world)");
+  TestStringValue("regexp_escape('Hello:world')", R"(Hello\:world)");
+  TestStringValue("regexp_escape('Hello-world')", R"(Hello\-world)");
+  // Mixed case
+  TestStringValue(R"(regexp_escape('a.b\\c+d*e?f[g]h$i(j)k{l}m=n!o<p>q|r:s-t'))",
+      R"(a\.b\\c\+d\*e\?f\[g\]h\$i\(j\)k\{l\}m\=n\!o\<p\>q\|r\:s\-t)");
+  // Mixed case with other regexp_* functions
+  TestStringValue(R"(regexp_extract(regexp_escape('Hello\\world'),)"
+      R"('([[:alpha:]]+)(\\\\\\\\)([[:alpha:]]+)', 0))", R"(Hello\\world)");
+  TestStringValue(R"(regexp_extract(regexp_escape('Hello\\world'),)"
+      R"('([[:alpha:]]+)(\\\\\\\\)([[:alpha:]]+)', 1))", "Hello");
+  TestStringValue(R"(regexp_extract(regexp_escape('Hello\\world'),)"
+      R"('([[:alpha:]]+)(\\\\\\\\)([[:alpha:]]+)', 2))", R"(\\)");
+  TestStringValue(R"(regexp_extract(regexp_escape('Hello\\world'),)"
+      R"('([[:alpha:]]+)(\\\\\\\\)([[:alpha:]]+)', 3))", "world");
 }
 
-TEST_F(ExprTest, StringParseUrlFunction) {
-  // TODO: For now, our parse_url my not behave exactly like Hive
+TEST_F(ExprTest, StringParseUrlFunction) { // TODO: For now, our parse_url my not behave exactly like Hive
   // when given malformed URLs.
   // If necessary, we can closely follow Java's URL implementation
   // to behave exactly like Hive.
@@ -3685,6 +4702,7 @@ TEST_F(ExprTest, UtilityFunctions) {
   TestStringValue("typeOf(cast(10 as DOUBLE))", "DOUBLE");
   TestStringValue("typeOf(current_database())", "STRING");
   TestStringValue("typeOf(now())", "TIMESTAMP");
+  TestStringValue("typeOf(utc_timestamp())", "TIMESTAMP");
   TestStringValue("typeOf(cast(10 as DECIMAL))", "DECIMAL(9,0)");
   TestStringValue("typeOf(0.0)", "DECIMAL(1,1)");
   TestStringValue("typeOf(3.14)", "DECIMAL(3,2)");
@@ -3739,13 +4757,59 @@ TEST_F(ExprTest, UtilityFunctions) {
   TestIsNull("fnv_hash(NULL)", TYPE_BIGINT);
 }
 
+TEST_F(ExprTest, MurmurHashFunction) {
+  string s("hello world");
+  int64_t expected = HashUtil::MurmurHash2_64(s.data(), s.size(),
+      HashUtil::MURMUR_DEFAULT_SEED);
+  // The comparison with the constant is to detect if MurmurHash2_64 accidentally
+  // changes behavior.
+  EXPECT_EQ(-3190198453633110066, expected);
+  TestValue("murmur_hash('hello world')", TYPE_BIGINT, expected);
+  s = string("");
+  expected = HashUtil::MurmurHash2_64(s.data(), s.size(), HashUtil::MURMUR_DEFAULT_SEED);
+  TestValue("murmur_hash('')", TYPE_BIGINT, expected);
+
+  IntValMap::iterator int_iter;
+  for(int_iter = min_int_values_.begin(); int_iter != min_int_values_.end();
+      ++int_iter) {
+    ColumnType t = ColumnType(static_cast<PrimitiveType>(int_iter->first));
+    expected = HashUtil::MurmurHash2_64(
+        &int_iter->second, t.GetByteSize(), HashUtil::MURMUR_DEFAULT_SEED);
+    string& val = default_type_strs_[int_iter->first];
+    TestValue("murmur_hash(" + val + ")", TYPE_BIGINT, expected);
+  }
+
+  // Don't use min_float_values_ for testing floats and doubles due to improper float
+  // and double literal handling, see IMPALA-669.
+  float float_val = 42;
+  expected = HashUtil::MurmurHash2_64(&float_val, sizeof(float),
+      HashUtil::MURMUR_DEFAULT_SEED);
+  TestValue("murmur_hash(CAST(42 as FLOAT))", TYPE_BIGINT, expected);
+
+  double double_val = 42;
+  expected = HashUtil::MurmurHash2_64(&double_val, sizeof(double),
+      HashUtil::MURMUR_DEFAULT_SEED);
+  TestValue("murmur_hash(CAST(42 as DOUBLE))", TYPE_BIGINT, expected);
+
+  expected = HashUtil::MurmurHash2_64(&default_timestamp_val_, 12,
+      HashUtil::MURMUR_DEFAULT_SEED);
+  TestValue("murmur_hash(" + default_timestamp_str_ + ")", TYPE_BIGINT, expected);
+
+  bool bool_val = false;
+  expected = HashUtil::MurmurHash2_64(&bool_val, 1, HashUtil::MURMUR_DEFAULT_SEED);
+  TestValue("murmur_hash(FALSE)", TYPE_BIGINT, expected);
+
+  // Test NULL input returns NULL
+  TestIsNull("murmur_hash(NULL)", TYPE_BIGINT);
+}
+
 TEST_F(ExprTest, SessionFunctions) {
   enum Session {S1, S2};
   enum Query {Q1, Q2};
 
   map<Session, map<Query, string>> results;
   for (Session session: {S1, S2}) {
-    executor_->Setup(); // Starts new session
+    ASSERT_OK(executor_->Setup()); // Starts new session
     results[session][Q1] = GetValue("current_session()", TYPE_STRING);
     results[session][Q2] = GetValue("current_sid()", TYPE_STRING);
   }
@@ -4030,6 +5094,21 @@ TEST_F(ExprTest, MathFunctions) {
   TestValue("e()", TYPE_DOUBLE, M_E);
   TestValue("abs(cast(-1.0 as double))", TYPE_DOUBLE, 1.0);
   TestValue("abs(cast(1.0 as double))", TYPE_DOUBLE, 1.0);
+  TestValue("abs(-127)", TYPE_SMALLINT, 127);
+  TestValue("abs(-128)", TYPE_SMALLINT, 128);
+  TestValue("abs(127)", TYPE_SMALLINT, 127);
+  TestValue("abs(128)", TYPE_INT, 128);
+  TestValue("abs(-32767)", TYPE_INT, 32767);
+  TestValue("abs(-32768)", TYPE_INT, 32768);
+  TestValue("abs(32767)", TYPE_INT, 32767);
+  TestValue("abs(32768)", TYPE_BIGINT, 32768);
+  TestValue("abs(-1 * cast(pow(2, 31) as int))", TYPE_BIGINT, 2147483648);
+  TestValue("abs(cast(pow(2, 31) as int))", TYPE_BIGINT, 2147483648);
+  TestValue("abs(2147483647)", TYPE_BIGINT, 2147483647);
+  TestValue("abs(2147483647)", TYPE_BIGINT, 2147483647);
+  TestValue("abs(-9223372036854775807)", TYPE_BIGINT,  9223372036854775807);
+  TestValue("abs(9223372036854775807)", TYPE_BIGINT,  9223372036854775807);
+  TestIsNull("abs(-9223372036854775808)", TYPE_BIGINT);
   TestValue("sign(0.0)", TYPE_FLOAT, 0.0f);
   TestValue("sign(-0.0)", TYPE_FLOAT, 0.0f);
   TestValue("sign(+0.0)", TYPE_FLOAT, 0.0f);
@@ -4063,16 +5142,15 @@ TEST_F(ExprTest, MathFunctions) {
   TestValue("dsqrt(81.0)", TYPE_DOUBLE, 9);
 
   // Run twice to test deterministic behavior.
-  uint32_t seed = 0;
-  double expected = static_cast<double>(rand_r(&seed)) / static_cast<double>(RAND_MAX);
-  TestValue("rand()", TYPE_DOUBLE, expected);
-  TestValue("rand()", TYPE_DOUBLE, expected);
-  TestValue("random()", TYPE_DOUBLE, expected); // Test alias
-  seed = 1234;
-  expected = static_cast<double>(rand_r(&seed)) / static_cast<double>(RAND_MAX);
-  TestValue("rand(1234)", TYPE_DOUBLE, expected);
-  TestValue("rand(1234)", TYPE_DOUBLE, expected);
-  TestValue("random(1234)", TYPE_DOUBLE, expected); // Test alias
+  for (uint32_t seed : {0, 1234}) {
+    stringstream rand, random;
+    rand << "rand(" << seed << ")";
+    random << "random(" << seed << ")";
+    const double expected_result = ConvertValue<double>(GetValue(rand.str(),
+      TYPE_DOUBLE));
+    TestValue(rand.str(), TYPE_DOUBLE, expected_result);
+    TestValue(random.str(), TYPE_DOUBLE, expected_result); // Test alias
+  }
 
   // Test bigint param.
   TestValue("pmod(10, 3)", TYPE_BIGINT, 1);
@@ -4298,7 +5376,7 @@ TEST_F(ExprTest, MathFunctions) {
 
   // NULL arguments. In some cases the NULL can match multiple overloads so the result
   // type depends on the order in which function overloads are considered.
-  TestIsNull("abs(NULL)", TYPE_TINYINT);
+  TestIsNull("abs(NULL)", TYPE_SMALLINT);
   TestIsNull("sign(NULL)", TYPE_FLOAT);
   TestIsNull("exp(NULL)", TYPE_DOUBLE);
   TestIsNull("ln(NULL)", TYPE_DOUBLE);
@@ -4470,6 +5548,11 @@ TEST_F(ExprTest, MoscowTimezoneConversion) {
   TestStringValue(MSC_TO_UTC("2014-12-20 12:00:00"), "2014-12-20 09:00:00");
   TestStringValue(MSC_TO_UTC("2015-06-20 12:00:00"), "2015-06-20 09:00:00");
   TestStringValue(MSC_TO_UTC("2015-12-20 12:00:00"), "2015-12-20 09:00:00");
+
+  // Timestamp conversions of "dateless" times should return null (and not crash,
+  // see IMPALA-5983).
+  TestIsNull(UTC_TO_MSC("10:00:00"), TYPE_STRING);
+  TestIsNull(MSC_TO_UTC("10:00:00"), TYPE_STRING);
 
 #pragma pop_macro("MSC_TO_UTC")
 #pragma pop_macro("UTC_TO_MSC")
@@ -4826,6 +5909,8 @@ TEST_F(ExprTest, TimestampFunctions) {
   }
 
   TestIsNull("from_unixtime(NULL, 'yyyy-MM-dd')", TYPE_STRING);
+  TestIsNull("from_unixtime(999999999999999)", TYPE_STRING);
+  TestIsNull("from_unixtime(999999999999999, 'yyyy-MM-dd')", TYPE_STRING);
   TestStringValue("from_unixtime(unix_timestamp('1999-01-01 10:10:10'), \
       'yyyy-MM-dd')", "1999-01-01");
   TestStringValue("from_unixtime(unix_timestamp('1999-01-01 10:10:10'), \
@@ -4849,11 +5934,13 @@ TEST_F(ExprTest, TimestampFunctions) {
   TestValue("cast('2011-12-22 09:10:11.000000' as timestamp) = \
       cast('2011-12-22 09:10:11' as timestamp)", TYPE_BOOLEAN, true);
   TestValue("year(cast('2011-12-22 09:10:11.000000' as timestamp))", TYPE_INT, 2011);
+  TestValue("quarter(cast('2011-12-22 09:10:11.000000' as timestamp))", TYPE_INT, 4);
   TestValue("month(cast('2011-12-22 09:10:11.000000' as timestamp))", TYPE_INT, 12);
   TestValue("dayofmonth(cast('2011-12-22 09:10:11.000000' as timestamp))", TYPE_INT, 22);
   TestValue("day(cast('2011-12-22 09:10:11.000000' as timestamp))", TYPE_INT, 22);
   TestValue("dayofyear(cast('2011-12-22 09:10:11.000000' as timestamp))", TYPE_INT, 356);
   TestValue("weekofyear(cast('2011-12-22 09:10:11.000000' as timestamp))", TYPE_INT, 51);
+  TestValue("week(cast('2011-12-22 09:10:11.000000' as timestamp))", TYPE_INT, 51);
   TestValue("dayofweek(cast('2011-12-18 09:10:11.000000' as timestamp))", TYPE_INT, 1);
   TestValue("dayofweek(cast('2011-12-22 09:10:11.000000' as timestamp))", TYPE_INT, 5);
   TestValue("dayofweek(cast('2011-12-24 09:10:11.000000' as timestamp))", TYPE_INT, 7);
@@ -4865,11 +5952,13 @@ TEST_F(ExprTest, TimestampFunctions) {
   TestValue("millisecond(cast('2011-12-22 09:10:11' as timestamp))", TYPE_INT, 0);
   TestValue("millisecond(cast('2011-12-22' as timestamp))", TYPE_INT, 0);
   TestValue("year(cast('2011-12-22' as timestamp))", TYPE_INT, 2011);
+  TestValue("quarter(cast('2011-12-22' as timestamp))", TYPE_INT, 4);
   TestValue("month(cast('2011-12-22' as timestamp))", TYPE_INT, 12);
   TestValue("dayofmonth(cast('2011-12-22' as timestamp))", TYPE_INT, 22);
   TestValue("day(cast('2011-12-22' as timestamp))", TYPE_INT, 22);
   TestValue("dayofyear(cast('2011-12-22' as timestamp))", TYPE_INT, 356);
   TestValue("weekofyear(cast('2011-12-22' as timestamp))", TYPE_INT, 51);
+  TestValue("week(cast('2011-12-22' as timestamp))", TYPE_INT, 51);
   TestValue("dayofweek(cast('2011-12-18' as timestamp))", TYPE_INT, 1);
   TestValue("dayofweek(cast('2011-12-22' as timestamp))", TYPE_INT, 5);
   TestValue("dayofweek(cast('2011-12-24' as timestamp))", TYPE_INT, 7);
@@ -4927,22 +6016,26 @@ TEST_F(ExprTest, TimestampFunctions) {
   TestIsNull("cast('2000-12-31 24:59:59' as timestamp)", TYPE_TIMESTAMP);
 
   TestIsNull("year(cast('09:10:11.000000' as timestamp))", TYPE_INT);
+  TestIsNull("quarter(cast('09:10:11.000000' as timestamp))", TYPE_INT);
   TestIsNull("month(cast('09:10:11.000000' as timestamp))", TYPE_INT);
   TestIsNull("dayofmonth(cast('09:10:11.000000' as timestamp))", TYPE_INT);
   TestIsNull("day(cast('09:10:11.000000' as timestamp))", TYPE_INT);
   TestIsNull("dayofyear(cast('09:10:11.000000' as timestamp))", TYPE_INT);
   TestIsNull("dayofweek(cast('09:10:11.000000' as timestamp))", TYPE_INT);
   TestIsNull("weekofyear(cast('09:10:11.000000' as timestamp))", TYPE_INT);
+  TestIsNull("week(cast('09:10:11.000000' as timestamp))", TYPE_INT);
   TestIsNull("datediff(cast('09:10:11.12345678' as timestamp), "
       "cast('2012-12-22' as timestamp))", TYPE_INT);
 
   TestIsNull("year(NULL)", TYPE_INT);
+  TestIsNull("quarter(NULL)", TYPE_INT);
   TestIsNull("month(NULL)", TYPE_INT);
   TestIsNull("dayofmonth(NULL)", TYPE_INT);
   TestIsNull("day(NULL)", TYPE_INT);
   TestIsNull("dayofweek(NULL)", TYPE_INT);
   TestIsNull("dayofyear(NULL)", TYPE_INT);
   TestIsNull("weekofyear(NULL)", TYPE_INT);
+  TestIsNull("week(NULL)", TYPE_INT);
   TestIsNull("datediff(NULL, cast('2011-12-22 09:10:11.12345678' as timestamp))",
       TYPE_INT);
   TestIsNull("datediff(cast('2012-12-22' as timestamp), NULL)", TYPE_INT);
@@ -4961,6 +6054,34 @@ TEST_F(ExprTest, TimestampFunctions) {
       "Saturday");
   TestStringValue("dayname(cast('2011-12-25 09:10:11.000000' as timestamp))", "Sunday");
   TestIsNull("dayname(NULL)", TYPE_STRING);
+
+  TestStringValue("monthname(cast('2011-01-18 09:10:11.000000' as timestamp))", "January");
+  TestStringValue("monthname(cast('2011-02-18 09:10:11.000000' as timestamp))", "February");
+  TestStringValue("monthname(cast('2011-03-18 09:10:11.000000' as timestamp))", "March");
+  TestStringValue("monthname(cast('2011-04-18 09:10:11.000000' as timestamp))", "April");
+  TestStringValue("monthname(cast('2011-05-18 09:10:11.000000' as timestamp))", "May");
+  TestStringValue("monthname(cast('2011-06-18 09:10:11.000000' as timestamp))", "June");
+  TestStringValue("monthname(cast('2011-07-18 09:10:11.000000' as timestamp))", "July");
+  TestStringValue("monthname(cast('2011-08-18 09:10:11.000000' as timestamp))", "August");
+  TestStringValue("monthname(cast('2011-09-18 09:10:11.000000' as timestamp))", "September");
+  TestStringValue("monthname(cast('2011-10-18 09:10:11.000000' as timestamp))", "October");
+  TestStringValue("monthname(cast('2011-11-18 09:10:11.000000' as timestamp))", "November");
+  TestStringValue("monthname(cast('2011-12-18 09:10:11.000000' as timestamp))", "December");
+  TestIsNull("monthname(NULL)", TYPE_STRING);
+
+  TestValue("quarter(cast('2011-01-18 09:10:11.000000' as timestamp))", TYPE_INT, 1);
+  TestValue("quarter(cast('2011-02-18 09:10:11.000000' as timestamp))", TYPE_INT, 1);
+  TestValue("quarter(cast('2011-03-18 09:10:11.000000' as timestamp))", TYPE_INT, 1);
+  TestValue("quarter(cast('2011-04-18 09:10:11.000000' as timestamp))", TYPE_INT, 2);
+  TestValue("quarter(cast('2011-05-18 09:10:11.000000' as timestamp))", TYPE_INT, 2);
+  TestValue("quarter(cast('2011-06-18 09:10:11.000000' as timestamp))", TYPE_INT, 2);
+  TestValue("quarter(cast('2011-07-18 09:10:11.000000' as timestamp))", TYPE_INT, 3);
+  TestValue("quarter(cast('2011-08-18 09:10:11.000000' as timestamp))", TYPE_INT, 3);
+  TestValue("quarter(cast('2011-09-18 09:10:11.000000' as timestamp))", TYPE_INT, 3);
+  TestValue("quarter(cast('2011-10-18 09:10:11.000000' as timestamp))", TYPE_INT, 4);
+  TestValue("quarter(cast('2011-11-18 09:10:11.000000' as timestamp))", TYPE_INT, 4);
+  TestValue("quarter(cast('2011-12-18 09:10:11.000000' as timestamp))", TYPE_INT, 4);
+  TestIsNull("quarter(NULL)", TYPE_INT);
 
   // Tests from Hive
   // The hive documentation states that timestamps are timezoneless, but the tests
@@ -5050,6 +6171,7 @@ TEST_F(ExprTest, TimestampFunctions) {
 
   // Test functions with unknown expected value.
   TestValidTimestampValue("now()");
+  TestValidTimestampValue("utc_timestamp()");
   TestValidTimestampValue("current_timestamp()");
   TestValidTimestampValue("cast(unix_timestamp() as timestamp)");
 
@@ -5079,20 +6201,53 @@ TEST_F(ExprTest, TimestampFunctions) {
 
   // Test that the other current time functions are also reasonable.
   TimestampValue timestamp_result;
-  TimestampValue start_time = TimestampValue::LocalTime();
+  TimestampValue start_time = TimestampValue::FromUnixTimeMicros(UnixMicros());
   timestamp_result = ConvertValue<TimestampValue>(GetValue("now()", TYPE_TIMESTAMP));
-  EXPECT_BETWEEN(start_time, timestamp_result, TimestampValue::LocalTime());
+  EXPECT_BETWEEN(start_time, timestamp_result,
+      TimestampValue::FromUnixTimeMicros(UnixMicros()));
   timestamp_result = ConvertValue<TimestampValue>(GetValue("current_timestamp()",
       TYPE_TIMESTAMP));
-  EXPECT_BETWEEN(start_time, timestamp_result, TimestampValue::LocalTime());
+  EXPECT_BETWEEN(start_time, timestamp_result,
+      TimestampValue::FromUnixTimeMicros(UnixMicros()));
+  const TimestampValue utc_start_time =
+      TimestampValue::UtcFromUnixTimeMicros(UnixMicros());
+  timestamp_result = ConvertValue<TimestampValue>(GetValue("utc_timestamp()",
+      TYPE_TIMESTAMP));
+  EXPECT_BETWEEN(utc_start_time, timestamp_result,
+      TimestampValue::UtcFromUnixTimeMicros(UnixMicros()));
   // UNIX_TIMESTAMP() has second precision so the comparison start time is shifted back
   // a second to ensure an earlier value.
   unix_start_time =
       (posix_time::microsec_clock::local_time() - from_time_t(0)).total_seconds();
   timestamp_result = ConvertValue<TimestampValue>(GetValue(
       "cast(unix_timestamp() as timestamp)", TYPE_TIMESTAMP));
-  EXPECT_BETWEEN(TimestampValue(unix_start_time - 1), timestamp_result,
-      TimestampValue::LocalTime());
+  EXPECT_BETWEEN(TimestampValue::FromUnixTime(unix_start_time - 1), timestamp_result,
+      TimestampValue::FromUnixTimeMicros(UnixMicros()));
+
+  // Test that UTC and local time represent the same point in time
+  {
+    const string stmt = "select now(), utc_timestamp()";
+    vector<FieldSchema> result_types;
+    Status status = executor_->Exec(stmt, &result_types);
+    EXPECT_TRUE(status.ok()) << "stmt: " << stmt << "\nerror: " << status.GetDetail();
+    DCHECK(result_types.size() == 2);
+    EXPECT_EQ(TypeToOdbcString(TYPE_TIMESTAMP), result_types[0].type)
+        << "invalid type returned by now()";
+    EXPECT_EQ(TypeToOdbcString(TYPE_TIMESTAMP), result_types[1].type)
+        << "invalid type returned by utc_timestamp()";
+    string result_row;
+    status = executor_->FetchResult(&result_row);
+    EXPECT_TRUE(status.ok()) << "stmt: " << stmt << "\nerror: " << status.GetDetail();
+    vector<string> result_cols;
+    boost::split(result_cols, result_row, boost::is_any_of("\t"));
+    // To ensure this fails if columns are not tab separated
+    DCHECK(result_cols.size() == 2);
+    const TimestampValue local_time = ConvertValue<TimestampValue>(result_cols[0]);
+    const TimestampValue utc_timestamp = ConvertValue<TimestampValue>(result_cols[1]);
+    TimestampValue utc_converted_to_local(utc_timestamp);
+    utc_converted_to_local.UtcToLocal();
+    EXPECT_EQ(utc_converted_to_local, local_time);
+  }
 
   // Test alias
   TestValue("now() = current_timestamp()", TYPE_BOOLEAN, true);
@@ -5408,6 +6563,8 @@ TEST_F(ExprTest, TimestampFunctions) {
   // Extract using FROM keyword
   TestValue("extract(YEAR from cast('2006-05-12 18:27:28.12345' as timestamp))",
             TYPE_INT, 2006);
+  TestValue("extract(QUARTER from cast('2006-05-12 18:27:28.12345' as timestamp))",
+            TYPE_INT, 2);
   TestValue("extract(MoNTH from cast('2006-05-12 18:27:28.12345' as timestamp))",
             TYPE_INT, 5);
   TestValue("extract(DaY from cast('2006-05-12 18:27:28.12345' as timestamp))",
@@ -5429,6 +6586,8 @@ TEST_F(ExprTest, TimestampFunctions) {
   // Date_part, same as extract function but with arguments swapped
   TestValue("date_part('YEAR', cast('2006-05-12 18:27:28.12345' as timestamp))",
             TYPE_INT, 2006);
+  TestValue("date_part('QUARTER', cast('2006-05-12 18:27:28.12345' as timestamp))",
+            TYPE_INT, 2);
   TestValue("date_part('MoNTH', cast('2006-05-12 18:27:28.12345' as timestamp))",
             TYPE_INT, 5);
   TestValue("date_part('DaY', cast('2006-05-12 18:27:28.12345' as timestamp))",
@@ -5578,6 +6737,24 @@ TEST_F(ExprTest, TimestampFunctions) {
 
   // next_day udf test for IMPALA-2459
   TestNextDayFunction();
+
+  // last_day udf test for IMPALA-5316
+  TestLastDayFunction();
+
+  // Test microsecond unix time conversion functions.
+  TestValue("utc_to_unix_micros(\"1400-01-01 00:00:00\")", TYPE_BIGINT,
+      -17987443200000000);
+  TestValue("utc_to_unix_micros(\"1970-01-01 00:00:00\")", TYPE_BIGINT,
+      0);
+  TestValue("utc_to_unix_micros(\"9999-01-01 23:59:59.9999999\")", TYPE_BIGINT,
+      253370851200000000);
+
+  TestStringValue("cast(unix_micros_to_utc_timestamp(-17987443200000000) as string)",
+      "1400-01-01 00:00:00");
+  TestIsNull("unix_micros_to_utc_timestamp(-17987443200000001)", TYPE_TIMESTAMP);
+  TestStringValue("cast(unix_micros_to_utc_timestamp(253402300799999999) as string)",
+      "9999-12-31 23:59:59.999999000");
+  TestIsNull("unix_micros_to_utc_timestamp(253402300800000000)", TYPE_TIMESTAMP);
 }
 
 TEST_F(ExprTest, ConditionalFunctions) {
@@ -5591,12 +6768,30 @@ TEST_F(ExprTest, ConditionalFunctions) {
   TestValue("if(FALSE, cast(5.5 as double), cast(8.8 as double))", TYPE_DOUBLE, 8.8);
   TestStringValue("if(TRUE, 'abc', 'defgh')", "abc");
   TestStringValue("if(FALSE, 'abc', 'defgh')", "defgh");
-  TimestampValue then_val(1293872461);
-  TimestampValue else_val(929387245);
+  TimestampValue then_val = TimestampValue::FromUnixTime(1293872461);
+  TimestampValue else_val = TimestampValue::FromUnixTime(929387245);
   TestTimestampValue("if(TRUE, cast('2011-01-01 09:01:01' as timestamp), "
       "cast('1999-06-14 19:07:25' as timestamp))", then_val);
   TestTimestampValue("if(FALSE, cast('2011-01-01 09:01:01' as timestamp), "
       "cast('1999-06-14 19:07:25' as timestamp))", else_val);
+
+  // Test nvl2(), which is rewritten to if() before analysis.
+  // Returns 2nd arg if 1st arg is not NULL, otherwise it returns 3rd arg.
+  // Output of nvl2(x,y,z) should be identical to one of if(x is not null,y,z).
+  TestValue("nvl2(now(), FALSE, TRUE)", TYPE_BOOLEAN, false);
+  TestValue("nvl2(NULL, FALSE, TRUE)", TYPE_BOOLEAN, true);
+  TestValue("nvl2(now(), 10, 20)", TYPE_TINYINT, 10);
+  TestValue("nvl2(NULL, 10, 20)", TYPE_TINYINT, 20);
+  TestValue("nvl2(TRUE, cast(5.5 as double), cast(8.8 as double))", TYPE_DOUBLE, 5.5);
+  TestValue("nvl2(NULL, cast(5.5 as double), cast(8.8 as double))", TYPE_DOUBLE, 8.8);
+  TestStringValue("nvl2('some string', 'abc', 'defgh')", "abc");
+  TestStringValue("nvl2(NULL, 'abc', 'defgh')", "defgh");
+  TimestampValue first_val = TimestampValue::FromUnixTime(1293872461);
+  TimestampValue second_val = TimestampValue::FromUnixTime(929387245);
+  TestTimestampValue("nvl2(FALSE, cast('2011-01-01 09:01:01' as timestamp), "
+      "cast('1999-06-14 19:07:25' as timestamp))", first_val);
+  TestTimestampValue("nvl2(NULL, cast('2011-01-01 09:01:01' as timestamp), "
+      "cast('1999-06-14 19:07:25' as timestamp))", second_val);
 
   // Test nullif(). Return NULL if lhs equals rhs, lhs otherwise.
   TestIsNull("nullif(NULL, NULL)", TYPE_BOOLEAN);
@@ -5618,7 +6813,7 @@ TEST_F(ExprTest, ConditionalFunctions) {
   TestStringValue("nullif('abc', NULL)", "abc");
   TestIsNull("nullif(cast('2011-01-01 09:01:01' as timestamp), "
       "cast('2011-01-01 09:01:01' as timestamp))", TYPE_TIMESTAMP);
-  TimestampValue testlhs(1293872461);
+  TimestampValue testlhs = TimestampValue::FromUnixTime(1293872461);
   TestTimestampValue("nullif(cast('2011-01-01 09:01:01' as timestamp), "
       "cast('1999-06-14 19:07:25' as timestamp))", testlhs);
   TestIsNull("nullif(NULL, "
@@ -5681,8 +6876,8 @@ TEST_F(ExprTest, ConditionalFunctions) {
   TestStringValue("coalesce(NULL, 'abc', NULL)", "abc");
   TestStringValue("coalesce('defgh', NULL, 'abc', NULL)", "defgh");
   TestStringValue("coalesce(NULL, NULL, NULL, 'abc', NULL, NULL)", "abc");
-  TimestampValue ats(1293872461);
-  TimestampValue bts(929387245);
+  TimestampValue ats = TimestampValue::FromUnixTime(1293872461);
+  TimestampValue bts = TimestampValue::FromUnixTime(929387245);
   TestTimestampValue("coalesce(cast('2011-01-01 09:01:01' as timestamp))", ats);
   TestTimestampValue("coalesce(NULL, cast('2011-01-01 09:01:01' as timestamp),"
       "NULL)", ats);
@@ -5947,13 +7142,13 @@ TEST_F(ExprTest, ConditionalFunctionIsNotFalse) {
 //   - expected_var_begin: byte offset where variable length types begin
 //   - expected_offsets: mapping of byte sizes to a set valid offsets
 //     exprs that have the same byte size can end up in a number of locations
-void ValidateLayout(const vector<Expr*>& exprs, int expected_byte_size,
+void ValidateLayout(const vector<ScalarExpr*>& exprs, int expected_byte_size,
     int expected_var_begin, const map<int, set<int>>& expected_offsets) {
   vector<int> offsets;
   set<int> offsets_found;
 
   int var_begin;
-  int byte_size = Expr::ComputeResultsLayout(exprs, &offsets, &var_begin);
+  int byte_size = ScalarExpr::ComputeResultsLayout(exprs, &offsets, &var_begin);
 
   EXPECT_EQ(expected_byte_size, byte_size);
   EXPECT_EQ(expected_var_begin, var_begin);
@@ -5978,7 +7173,7 @@ void ValidateLayout(const vector<Expr*>& exprs, int expected_byte_size,
 TEST_F(ExprTest, ResultsLayoutTest) {
   ObjectPool pool;
 
-  vector<Expr*> exprs;
+  vector<ScalarExpr*> exprs;
   map<int, set<int>> expected_offsets;
 
   // Test empty exprs
@@ -6018,9 +7213,9 @@ TEST_F(ExprTest, ResultsLayoutTest) {
     // With one expr, all offsets should be 0.
     expected_offsets[t.GetByteSize()] = set<int>({0});
     if (t.type != TYPE_TIMESTAMP) {
-      exprs.push_back(pool.Add(Literal::CreateLiteral(t, "0")));
+      exprs.push_back(pool.Add(CreateLiteral(t, "0")));
     } else {
-      exprs.push_back(pool.Add(Literal::CreateLiteral(t, "2016-11-09")));
+      exprs.push_back(pool.Add(CreateLiteral(t, "2016-11-09")));
     }
     if (t.IsVarLenStringType()) {
       ValidateLayout(exprs, 16, 0, expected_offsets);
@@ -6036,28 +7231,28 @@ TEST_F(ExprTest, ResultsLayoutTest) {
 
   // Test layout adding a bunch of exprs.  This is designed to trigger padding.
   // The expected result is computed along the way
-  exprs.push_back(pool.Add(Literal::CreateLiteral(TYPE_BOOLEAN, "0")));
-  exprs.push_back(pool.Add(Literal::CreateLiteral(TYPE_TINYINT, "0")));
-  exprs.push_back(pool.Add(Literal::CreateLiteral(ColumnType::CreateCharType(1), "0")));
+  exprs.push_back(pool.Add(CreateLiteral(TYPE_BOOLEAN, "0")));
+  exprs.push_back(pool.Add(CreateLiteral(TYPE_TINYINT, "0")));
+  exprs.push_back(pool.Add(CreateLiteral(ColumnType::CreateCharType(1), "0")));
   expected_offsets[1].insert(expected_byte_size);
   expected_offsets[1].insert(expected_byte_size + 1);
   expected_offsets[1].insert(expected_byte_size + 2);
   expected_byte_size += 3 * 1 + 1;  // 1 byte of padding
 
-  exprs.push_back(pool.Add(Literal::CreateLiteral(TYPE_SMALLINT, "0")));
+  exprs.push_back(pool.Add(CreateLiteral(TYPE_SMALLINT, "0")));
   expected_offsets[2].insert(expected_byte_size);
   expected_byte_size += 2; // No padding before CHAR
 
-  exprs.push_back(pool.Add(Literal::CreateLiteral(ColumnType::CreateCharType(3), "0")));
+  exprs.push_back(pool.Add(CreateLiteral(ColumnType::CreateCharType(3), "0")));
   expected_offsets[3].insert(expected_byte_size);
   expected_byte_size += 3 + 3; // 3 byte of padding
   ASSERT_EQ(expected_byte_size % 4, 0);
 
-  exprs.push_back(pool.Add(Literal::CreateLiteral(TYPE_INT, "0")));
-  exprs.push_back(pool.Add(Literal::CreateLiteral(TYPE_FLOAT, "0")));
-  exprs.push_back(pool.Add(Literal::CreateLiteral(TYPE_FLOAT, "0")));
+  exprs.push_back(pool.Add(CreateLiteral(TYPE_INT, "0")));
+  exprs.push_back(pool.Add(CreateLiteral(TYPE_FLOAT, "0")));
+  exprs.push_back(pool.Add(CreateLiteral(TYPE_FLOAT, "0")));
   exprs.push_back(pool.Add(
-      Literal::CreateLiteral(ColumnType::CreateDecimalType(9, 0), "0")));
+      CreateLiteral(ColumnType::CreateDecimalType(9, 0), "0")));
   expected_offsets[4].insert(expected_byte_size);
   expected_offsets[4].insert(expected_byte_size + 4);
   expected_offsets[4].insert(expected_byte_size + 8);
@@ -6065,12 +7260,12 @@ TEST_F(ExprTest, ResultsLayoutTest) {
   expected_byte_size += 4 * 4 + 4;  // 4 bytes of padding
   ASSERT_EQ(expected_byte_size % 8, 0);
 
-  exprs.push_back(pool.Add(Literal::CreateLiteral(TYPE_BIGINT, "0")));
-  exprs.push_back(pool.Add(Literal::CreateLiteral(TYPE_BIGINT, "0")));
-  exprs.push_back(pool.Add(Literal::CreateLiteral(TYPE_BIGINT, "0")));
-  exprs.push_back(pool.Add(Literal::CreateLiteral(TYPE_DOUBLE, "0")));
+  exprs.push_back(pool.Add(CreateLiteral(TYPE_BIGINT, "0")));
+  exprs.push_back(pool.Add(CreateLiteral(TYPE_BIGINT, "0")));
+  exprs.push_back(pool.Add(CreateLiteral(TYPE_BIGINT, "0")));
+  exprs.push_back(pool.Add(CreateLiteral(TYPE_DOUBLE, "0")));
   exprs.push_back(pool.Add(
-      Literal::CreateLiteral(ColumnType::CreateDecimalType(18, 0), "0")));
+      CreateLiteral(ColumnType::CreateDecimalType(18, 0), "0")));
   expected_offsets[8].insert(expected_byte_size);
   expected_offsets[8].insert(expected_byte_size + 8);
   expected_offsets[8].insert(expected_byte_size + 16);
@@ -6079,20 +7274,20 @@ TEST_F(ExprTest, ResultsLayoutTest) {
   expected_byte_size += 5 * 8;      // No more padding
   ASSERT_EQ(expected_byte_size % 8, 0);
 
-  exprs.push_back(pool.Add(Literal::CreateLiteral(TYPE_TIMESTAMP, "2016-11-09")));
-  exprs.push_back(pool.Add(Literal::CreateLiteral(TYPE_TIMESTAMP, "2016-11-09")));
+  exprs.push_back(pool.Add(CreateLiteral(TYPE_TIMESTAMP, "2016-11-09")));
+  exprs.push_back(pool.Add(CreateLiteral(TYPE_TIMESTAMP, "2016-11-09")));
   exprs.push_back(pool.Add(
-      Literal::CreateLiteral(ColumnType::CreateDecimalType(20, 0), "0")));
+      CreateLiteral(ColumnType::CreateDecimalType(20, 0), "0")));
   expected_offsets[16].insert(expected_byte_size);
   expected_offsets[16].insert(expected_byte_size + 16);
   expected_offsets[16].insert(expected_byte_size + 32);
   expected_byte_size += 3 * 16;
   ASSERT_EQ(expected_byte_size % 8, 0);
 
-  exprs.push_back(pool.Add(Literal::CreateLiteral(TYPE_STRING, "0")));
-  exprs.push_back(pool.Add(Literal::CreateLiteral(TYPE_STRING, "0")));
+  exprs.push_back(pool.Add(CreateLiteral(TYPE_STRING, "0")));
+  exprs.push_back(pool.Add(CreateLiteral(TYPE_STRING, "0")));
   exprs.push_back(pool.Add(
-      Literal::CreateLiteral(ColumnType::CreateVarcharType(1), "0")));
+      CreateLiteral(ColumnType::CreateVarcharType(1), "0")));
   expected_offsets[0].insert(expected_byte_size);
   expected_offsets[0].insert(expected_byte_size + 16);
   expected_offsets[0].insert(expected_byte_size + 32);
@@ -7067,13 +8262,127 @@ TEST_F(ExprTest, UuidTest) {
   EXPECT_TRUE(string_set.size() == NUM_UUIDS);
 }
 
+TEST_F(ExprTest, DateTruncTest) {
+  TestTimestampValue("date_trunc('MILLENNIUM', '2016-05-08 10:30:00')",
+      TimestampValue::Parse("2000-01-01 00:00:00"));
+  TestTimestampValue("date_trunc('MILLENNIUM', '2000-01-01 00:00:00')",
+      TimestampValue::Parse("2000-01-01 00:00:00"));
+  TestTimestampValue("date_trunc('CENTURY', '2016-05-08 10:30:00')",
+      TimestampValue::Parse("2000-01-01 00:00:00  "));
+  TestTimestampValue("date_trunc('CENTURY', '2116-05-08 10:30:00')",
+      TimestampValue::Parse("2100-01-01 00:00:00"));
+  TestTimestampValue("date_trunc('DECADE', '2116-05-08 10:30:00')",
+      TimestampValue::Parse("2110-01-01 00:00:00"));
+  TestTimestampValue("date_trunc('YEAR', '2016-05-08 10:30:00')",
+      TimestampValue::Parse("2016-01-01 00:00:00"));
+  TestTimestampValue("date_trunc('MONTH', '2016-05-08 00:00:00')",
+      TimestampValue::Parse("2016-05-01 00:00:00"));
+  TestTimestampValue("date_trunc('WEEK', '2116-05-08 10:30:00')",
+      TimestampValue::Parse("2116-05-04 00:00:00"));
+  TestTimestampValue("date_trunc('WEEK', '2017-01-01 10:37:03.455722111')",
+      TimestampValue::Parse("2016-12-26 00:00:00"));
+  TestTimestampValue("date_trunc('WEEK', '2017-01-02 10:37:03.455722111')",
+      TimestampValue::Parse("2017-01-02 00:00:00"));
+  TestTimestampValue("date_trunc('WEEK', '2017-01-07 10:37:03.455722111')",
+      TimestampValue::Parse("2017-01-02 00:00:00"));
+  TestTimestampValue("date_trunc('WEEK', '2017-01-08 10:37:03.455722111')",
+      TimestampValue::Parse("2017-01-02 00:00:00"));
+  TestTimestampValue("date_trunc('WEEK', '2017-01-09 10:37:03.455722111')",
+      TimestampValue::Parse("2017-01-09 00:00:00"));
+  TestTimestampValue("date_trunc('DAY', '1416-05-08 10:37:03.455722111')",
+      TimestampValue::Parse("1416-05-08 00:00:00"));
+
+  TestTimestampValue("date_trunc('HOUR', '1416-05-08 10:30:03.455722111')",
+      TimestampValue::Parse("1416-05-08 10:00:00"));
+  TestTimestampValue("date_trunc('HOUR', '1416-05-08 23:30:03.455722111')",
+      TimestampValue::Parse("1416-05-08 23:00:00"));
+  TestTimestampValue("date_trunc('MINUTE', '1416-05-08 10:37:03.455722111')",
+      TimestampValue::Parse("1416-05-08 10:37:00"));
+  TestTimestampValue("date_trunc('SECOND', '1416-05-08 10:37:03.455722111')",
+      TimestampValue::Parse("1416-05-08 10:37:03"));
+  TestTimestampValue("date_trunc('MILLISECONDS', '1416-05-08 10:37:03.455722111')",
+      TimestampValue::Parse("1416-05-08 10:37:03.455000000"));
+  TestTimestampValue("date_trunc('MICROSECONDS', '1416-05-08 10:37:03.455722111')",
+      TimestampValue::Parse("1416-05-08 10:37:03.455722000"));
+
+  // Test corner cases.
+  TestTimestampValue("date_trunc('MILLENNIUM', '9999-12-31 23:59:59.999999999')",
+      TimestampValue::Parse("9000-01-01 00:00:00"));
+  TestTimestampValue("date_trunc('CENTURY', '9999-12-31 23:59:59.999999999')",
+      TimestampValue::Parse("9900-01-01 00:00:00"));
+  TestTimestampValue("date_trunc('DECADE', '9999-12-31 23:59:59.999999999')",
+      TimestampValue::Parse("9990-01-01 00:00:00"));
+  TestTimestampValue("date_trunc('YEAR', '9999-12-31 23:59:59.999999999')",
+      TimestampValue::Parse("9999-01-01 00:00:00"));
+  TestTimestampValue("date_trunc('MONTH', '9999-12-31 23:59:59.999999999')",
+      TimestampValue::Parse("9999-12-01 00:00:00"));
+  TestTimestampValue("date_trunc('WEEK', '9999-12-31 23:59:59.999999999')",
+      TimestampValue::Parse("9999-12-27 00:00:00"));
+  TestTimestampValue("date_trunc('WEEK', '1400-01-06 23:59:59.999999999')",
+      TimestampValue::Parse("1400-01-06 00:00:00"));
+  TestTimestampValue("date_trunc('WEEK', '1400-01-07 23:59:59.999999999')",
+      TimestampValue::Parse("1400-01-06 00:00:00"));
+  TestTimestampValue("date_trunc('DAY', '9999-12-31 23:59:59.999999999')",
+      TimestampValue::Parse("9999-12-31 00:00:00"));
+  TestTimestampValue("date_trunc('HOUR', '9999-12-31 23:59:59.999999999')",
+      TimestampValue::Parse("9999-12-31 23:00:00"));
+  TestTimestampValue("date_trunc('MINUTE', '9999-12-31 23:59:59.999999999')",
+      TimestampValue::Parse("9999-12-31 23:59:00"));
+  TestTimestampValue("date_trunc('SECOND', '9999-12-31 23:59:59.999999999')",
+      TimestampValue::Parse("9999-12-31 23:59:59"));
+  TestTimestampValue("date_trunc('MILLISECONDS', '9999-12-31 23:59:59.999999999')",
+      TimestampValue::Parse("9999-12-31 23:59:59.999"));
+  TestTimestampValue("date_trunc('MICROSECONDS', '9999-12-31 23:59:59.999999999')",
+      TimestampValue::Parse("9999-12-31 23:59:59.999999"));
+
+  TestTimestampValue("date_trunc('CENTURY', '1400-01-01 00:00:00')",
+      TimestampValue::Parse("1400-01-01 00:00:00"));
+  TestTimestampValue("date_trunc('DECADE', '1400-01-01 00:00:00')",
+      TimestampValue::Parse("1400-01-01 00:00:00"));
+  TestTimestampValue("date_trunc('YEAR', '1400-01-01 00:00:00')",
+      TimestampValue::Parse("1400-01-01 00:00:00"));
+  TestTimestampValue("date_trunc('MONTH', '1400-01-01 00:00:00')",
+      TimestampValue::Parse("1400-01-01 00:00:00"));
+  TestTimestampValue("date_trunc('DAY', '1400-01-01 00:00:00')",
+      TimestampValue::Parse("1400-01-01 00:00:00"));
+  TestTimestampValue("date_trunc('HOUR', '1400-01-01 00:00:00')",
+      TimestampValue::Parse("1400-01-01 00:00:00"));
+  TestTimestampValue("date_trunc('MINUTE', '1400-01-01 00:00:00')",
+      TimestampValue::Parse("1400-01-01 00:00:00"));
+  TestTimestampValue("date_trunc('SECOND', '1400-01-01 00:00:00')",
+      TimestampValue::Parse("1400-01-01 00:00:00"));
+  TestTimestampValue("date_trunc('MILLISECONDS', '1400-01-01 00:00:00')",
+      TimestampValue::Parse("1400-01-01 00:00:00"));
+  TestTimestampValue("date_trunc('MICROSECONDS', '1400-01-01 00:00:00')",
+      TimestampValue::Parse("1400-01-01 00:00:00"));
+
+  // valid input with invalid output
+  TestIsNull("date_trunc('MILLENNIUM', '1416-05-08 10:30:00')", TYPE_TIMESTAMP);
+  TestIsNull("date_trunc('MILLENNIUM', '1999-12-31 11:59:59.999999')", TYPE_TIMESTAMP);
+  TestIsNull("date_trunc('WEEK', '1400-01-01 00:00:00')", TYPE_TIMESTAMP);
+  TestIsNull("date_trunc('WEEK', '1400-01-05 00:00:00')", TYPE_TIMESTAMP);
+
+  // Test invalid input.
+  TestIsNull("date_trunc('HOUR', '12202010')", TYPE_TIMESTAMP);
+  TestIsNull("date_trunc('HOUR', '')", TYPE_TIMESTAMP);
+  TestIsNull("date_trunc('HOUR', NULL)", TYPE_TIMESTAMP);
+  TestIsNull("date_trunc('HOUR', '02-13-2014')", TYPE_TIMESTAMP);
+  TestIsNull("date_trunc('CENTURY', '16-05-08 10:30:00')", TYPE_TIMESTAMP);
+  TestIsNull("date_trunc('CENTURY', '1116-05-08 10:30:00')", TYPE_TIMESTAMP);
+  TestIsNull("date_trunc('DAY', '00:00:00')", TYPE_TIMESTAMP);
+  TestError("date_trunc('YsEAR', '2016-05-08 10:30:00')");
+  TestError("date_trunc('D', '2116-05-08 10:30:00')");
+  TestError("date_trunc('2017-01-09', '2017-01-09 10:37:03.455722111' )");
+  TestError("date_trunc('2017-01-09 10:00:00', 'HOUR')");
+}
 } // namespace impala
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   InitCommonRuntime(argc, argv, true, TestInfo::BE_TEST);
+  ABORT_IF_ERROR(TimezoneDatabase::Initialize());
   InitFeSupport(false);
-  impala::LlvmCodeGen::InitializeLlvm();
+  ABORT_IF_ERROR(impala::LlvmCodeGen::InitializeLlvm());
 
   // Disable llvm optimization passes if the env var is no set to true. Running without
   // the optimizations makes the tests run much faster.
@@ -7091,7 +8400,9 @@ int main(int argc, char **argv) {
   FLAGS_abort_on_config_error = false;
   VLOG_CONNECTION << "creating test env";
   VLOG_CONNECTION << "starting backends";
-  InProcessImpalaServer* impala_server = InProcessImpalaServer::StartWithEphemeralPorts();
+  InProcessStatestore* ips = InProcessStatestore::StartWithEphemeralPorts();
+  InProcessImpalaServer* impala_server =
+      InProcessImpalaServer::StartWithEphemeralPorts(FLAGS_hostname, ips->port());
   executor_ = new ImpaladQueryExecutor(impala_server->hostname(),
       impala_server->beeswax_port());
   ABORT_IF_ERROR(executor_->Setup());
@@ -7114,6 +8425,7 @@ int main(int argc, char **argv) {
   executor_->PushExecOption("ENABLE_EXPR_REWRITES=0");
   executor_->PushExecOption("DISABLE_CODEGEN=0");
   executor_->PushExecOption("EXEC_SINGLE_NODE_ROWS_THRESHOLD=0");
+  executor_->PushExecOption("DISABLE_CODEGEN_ROWS_THRESHOLD=0");
   cout << endl << "Running with codegen" << endl;
   ret = RUN_ALL_TESTS();
   if (ret != 0) return ret;

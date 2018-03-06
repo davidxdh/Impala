@@ -18,10 +18,10 @@
 package org.apache.impala.catalog;
 
 import java.util.ArrayList;
-import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 
 import org.apache.hadoop.hive.common.StatsSetupConst;
@@ -31,7 +31,9 @@ import org.apache.hadoop.hive.metastore.api.ColumnStatisticsObj;
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
 import org.apache.impala.analysis.TableName;
 import org.apache.impala.common.ImpalaRuntimeException;
+import org.apache.impala.common.Metrics;
 import org.apache.impala.common.Pair;
+import org.apache.impala.common.RuntimeEnv;
 import org.apache.impala.thrift.TAccessLevel;
 import org.apache.impala.thrift.TCatalogObject;
 import org.apache.impala.thrift.TCatalogObjectType;
@@ -56,12 +58,9 @@ import com.google.common.collect.Maps;
  * is more general than Hive's CLUSTER BY ... INTO BUCKETS clause (which partitions
  * a key range into a fixed number of buckets).
  */
-public abstract class Table implements CatalogObject {
+public abstract class Table extends CatalogObjectImpl {
   private static final Logger LOG = Logger.getLogger(Table.class);
-
-  private long catalogVersion_ = Catalog.INITIAL_CATALOG_VERSION;
   protected org.apache.hadoop.hive.metastore.api.Table msTable_;
-
   protected final Db db_;
   protected final String name_;
   protected final String owner_;
@@ -72,8 +71,21 @@ public abstract class Table implements CatalogObject {
   // Number of clustering columns.
   protected int numClusteringCols_;
 
-  // estimated number of rows in table; -1: unknown.
-  protected long numRows_ = -1;
+  // Contains the estimated number of rows and optional file bytes. Non-null. Member
+  // values of -1 indicate an unknown statistic.
+  protected TTableStats tableStats_;
+
+  // Estimated size (in bytes) of this table metadata. Stored in an AtomicLong to allow
+  // this field to be accessed without holding the table lock.
+  protected AtomicLong estimatedMetadataSize_ = new AtomicLong(0);
+
+  // Number of metadata operations performed on that table since it was loaded.
+  // Stored in an AtomicLong to allow this field to be accessed without holding the
+  // table lock.
+  protected AtomicLong metadataOpsCount_ = new AtomicLong(0);
+
+  // Metrics for this table
+  protected final Metrics metrics_ = new Metrics();
 
   // colsByPos[i] refers to the ith column in the table. The first numClusteringCols are
   // the clustering columns.
@@ -88,6 +100,15 @@ public abstract class Table implements CatalogObject {
   // The lastDdlTime for this table; -1 if not set
   protected long lastDdlTime_;
 
+  // True if this object is stored in an Impalad catalog cache.
+  protected boolean storedInImpaladCatalogCache_ = false;
+
+  // Table metrics. These metrics are applicable to all table types. Each subclass of
+  // Table can define additional metrics specific to that table type.
+  public static final String REFRESH_DURATION_METRIC = "refresh-duration";
+  public static final String ALTER_DURATION_METRIC = "alter-duration";
+  public static final String LOAD_DURATION_METRIC = "load-duration";
+
   protected Table(org.apache.hadoop.hive.metastore.api.Table msTable, Db db,
       String name, String owner) {
     msTable_ = msTable;
@@ -96,12 +117,45 @@ public abstract class Table implements CatalogObject {
     owner_ = owner;
     lastDdlTime_ = (msTable_ != null) ?
         CatalogServiceCatalog.getLastDdlTime(msTable_) : -1;
+    tableStats_ = new TTableStats(-1);
+    tableStats_.setTotal_file_bytes(-1);
+    initMetrics();
   }
 
   public ReentrantLock getLock() { return tableLock_; }
   public abstract TTableDescriptor toThriftDescriptor(
       int tableId, Set<Long> referencedPartitions);
   public abstract TCatalogObjectType getCatalogObjectType();
+  public long getMetadataOpsCount() { return metadataOpsCount_.get(); }
+  public long getEstimatedMetadataSize() { return estimatedMetadataSize_.get(); }
+  public void setEstimatedMetadataSize(long estimatedMetadataSize) {
+    estimatedMetadataSize_.set(estimatedMetadataSize);
+    if (!isStoredInImpaladCatalogCache()) {
+      CatalogUsageMonitor.INSTANCE.updateLargestTables(this);
+    }
+  }
+
+  public void incrementMetadataOpsCount() {
+    metadataOpsCount_.incrementAndGet();
+    if (!isStoredInImpaladCatalogCache()) {
+      CatalogUsageMonitor.INSTANCE.updateFrequentlyAccessedTables(this);
+    }
+  }
+
+  public void initMetrics() {
+    metrics_.addTimer(REFRESH_DURATION_METRIC);
+    metrics_.addTimer(ALTER_DURATION_METRIC);
+    metrics_.addTimer(LOAD_DURATION_METRIC);
+  }
+
+  public Metrics getMetrics() { return metrics_; }
+
+  // Returns true if this table reference comes from the impalad catalog cache or if it
+  // is loaded from the testing framework. Returns false if this table reference points
+  // to a table stored in the catalog server.
+  public boolean isStoredInImpaladCatalogCache() {
+    return storedInImpaladCatalogCache_ || RuntimeEnv.INSTANCE.isTestEnv();
+  }
 
   /**
    * Populate members of 'this' from metastore info. If 'reuseMetadata' is true, reuse
@@ -109,6 +163,14 @@ public abstract class Table implements CatalogObject {
    */
   public abstract void load(boolean reuseMetadata, IMetaStoreClient client,
       org.apache.hadoop.hive.metastore.api.Table msTbl) throws TableLoadingException;
+
+  /**
+   * Sets 'tableStats_' by extracting the table statistics from the given HMS table.
+   */
+  public void setTableStats(org.apache.hadoop.hive.metastore.api.Table msTbl) {
+    tableStats_ = new TTableStats(getRowCount(msTbl.getParameters()));
+    tableStats_.setTotal_file_bytes(getTotalSize(msTbl.getParameters()));
+  }
 
   public void addColumn(Column col) {
     colsByPos_.add(col);
@@ -188,11 +250,19 @@ public abstract class Table implements CatalogObject {
    * Returns the value of the ROW_COUNT constant, or -1 if not found.
    */
   protected static long getRowCount(Map<String, String> parameters) {
+    return getLongParam(StatsSetupConst.ROW_COUNT, parameters);
+  }
+
+  protected static long getTotalSize(Map<String, String> parameters) {
+    return getLongParam(StatsSetupConst.TOTAL_SIZE, parameters);
+  }
+
+  private static long getLongParam(String key, Map<String, String> parameters) {
     if (parameters == null) return -1;
-    String numRowsStr = parameters.get(StatsSetupConst.ROW_COUNT);
-    if (numRowsStr == null) return -1;
+    String value = parameters.get(key);
+    if (value == null) return -1;
     try {
-      return Long.valueOf(numRowsStr);
+      return Long.valueOf(value);
     } catch (NumberFormatException exc) {
       // ignore
     }
@@ -268,14 +338,13 @@ public abstract class Table implements CatalogObject {
     }
 
     numClusteringCols_ = thriftTable.getClustering_columns().size();
-
-    // Estimated number of rows
-    numRows_ = thriftTable.isSetTable_stats() ?
-        thriftTable.getTable_stats().getNum_rows() : -1;
+    if (thriftTable.isSetTable_stats()) tableStats_ = thriftTable.getTable_stats();
 
     // Default to READ_WRITE access if the field is not set.
     accessLevel_ = thriftTable.isSetAccess_level() ? thriftTable.getAccess_level() :
         TAccessLevel.READ_WRITE;
+
+    storedInImpaladCatalogCache_ = true;
   }
 
   /**
@@ -324,18 +393,23 @@ public abstract class Table implements CatalogObject {
     }
 
     table.setMetastore_table(getMetaStoreTable());
-    if (numRows_ != -1) {
-      table.setTable_stats(new TTableStats());
-      table.getTable_stats().setNum_rows(numRows_);
-    }
+    table.setTable_stats(tableStats_);
     return table;
   }
 
   public TCatalogObject toTCatalogObject() {
-    TCatalogObject catalogObject = new TCatalogObject();
-    catalogObject.setType(getCatalogObjectType());
-    catalogObject.setCatalog_version(getCatalogVersion());
+    TCatalogObject catalogObject =
+        new TCatalogObject(getCatalogObjectType(), getCatalogVersion());
     catalogObject.setTable(toThrift());
+    return catalogObject;
+  }
+
+  public TCatalogObject toMinimalTCatalogObject() {
+    TCatalogObject catalogObject =
+        new TCatalogObject(getCatalogObjectType(), getCatalogVersion());
+    catalogObject.setTable(new TTable());
+    catalogObject.getTable().setDb_name(getDb().getName());
+    catalogObject.getTable().setTbl_name(getName());
     return catalogObject;
   }
 
@@ -370,19 +444,15 @@ public abstract class Table implements CatalogObject {
   public TableName getTableName() {
     return new TableName(db_ != null ? db_.getName() : null, name_);
   }
+  @Override
+  public String getUniqueName() { return "TABLE:" + getFullName(); }
 
   public ArrayList<Column> getColumns() { return colsByPos_; }
 
   /**
    * Returns a list of the column names ordered by position.
    */
-  public List<String> getColumnNames() {
-    List<String> colNames = Lists.<String>newArrayList();
-    for (Column col: colsByPos_) {
-      colNames.add(col.getName());
-    }
-    return colNames;
-  }
+  public List<String> getColumnNames() { return Column.toColumnNames(colsByPos_); }
 
   /**
    * Returns a list of thrift column descriptors ordered by position.
@@ -438,7 +508,7 @@ public abstract class Table implements CatalogObject {
   }
 
   /**
-   * Case-insensitive lookup.
+   * Case-insensitive lookup. Returns null if the column with 'name' is not found.
    */
   public Column getColumn(String name) { return colsByName_.get(name.toLowerCase()); }
 
@@ -455,19 +525,20 @@ public abstract class Table implements CatalogObject {
   }
 
   public int getNumClusteringCols() { return numClusteringCols_; }
-  public long getNumRows() { return numRows_; }
-  public ArrayType getType() { return type_; }
 
-  @Override
-  public long getCatalogVersion() { return catalogVersion_; }
-
-  @Override
-  public void setCatalogVersion(long catalogVersion) {
-    catalogVersion_ = catalogVersion;
+  /**
+   * Sets the number of clustering columns. This method should only be used for tests and
+   * the caller must make sure that the value matches any columns that were added to the
+   * table.
+   */
+  public void setNumClusteringCols(int n) {
+    Preconditions.checkState(RuntimeEnv.INSTANCE.isTestEnv());
+    numClusteringCols_ = n;
   }
 
-  @Override
-  public boolean isLoaded() { return true; }
+  public long getNumRows() { return tableStats_.num_rows; }
+  public TTableStats getTTableStats() { return tableStats_; }
+  public ArrayType getType() { return type_; }
 
   public static boolean isExternalTable(
       org.apache.hadoop.hive.metastore.api.Table msTbl) {
@@ -499,5 +570,20 @@ public abstract class Table implements CatalogObject {
       }
     }
     return new Pair<String, Short>(cachePoolName, cacheReplication);
+  }
+
+  /**
+   * The implementations of hashCode() and equals() functions are using table names as
+   * unique identifiers of tables. Hence, they should be used with caution and not in
+   * cases where truly unique table objects are needed.
+   */
+  @Override
+  public int hashCode() { return getFullName().hashCode(); }
+
+  @Override
+  public boolean equals(Object obj) {
+    if (obj == null) return false;
+    if (!(obj instanceof Table)) return false;
+    return getFullName().equals(((Table) obj).getFullName());
   }
 }

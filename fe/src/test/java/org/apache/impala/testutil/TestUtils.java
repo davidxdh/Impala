@@ -22,8 +22,10 @@ import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Calendar;
 import java.util.Collections;
+import java.util.Date;
 import java.util.Map;
 import java.util.Scanner;
+import java.util.TimeZone;
 
 import javax.json.Json;
 import javax.json.JsonObject;
@@ -91,7 +93,7 @@ public class TestUtils {
   static class FileSizeFilter implements ResultFilter {
     private final static String BYTE_FILTER = "[KMGT]?B";
     private final static String NUMBER_FILTER = "\\d+(\\.\\d+)?";
-    private final static String FILTER_KEY = "size=";
+    private final static String FILTER_KEY = " size=";
 
     public boolean matches(String input) { return input.contains(FILTER_KEY); }
 
@@ -258,7 +260,10 @@ public class TestUtils {
     queryCtx.setSession(new TSessionState(new TUniqueId(), TSessionType.BEESWAX,
         defaultDb, user, new TNetworkAddress("localhost", 0)));
     SimpleDateFormat formatter = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSSSSSSSS");
-    queryCtx.setNow_string(formatter.format(Calendar.getInstance().getTime()));
+    Date now = Calendar.getInstance().getTime();
+    queryCtx.setNow_string(formatter.format(now));
+    formatter.setTimeZone(TimeZone.getTimeZone("GMT"));
+    queryCtx.setUtc_timestamp_string(formatter.format(now));
     queryCtx.setStart_unix_millis(System.currentTimeMillis());
     queryCtx.setPid(1000);
     // Disable rewrites by default because some analyzer tests have non-executable

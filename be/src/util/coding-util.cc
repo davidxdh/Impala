@@ -67,7 +67,7 @@ void UrlEncode(const vector<uint8_t>& in, string* out, bool hive_compat) {
   if (in.empty()) {
     *out = "";
   } else {
-    UrlEncode(reinterpret_cast<const char*>(&in[0]), in.size(), out, hive_compat);
+    UrlEncode(reinterpret_cast<const char*>(in.data()), in.size(), out, hive_compat);
   }
 }
 
@@ -160,7 +160,7 @@ void Base64Encode(const vector<uint8_t>& in, string* out) {
 void Base64Encode(const vector<uint8_t>& in, stringstream* out) {
   if (!in.empty()) {
     // Boost does not like non-null terminated strings
-    string tmp(reinterpret_cast<const char*>(&in[0]), in.size());
+    string tmp(reinterpret_cast<const char*>(in.data()), in.size());
     Base64Encode(tmp.c_str(), tmp.size(), out);
   }
 }
@@ -195,9 +195,11 @@ bool Base64DecodeBufLen(const char* in, int64_t in_len, int64_t* out_max) {
 
 bool Base64Decode(const char* in, int64_t in_len, int64_t out_max, char* out,
     int64_t* out_len) {
+  uint32_t out_len_u32 = 0;
   if (UNLIKELY((in_len & 3) != 0)) return false;
   const int decode_result = sasl_decode64(in, static_cast<unsigned>(in_len), out,
-      static_cast<unsigned>(out_max), reinterpret_cast<unsigned*>(out_len));
+      static_cast<unsigned>(out_max), &out_len_u32);
+  *out_len = out_len_u32;
   if (UNLIKELY(decode_result != SASL_OK || *out_len != out_max - 1)) return false;
   return true;
 }

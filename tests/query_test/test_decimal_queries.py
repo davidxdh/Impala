@@ -34,14 +34,16 @@ class TestDecimalQueries(ImpalaTestSuite):
     cls.ImpalaTestMatrix.add_dimension(
       create_exec_option_dimension_from_dict({
         'decimal_v2' : ['false', 'true'],
-        'batch_size' : [0, 1]}))
+        'batch_size' : [0, 1],
+        'disable_codegen' : ['false', 'true'],
+        'disable_codegen_rows_threshold' : [0]}))
     # Hive < 0.11 does not support decimal so we can't run these tests against the other
     # file formats.
     # TODO: Enable them on Hive >= 0.11.
     cls.ImpalaTestMatrix.add_constraint(lambda v:\
         (v.get_value('table_format').file_format == 'text' and
          v.get_value('table_format').compression_codec == 'none') or
-         v.get_value('table_format').file_format == 'parquet')
+         v.get_value('table_format').file_format in ['parquet', 'kudu'])
 
   def test_queries(self, vector):
     self.run_test_case('QueryTest/decimal', vector)
@@ -58,7 +60,7 @@ class TestDecimalExprs(ImpalaTestSuite):
   def add_test_dimensions(cls):
     super(TestDecimalExprs, cls).add_test_dimensions()
     cls.ImpalaTestMatrix.add_constraint(lambda v:
-        (v.get_value('table_format').file_format == 'parquet'))
+        (v.get_value('table_format').file_format in ['parquet', 'kudu']))
 
   def test_exprs(self, vector):
     self.run_test_case('QueryTest/decimal-exprs', vector)

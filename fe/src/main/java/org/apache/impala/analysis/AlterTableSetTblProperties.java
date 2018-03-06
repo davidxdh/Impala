@@ -24,7 +24,11 @@ import java.util.Map;
 import org.apache.avro.SchemaParseException;
 import org.apache.hadoop.hive.metastore.api.hive_metastoreConstants;
 import org.apache.hadoop.hive.serde2.avro.AvroSerdeUtils;
+import org.apache.impala.authorization.PrivilegeRequestBuilder;
+import org.apache.impala.catalog.Column;
+import org.apache.impala.catalog.HBaseTable;
 import org.apache.impala.catalog.HdfsTable;
+import org.apache.impala.catalog.KuduTable;
 import org.apache.impala.catalog.Table;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.thrift.TAlterTableParams;
@@ -36,6 +40,7 @@ import org.apache.impala.util.AvroSchemaUtils;
 import org.apache.impala.util.MetaStoreUtil;
 
 import com.google.common.base.Preconditions;
+import com.google.common.base.Splitter;
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
 
@@ -86,6 +91,8 @@ public class AlterTableSetTblProperties extends AlterTableSetStmt {
           hive_metastoreConstants.META_TABLE_STORAGE));
     }
 
+    if (getTargetTable() instanceof KuduTable) analyzeKuduTable(analyzer);
+
     // Check avro schema when it is set in avro.schema.url or avro.schema.literal to
     // avoid potential metadata corruption (see IMPALA-2042).
     // If both properties are set then only check avro.schema.literal and ignore
@@ -99,6 +106,33 @@ public class AlterTableSetTblProperties extends AlterTableSetStmt {
 
     // Analyze 'skip.header.line.format' property.
     analyzeSkipHeaderLineCount(getTargetTable(), tblProperties_);
+
+    // Analyze 'sort.columns' property.
+    analyzeSortColumns(getTargetTable(), tblProperties_);
+  }
+
+  private void analyzeKuduTable(Analyzer analyzer) throws AnalysisException {
+    // Checking for 'EXTERNAL' is case-insensitive, see IMPALA-5637.
+    String keyForExternalProperty =
+        MetaStoreUtil.findTblPropKeyCaseInsensitive(tblProperties_, "EXTERNAL");
+
+    // Throw error if kudu.table_name is provided for managed Kudu tables
+    // TODO IMPALA-6375: Allow setting kudu.table_name for managed Kudu tables
+    // if the 'EXTERNAL' property is set to TRUE in the same step.
+    if (!Table.isExternalTable(table_.getMetaStoreTable())) {
+      AnalysisUtils.throwIfNotNull(tblProperties_.get(KuduTable.KEY_TABLE_NAME),
+          String.format("Not allowed to set '%s' manually for managed Kudu tables .",
+              KuduTable.KEY_TABLE_NAME));
+    }
+    if (analyzer.getAuthzConfig().isEnabled()) {
+      if (keyForExternalProperty != null ||
+          tblProperties_.containsKey(KuduTable.KEY_MASTER_HOSTS)) {
+        String authzServer = analyzer.getAuthzConfig().getServerName();
+        Preconditions.checkNotNull(authzServer);
+        analyzer.registerPrivReq(new PrivilegeRequestBuilder().onServer(
+            authzServer).all().toRequest());
+      }
+    }
   }
 
   /**
@@ -154,5 +188,37 @@ public class AlterTableSetTblProperties extends AlterTableSetStmt {
       HdfsTable.parseSkipHeaderLineCount(tblProperties, error);
       if (error.length() > 0) throw new AnalysisException(error.toString());
     }
+  }
+
+  /**
+   * Analyzes the 'sort.columns' property in 'tblProperties' against the columns of
+   * 'table'. The property must store a list of column names separated by commas, and each
+   * column in the property must occur in 'table' as a non-partitioning column. If there
+   * are errors during the analysis, this function will throw an AnalysisException.
+   * Returns a list of positions of the sort columns within the table's list of
+   * columns.
+   */
+  public static List<Integer> analyzeSortColumns(Table table,
+      Map<String, String> tblProperties) throws AnalysisException {
+    if (!tblProperties.containsKey(
+        AlterTableSortByStmt.TBL_PROP_SORT_COLUMNS)) {
+      return Lists.newArrayList();
+    }
+
+    // ALTER TABLE SET is not supported on HBase tables at all, see
+    // AlterTableSetStmt::analyze().
+    Preconditions.checkState(!(table instanceof HBaseTable));
+
+    if (table instanceof KuduTable) {
+      throw new AnalysisException(String.format("'%s' table property is not supported " +
+          "for Kudu tables.", AlterTableSortByStmt.TBL_PROP_SORT_COLUMNS));
+    }
+
+    List<String> sortCols = Lists.newArrayList(
+        Splitter.on(",").trimResults().omitEmptyStrings().split(
+        tblProperties.get(AlterTableSortByStmt.TBL_PROP_SORT_COLUMNS)));
+    return TableDef.analyzeSortColumns(sortCols,
+        Column.toColumnNames(table.getNonClusteringColumns()),
+        Column.toColumnNames(table.getClusteringColumns()));
   }
 }

@@ -19,6 +19,7 @@
 #define IMPALA_RUNTIME_TMP_FILE_MGR_H
 
 #include <functional>
+#include <memory>
 #include <utility>
 
 #include <boost/scoped_ptr.hpp>
@@ -27,10 +28,10 @@
 #include "common/object-pool.h"
 #include "common/status.h"
 #include "gen-cpp/Types_types.h" // for TUniqueId
-#include "runtime/disk-io-mgr.h"
-#include "util/mem-range.h"
+#include "runtime/io/request-ranges.h"
 #include "util/collection-metrics.h"
 #include "util/condition-variable.h"
+#include "util/mem-range.h"
 #include "util/openssl-util.h"
 #include "util/runtime-profile.h"
 #include "util/spinlock.h"
@@ -99,7 +100,7 @@ class TmpFileMgr {
     /// space used. 'unique_id' is a unique ID that is used to prefix any scratch file
     /// names. It is an error to create multiple FileGroups with the same 'unique_id'.
     /// 'bytes_limit' is the limit on the total file space to allocate.
-    FileGroup(TmpFileMgr* tmp_file_mgr, DiskIoMgr* io_mgr, RuntimeProfile* profile,
+    FileGroup(TmpFileMgr* tmp_file_mgr, io::DiskIoMgr* io_mgr, RuntimeProfile* profile,
         const TUniqueId& unique_id, int64_t bytes_limit = -1);
 
     ~FileGroup();
@@ -117,21 +118,33 @@ class TmpFileMgr {
     /// a different thread when the write completes successfully or unsuccessfully or is
     /// cancelled.
     ///
-    /// 'handle' must be destroyed by passing the DestroyWriteHandle() or
-    /// CancelWriteAndRestoreData().
+    /// 'handle' must be destroyed by passing the DestroyWriteHandle() or RestoreData().
     Status Write(MemRange buffer, WriteDoneCallback cb,
         std::unique_ptr<WriteHandle>* handle) WARN_UNUSED_RESULT;
 
     /// Synchronously read the data referenced by 'handle' from the temporary file into
     /// 'buffer'. buffer.len() must be the same as handle->len(). Can only be called
-    /// after a write successfully completes.
+    /// after a write successfully completes. Should not be called while an async read
+    /// is in flight. Equivalent to calling ReadAsync() then WaitForAsyncRead().
     Status Read(WriteHandle* handle, MemRange buffer) WARN_UNUSED_RESULT;
 
-    /// Cancels the write referenced by 'handle' and destroy associate resources. Also
-    /// restore the original data in the 'buffer' passed to Write(), decrypting or
-    /// decompressing as necessary. The cancellation always succeeds, but an error
-    /// is returned if restoring the data fails.
-    Status CancelWriteAndRestoreData(
+    /// Asynchronously read the data referenced by 'handle' from the temporary file into
+    /// 'buffer'. buffer.len() must be the same as handle->len(). Can only be called
+    /// after a write successfully completes. WaitForAsyncRead() must be called before the
+    /// data in the buffer is valid. Should not be called while an async read
+    /// is already in flight.
+    Status ReadAsync(WriteHandle* handle, MemRange buffer) WARN_UNUSED_RESULT;
+
+    /// Wait until the read started for 'handle' by ReadAsync() completes. 'buffer'
+    /// should be the same buffer passed into ReadAsync(). Returns an error if the
+    /// read fails. Retrying a failed read by calling ReadAsync() again is allowed.
+    Status WaitForAsyncRead(WriteHandle* handle, MemRange buffer) WARN_UNUSED_RESULT;
+
+    /// Restore the original data in the 'buffer' passed to Write(), decrypting or
+    /// decompressing as necessary. Returns an error if restoring the data fails.
+    /// The write must not be in-flight - the caller is responsible for waiting for
+    /// the write to complete.
+    Status RestoreData(
         std::unique_ptr<WriteHandle> handle, MemRange buffer) WARN_UNUSED_RESULT;
 
     /// Wait for the in-flight I/Os to complete and destroy resources associated with
@@ -185,10 +198,10 @@ class TmpFileMgr {
     TmpFileMgr* const tmp_file_mgr_;
 
     /// DiskIoMgr used for all I/O to temporary files.
-    DiskIoMgr* const io_mgr_;
+    io::DiskIoMgr* const io_mgr_;
 
     /// I/O context used for all reads and writes. Registered in constructor.
-    DiskIoRequestContext* io_ctx_;
+    std::unique_ptr<io::RequestContext> io_ctx_;
 
     /// Stores scan ranges allocated in Read(). Needed because ScanRange objects may be
     /// touched by DiskIoMgr even after the scan is finished.
@@ -216,7 +229,7 @@ class TmpFileMgr {
     /// Amount of scratch space allocated in bytes.
     RuntimeProfile::Counter* const scratch_space_bytes_used_counter_;
 
-    /// Time taken for disk reads.
+    /// Time spent waiting for disk reads.
     RuntimeProfile::Counter* const disk_read_timer_;
 
     /// Time spent in disk spill encryption, decryption, and integrity checking.
@@ -255,19 +268,22 @@ class TmpFileMgr {
   /// handle can be passed to FileGroup::Read() to read back the data zero or more times.
   /// FileGroup::DestroyWriteHandle() can be called at any time to destroy the handle and
   /// allow reuse of the scratch file range written to. Alternatively,
-  /// FileGroup::CancelWriteAndRestoreData() can be called to reverse the effects of
-  /// FileGroup::Write() by destroying the handle and restoring the original data to the
-  /// buffer, so long as the data in the buffer was not modified by the caller.
+  /// FileGroup::RestoreData() can be called to reverse the effects of FileGroup::Write()
+  /// by destroying the handle and restoring the original data to the buffer, so long as
+  /// the data in the buffer was not modified by the caller.
   ///
   /// Public methods of WriteHandle are safe to call concurrently from multiple threads.
   class WriteHandle {
    public:
     /// The write must be destroyed by passing it to FileGroup - destroying it before
-    /// cancelling the write is an error.
+    /// the write completes is an error.
     ~WriteHandle() {
       DCHECK(!write_in_flight_);
-      DCHECK(is_cancelled_);
+      DCHECK(read_range_ == nullptr);
     }
+
+    /// Cancel any in-flight read synchronously.
+    void CancelRead();
 
     /// Path of temporary file backing the block. Intended for use in testing.
     /// Returns empty string if no backing file allocated.
@@ -280,32 +296,36 @@ class TmpFileMgr {
 
    private:
     friend class FileGroup;
+    friend class TmpFileMgrTest;
 
     WriteHandle(RuntimeProfile::Counter* encryption_timer, WriteDoneCallback cb);
 
     /// Starts a write of 'buffer' to 'offset' of 'file'. 'write_in_flight_' must be false
     /// before calling. After returning, 'write_in_flight_' is true on success or false on
     /// failure and 'is_cancelled_' is set to true on failure.
-    Status Write(DiskIoMgr* io_mgr, DiskIoRequestContext* io_ctx, File* file,
+    Status Write(io::DiskIoMgr* io_mgr, io::RequestContext* io_ctx, File* file,
         int64_t offset, MemRange buffer,
-        DiskIoMgr::WriteRange::WriteDoneCallback callback) WARN_UNUSED_RESULT;
+        io::WriteRange::WriteDoneCallback callback) WARN_UNUSED_RESULT;
 
     /// Retry the write after the initial write failed with an error, instead writing to
     /// 'offset' of 'file'. 'write_in_flight_' must be true before calling.
     /// After returning, 'write_in_flight_' is true on success or false on failure.
-    Status RetryWrite(DiskIoMgr* io_mgr, DiskIoRequestContext* io_ctx, File* file,
+    Status RetryWrite(io::DiskIoMgr* io_mgr, io::RequestContext* io_ctx, File* file,
         int64_t offset) WARN_UNUSED_RESULT;
-
-    /// Cancels the write asynchronously. After Cancel() is called, writes are not
-    /// retried.
-    void Cancel();
-
-    /// Blocks until the write completes either successfully or unsuccessfully.
-    void WaitForWrite();
 
     /// Called when the write has completed successfully or not. Sets 'write_in_flight_'
     /// then calls 'cb_'.
     void WriteComplete(const Status& write_status);
+
+    /// Cancels any in-flight writes or reads. Reads are cancelled synchronously and
+    /// writes are cancelled asynchronously. After Cancel() is called, writes are not
+    /// retried. The write callback may be called with a CANCELLED status (unless
+    /// it succeeded or encountered a different error first).
+    void Cancel();
+
+    /// Blocks until the write completes either successfully or unsuccessfully.
+    /// May return before the write callback has been called.
+    void WaitForWrite();
 
     /// Encrypts the data in 'buffer' in-place and computes 'hash_'.
     Status EncryptAndHash(MemRange buffer) WARN_UNUSED_RESULT;
@@ -320,7 +340,7 @@ class TmpFileMgr {
     RuntimeProfile::Counter* encryption_timer_;
 
     /// The DiskIoMgr write range for this write.
-    boost::scoped_ptr<DiskIoMgr::WriteRange> write_range_;
+    boost::scoped_ptr<io::WriteRange> write_range_;
 
     /// The temporary file being written to.
     File* file_;
@@ -332,6 +352,10 @@ class TmpFileMgr {
     /// If --disk_spill_encryption is on, our hash of the data being written. Filled in
     /// on writes; verified on reads. This is calculated _after_ encryption.
     IntegrityHash hash_;
+
+    /// The scan range for the read that is currently in flight. NULL when no read is in
+    /// flight.
+    io::ScanRange* read_range_;
 
     /// Protects all fields below while 'write_in_flight_' is true. At other times, it is
     /// invalid to call WriteRange/FileGroup methods concurrently from multiple threads,

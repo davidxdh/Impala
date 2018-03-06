@@ -17,8 +17,8 @@
 
 #include "exec/plan-root-sink.h"
 
-#include "exprs/expr-context.h"
-#include "exprs/expr.h"
+#include "exprs/scalar-expr.h"
+#include "exprs/scalar-expr-evaluator.h"
 #include "runtime/row-batch.h"
 #include "runtime/tuple-row.h"
 #include "service/query-result-set.h"
@@ -32,26 +32,8 @@ using boost::mutex;
 
 namespace impala {
 
-const string PlanRootSink::NAME = "PLAN_ROOT_SINK";
-
-PlanRootSink::PlanRootSink(const RowDescriptor& row_desc,
-    const std::vector<TExpr>& output_exprs, const TDataSink& thrift_sink)
-  : DataSink(row_desc), thrift_output_exprs_(output_exprs) {}
-
-Status PlanRootSink::Prepare(RuntimeState* state, MemTracker* parent_mem_tracker) {
-  RETURN_IF_ERROR(DataSink::Prepare(state, parent_mem_tracker));
-  RETURN_IF_ERROR(
-      Expr::CreateExprTrees(state->obj_pool(), thrift_output_exprs_, &output_expr_ctxs_));
-  RETURN_IF_ERROR(
-      Expr::Prepare(output_expr_ctxs_, state, row_desc_, expr_mem_tracker_.get()));
-
-  return Status::OK();
-}
-
-Status PlanRootSink::Open(RuntimeState* state) {
-  RETURN_IF_ERROR(Expr::Open(output_expr_ctxs_, state));
-  return Status::OK();
-}
+PlanRootSink::PlanRootSink(const RowDescriptor* row_desc, RuntimeState* state)
+  : DataSink(row_desc, "PLAN_ROOT_SINK", state) {}
 
 namespace {
 
@@ -82,7 +64,7 @@ void ValidateCollectionSlots(const RowDescriptor& row_desc, RowBatch* batch) {
 }
 
 Status PlanRootSink::Send(RuntimeState* state, RowBatch* batch) {
-  ValidateCollectionSlots(row_desc_, batch);
+  ValidateCollectionSlots(*row_desc_, batch);
   int current_batch_row = 0;
 
   // Don't enter the loop if batch->num_rows() == 0; no point triggering the consumer with
@@ -90,7 +72,7 @@ Status PlanRootSink::Send(RuntimeState* state, RowBatch* batch) {
   // written clients may not cope correctly with them. See IMPALA-4335.
   while (current_batch_row < batch->num_rows()) {
     unique_lock<mutex> l(lock_);
-    while (results_ == nullptr && !consumer_done_) sender_cv_.wait(l);
+    while (results_ == nullptr && !consumer_done_) sender_cv_.Wait(l);
     if (consumer_done_ || batch == nullptr) {
       eos_ = true;
       return Status::OK();
@@ -100,7 +82,7 @@ Status PlanRootSink::Send(RuntimeState* state, RowBatch* batch) {
     DCHECK(results_ != nullptr);
     // List of expr values to hold evaluated rows from the query
     vector<void*> result_row;
-    result_row.resize(output_expr_ctxs_.size());
+    result_row.resize(output_exprs_.size());
 
     // List of scales for floating point values in result_row
     vector<int> scales;
@@ -114,10 +96,11 @@ Status PlanRootSink::Send(RuntimeState* state, RowBatch* batch) {
       RETURN_IF_ERROR(results_->AddOneRow(result_row, scales));
       ++current_batch_row;
     }
+    // Prevent expr result allocations from accumulating.
+    expr_results_pool_->Clear();
     // Signal the consumer.
     results_ = nullptr;
-    ExprContext::FreeLocalAllocations(output_expr_ctxs_);
-    consumer_cv_.notify_all();
+    consumer_cv_.NotifyAll();
   }
   return Status::OK();
 }
@@ -126,7 +109,7 @@ Status PlanRootSink::FlushFinal(RuntimeState* state) {
   unique_lock<mutex> l(lock_);
   sender_done_ = true;
   eos_ = true;
-  consumer_cv_.notify_all();
+  consumer_cv_.NotifyAll();
   return Status::OK();
 }
 
@@ -135,18 +118,17 @@ void PlanRootSink::Close(RuntimeState* state) {
   // No guarantee that FlushFinal() has been called, so need to mark sender_done_ here as
   // well.
   sender_done_ = true;
-  consumer_cv_.notify_all();
+  consumer_cv_.NotifyAll();
   // Wait for consumer to be done, in case sender tries to tear-down this sink while the
   // sender is still reading from it.
-  while (!consumer_done_) sender_cv_.wait(l);
-  Expr::Close(output_expr_ctxs_, state);
+  while (!consumer_done_) sender_cv_.Wait(l);
   DataSink::Close(state);
 }
 
 void PlanRootSink::CloseConsumer() {
   unique_lock<mutex> l(lock_);
   consumer_done_ = true;
-  sender_cv_.notify_all();
+  sender_cv_.NotifyAll();
 }
 
 Status PlanRootSink::GetNext(
@@ -155,20 +137,20 @@ Status PlanRootSink::GetNext(
 
   results_ = results;
   num_rows_requested_ = num_results;
-  sender_cv_.notify_all();
+  sender_cv_.NotifyAll();
 
-  while (!eos_ && results_ != nullptr && !sender_done_) consumer_cv_.wait(l);
+  while (!eos_ && results_ != nullptr && !sender_done_) consumer_cv_.Wait(l);
 
   *eos = eos_;
-  return state->CheckQueryState();
+  return state->GetQueryStatus();
 }
 
 void PlanRootSink::GetRowValue(
     TupleRow* row, vector<void*>* result, vector<int>* scales) {
-  DCHECK(result->size() >= output_expr_ctxs_.size());
-  for (int i = 0; i < output_expr_ctxs_.size(); ++i) {
-    (*result)[i] = output_expr_ctxs_[i]->GetValue(row);
-    (*scales)[i] = output_expr_ctxs_[i]->root()->output_scale();
+  DCHECK_GE(result->size(), output_expr_evals_.size());
+  for (int i = 0; i < output_expr_evals_.size(); ++i) {
+    (*result)[i] = output_expr_evals_[i]->GetValue(row);
+    (*scales)[i] = output_expr_evals_[i]->output_scale();
   }
 }
 }

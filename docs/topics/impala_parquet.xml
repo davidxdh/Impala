@@ -85,11 +85,6 @@ under the License.
 
     <p outputclass="toc inpage"/>
 
-    <p audience="integrated">
-      For general information about using Parquet with other CDH components,
-      see <xref href="cdh_ig_parquet.xml#parquet_format"/>.
-    </p>
-
   </conbody>
 
 
@@ -362,6 +357,25 @@ Add an example here.
 
       <p conref="../shared/impala_common.xml#common/s3_block_splitting"/>
 
+      <p rev="IMPALA-3909">
+        In <keyword keyref="impala29"/> and higher, Parquet files written by Impala include
+        embedded metadata specifying the minimum and maximum values for each column, within
+        each row group and each data page within the row group. Impala-written Parquet files
+        typically contain a single row group; a row group can contain many data pages.
+        Impala uses this information (currently, only the metadata for each row group)
+        when reading each Parquet data file during a query, to quickly determine whether each
+        row group within the file potentially includes any rows that match the conditions in the
+        <codeph>WHERE</codeph> clause. For example, if the column <codeph>X</codeph> within
+        a particular Parquet file has a minimum value of 1 and a maximum value of 100, then
+        a query including the clause <codeph>WHERE x &gt; 200</codeph> can quickly determine
+        that it is safe to skip that particular file, instead of scanning all the associated
+        column values. This optimization technique is especially effective for tables that
+        use the <codeph>SORT BY</codeph> clause for the columns most frequently checked in
+        <codeph>WHERE</codeph> clauses, because any <codeph>INSERT</codeph> operation on
+        such tables produces Parquet data files with relatively narrow ranges of column values
+        within each file.
+      </p>
+
     </conbody>
 
     <concept id="parquet_partitioning">
@@ -410,9 +424,8 @@ Add an example here.
 <!-- Old name, now deprecated: <codeph>dfs.datanode.max.xcievers</codeph>. -->
             <codeph>dfs.datanode.max.transfer.threads</codeph>. For example, if you were loading 12 years of data
             partitioned by year, month, and day, even a value of 4096 might not be high enough. This
-            <xref href="http://blog.cloudera.com/blog/2012/03/hbase-hadoop-xceivers/" scope="external" format="html">blog
-            post</xref> explores the considerations for setting this value higher or lower, using HBase examples
-            for illustration.
+            <xref keyref="hbase-hadoop-xceivers">blog post</xref> explores the considerations for setting this value
+            higher or lower, using HBase examples for illustration.
           </li>
 
           <li>
@@ -714,8 +727,8 @@ Returned 1 row(s) in 13.35s
     <conbody>
 
       <p>
-        You can read and write Parquet data files from other CDH components.
-        <ph audience="integrated">See <xref href="cdh_ig_parquet.xml#parquet_format"/> for details.</ph>
+        You can read and write Parquet data files from other <keyword keyref="distro"/> components.
+        See <xref keyref="cdh_ig_parquet"/> for details.
       </p>
 
 <!-- These couple of paragraphs reused in the release notes 'incompatible changes' section. -->
@@ -1105,7 +1118,7 @@ select * from production_table where c1 = 100 and c2 &lt; 50 and ...;
         </li>
       </ul>
 
-      <p rev="2.6.0 IMPALA-2835 CDH-33330">
+      <p rev="2.6.0 IMPALA-2835">
         You might find that you have Parquet files where the columns do not line up in the same
         order as in your Impala table. For example, you might have a Parquet file that was part of
         a table with columns <codeph>C1,C2,C3,C4</codeph>, and now you want to reuse the same
@@ -1157,6 +1170,7 @@ INT96 -&gt; TIMESTAMP
       </p>
 
 <codeblock>BINARY + OriginalType UTF8 -&gt; STRING
+BINARY + OriginalType ENUM -&gt; STRING
 BINARY + OriginalType DECIMAL -&gt; DECIMAL
 </codeblock>
 

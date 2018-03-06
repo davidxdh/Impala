@@ -19,15 +19,14 @@
 #define IMPALA_EXEC_PLAN_ROOT_SINK_H
 
 #include "exec/data-sink.h"
-
-#include <boost/thread/condition_variable.hpp>
+#include "util/condition-variable.h"
 
 namespace impala {
 
 class TupleRow;
 class RowBatch;
 class QueryResultSet;
-class ExprContext;
+class ScalarExprEvaluator;
 
 /// Sink which manages the handoff between a 'sender' (a fragment instance) that produces
 /// batches by calling Send(), and a 'consumer' (e.g. the coordinator) which consumes rows
@@ -57,14 +56,7 @@ class ExprContext;
 /// and consumer. See IMPALA-4268.
 class PlanRootSink : public DataSink {
  public:
-  PlanRootSink(const RowDescriptor& row_desc, const std::vector<TExpr>& output_exprs,
-      const TDataSink& thrift_sink);
-
-  virtual std::string GetName() { return NAME; }
-
-  virtual Status Prepare(RuntimeState* state, MemTracker* tracker);
-
-  virtual Status Open(RuntimeState* state);
+  PlanRootSink(const RowDescriptor* row_desc, RuntimeState* state);
 
   /// Sends a new batch. Ownership of 'batch' remains with the sender. Blocks until the
   /// consumer has consumed 'batch' by calling GetNext().
@@ -100,12 +92,12 @@ class PlanRootSink : public DataSink {
   /// num_rows_requested_, and so the sender may begin satisfying that request for rows
   /// from its current batch. Also signalled when CloseConsumer() is called, to unblock
   /// the sender.
-  boost::condition_variable sender_cv_;
+  ConditionVariable sender_cv_;
 
   /// Waited on by the consumer only. Signalled when the sender has finished serving a
   /// request for rows. Also signalled by Close() and FlushFinal() to signal to the
   /// consumer that no more rows are coming.
-  boost::condition_variable consumer_cv_;
+  ConditionVariable consumer_cv_;
 
   /// Signals to producer that the consumer is done, and the sink may be torn down.
   bool consumer_done_ = false;
@@ -125,12 +117,8 @@ class PlanRootSink : public DataSink {
   /// Set to true in Send() and FlushFinal() when the Sink() has finished producing rows.
   bool eos_ = false;
 
-  /// Output expressions to map plan row batches onto result set rows.
-  std::vector<TExpr> thrift_output_exprs_;
-  std::vector<ExprContext*> output_expr_ctxs_;
-
-  /// Writes a single row into 'result' and 'scales' by evaluating output_expr_ctxs_ over
-  /// 'row'.
+  /// Writes a single row into 'result' and 'scales' by evaluating
+  /// output_expr_evals_ over 'row'.
   void GetRowValue(TupleRow* row, std::vector<void*>* result, std::vector<int>* scales);
 };
 }

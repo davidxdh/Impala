@@ -17,16 +17,10 @@
 
 package org.apache.impala.service;
 
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
-
-import org.apache.thrift.TDeserializer;
-import org.apache.thrift.TException;
-import org.apache.thrift.TSerializer;
-import org.apache.thrift.protocol.TBinaryProtocol;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import org.apache.impala.analysis.BoolLiteral;
 import org.apache.impala.analysis.Expr;
@@ -34,22 +28,32 @@ import org.apache.impala.analysis.NullLiteral;
 import org.apache.impala.analysis.SlotRef;
 import org.apache.impala.analysis.TableName;
 import org.apache.impala.common.InternalException;
+import org.apache.impala.common.Pair;
 import org.apache.impala.thrift.TCacheJarParams;
 import org.apache.impala.thrift.TCacheJarResult;
 import org.apache.impala.thrift.TCatalogObject;
 import org.apache.impala.thrift.TCatalogObjectType;
 import org.apache.impala.thrift.TCatalogServiceRequestHeader;
 import org.apache.impala.thrift.TColumnValue;
+import org.apache.impala.thrift.TErrorCode;
 import org.apache.impala.thrift.TExprBatch;
 import org.apache.impala.thrift.TPrioritizeLoadRequest;
 import org.apache.impala.thrift.TPrioritizeLoadResponse;
 import org.apache.impala.thrift.TQueryCtx;
+import org.apache.impala.thrift.TQueryOptions;
 import org.apache.impala.thrift.TResultRow;
-import org.apache.impala.thrift.TStatus;
 import org.apache.impala.thrift.TSymbolLookupParams;
 import org.apache.impala.thrift.TSymbolLookupResult;
 import org.apache.impala.thrift.TTable;
 import org.apache.impala.util.NativeLibUtil;
+import org.apache.thrift.TDeserializer;
+import org.apache.thrift.TException;
+import org.apache.thrift.TSerializer;
+import org.apache.thrift.protocol.TBinaryProtocol;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 
 /**
@@ -78,11 +82,40 @@ public class FeSupport {
   // Returns a serialized TCacheJarResult
   public native static byte[] NativeCacheJar(byte[] thriftCacheJar);
 
+  // Adds a topic item to the backend's pending metadata-topic update.
+  // 'serializationBuffer' is a serialized TCatalogObject.
+  // The return value is true if the operation succeeds and false otherwise.
+  public native static boolean NativeAddPendingTopicItem(long nativeCatalogServerPtr,
+      String key, byte[] serializationBuffer, boolean deleted);
+
+  // Get a catalog object update from the backend. A pair of isDeletion flag and
+  // serialized TCatalogObject is returned.
+  public native static Pair<Boolean, ByteBuffer> NativeGetNextCatalogObjectUpdate(
+      long nativeIteratorPtr);
+
+  // The return value is true if the operation succeeds and false otherwise.
+  public native static boolean NativeLibCacheSetNeedsRefresh(String hdfsLocation);
+  public native static boolean NativeLibCacheRemoveEntry(String hdfsLibFile);
+
   // Does an RPCs to the Catalog Server to prioritize the metadata loading of a
   // one or more catalog objects. To keep our kerberos configuration consolidated,
   // we make make all RPCs in the BE layer instead of calling the Catalog Server
   // using Java Thrift bindings.
   public native static byte[] NativePrioritizeLoad(byte[] thriftReq);
+
+  // Parses a string of comma-separated key=value query options ('csvQueryOptions'),
+  // updates the existing query options ('queryOptions') with them and returns the
+  // resulting serialized TQueryOptions object.
+  // A note about the function's interface: ideally we wouldn't have to pass in the
+  // existing query options. We could just return the newly set query options to the
+  // caller and let the caller update the existing query options with the new ones.
+  // Unfortunately due to a bug in the thrift-generated TQueryOptions class, in some cases
+  // it is impossible to figure out whether a query option has been set explicitly or left
+  // at its default setting, therefore this approach would not work.
+  public native static byte[] NativeParseQueryOptions(String csvQueryOptions,
+      byte[] queryOptions);
+
+  public native static int MinLogSpaceForBloomFilter(long ndv, double fpp);
 
   /**
    * Locally caches the jar at the specified HDFS location.
@@ -231,9 +264,12 @@ public class FeSupport {
     return NativePrioritizeLoad(thriftReq);
   }
 
-  public static TStatus PrioritizeLoad(Set<TableName> tableNames)
+  public static void PrioritizeLoad(Set<TableName> tableNames)
       throws InternalException {
     Preconditions.checkNotNull(tableNames);
+
+    LOG.info(String.format("Requesting prioritized load of table(s): %s",
+        Joiner.on(", ").join(tableNames)));
 
     List<TCatalogObject> objectDescs = new ArrayList<TCatalogObject>(tableNames.size());
     for (TableName tableName: tableNames) {
@@ -254,11 +290,60 @@ public class FeSupport {
       TDeserializer deserializer = new TDeserializer(new TBinaryProtocol.Factory());
       TPrioritizeLoadResponse response = new TPrioritizeLoadResponse();
       deserializer.deserialize(response, result);
-      return response.getStatus();
+      if (response.getStatus().getStatus_code() != TErrorCode.OK) {
+        throw new InternalException("Error requesting prioritized load: " +
+            Joiner.on("\n").join(response.getStatus().getError_msgs()));
+      }
     } catch (TException e) {
       // this should never happen
       throw new InternalException("Error processing request: " + e.getMessage(), e);
     }
+  }
+
+  private static byte[] ParseQueryOptions(String csvQueryOptions, byte[] queryOptions) {
+    try {
+      return NativeParseQueryOptions(csvQueryOptions, queryOptions);
+    } catch (UnsatisfiedLinkError e) {
+      loadLibrary();
+    }
+    return NativeParseQueryOptions(csvQueryOptions, queryOptions);
+  }
+
+  /**
+   * Parses a string of comma-separated key=value query options. Returns a TQueryOptions
+   * object that contains the updated query options.
+   */
+  public static TQueryOptions ParseQueryOptions(String csvQueryOptions,
+      TQueryOptions queryOptions) throws InternalException {
+    Preconditions.checkNotNull(csvQueryOptions);
+    Preconditions.checkNotNull(queryOptions);
+
+    TSerializer serializer = new TSerializer(new TBinaryProtocol.Factory());
+    try {
+      byte[] result = ParseQueryOptions(csvQueryOptions,
+          serializer.serialize(queryOptions));
+      Preconditions.checkNotNull(result);
+      TDeserializer deserializer = new TDeserializer(new TBinaryProtocol.Factory());
+      TQueryOptions updatedQueryOptions = new TQueryOptions();
+      deserializer.deserialize(updatedQueryOptions, result);
+      return updatedQueryOptions;
+    } catch (TException e) {
+      throw new InternalException("Could not parse query options: " + e.getMessage(), e);
+    }
+  }
+
+  /**
+   * Returns the log (base 2) of the minimum number of bytes we need for a Bloom
+   * filter with 'ndv' unique elements and a false positive probability of less
+   * than 'fpp'.
+   */
+  public static int GetMinLogSpaceForBloomFilter(long ndv, double fpp) {
+    try {
+      return MinLogSpaceForBloomFilter(ndv, fpp);
+    } catch (UnsatisfiedLinkError e) {
+      loadLibrary();
+    }
+    return MinLogSpaceForBloomFilter(ndv, fpp);
   }
 
   /**

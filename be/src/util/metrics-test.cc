@@ -36,7 +36,7 @@ namespace impala {
 template <typename M, typename T>
 void AssertValue(M* metric, const T& value,
     const string& human_readable) {
-  EXPECT_EQ(metric->value(), value);
+  EXPECT_EQ(metric->GetValue(), value);
   if (!human_readable.empty()) {
     EXPECT_EQ(metric->ToHumanReadable(), human_readable);
   }
@@ -73,37 +73,58 @@ class MetricsTest : public testing::Test {
 TEST_F(MetricsTest, CounterMetrics) {
   MetricGroup metrics("CounterMetrics");
   AddMetricDef("counter", TMetricKind::COUNTER, TUnit::UNIT);
-  IntCounter* int_counter = metrics.AddCounter<int64_t>("counter", 0);
+  IntCounter* int_counter = metrics.AddCounter("counter", 0);
   AssertValue(int_counter, 0, "0");
   int_counter->Increment(1);
   AssertValue(int_counter, 1, "1");
   int_counter->Increment(10);
   AssertValue(int_counter, 11, "11");
-  int_counter->set_value(3456);
+  int_counter->SetValue(3456);
   AssertValue(int_counter, 3456, "3.46K");
 
   AddMetricDef("counter_with_units", TMetricKind::COUNTER, TUnit::BYTES);
   IntCounter* int_counter_with_units =
-      metrics.AddCounter<int64_t>("counter_with_units", 10);
+      metrics.AddCounter("counter_with_units", 10);
   AssertValue(int_counter_with_units, 10, "10.00 B");
 }
 
 TEST_F(MetricsTest, GaugeMetrics) {
   MetricGroup metrics("GaugeMetrics");
   AddMetricDef("gauge", TMetricKind::GAUGE, TUnit::NONE);
-  IntGauge* int_gauge = metrics.AddGauge<int64_t>("gauge", 0);
+  IntGauge* int_gauge = metrics.AddGauge("gauge", 0);
   AssertValue(int_gauge, 0, "0");
   int_gauge->Increment(-1);
   AssertValue(int_gauge, -1, "-1");
   int_gauge->Increment(10);
   AssertValue(int_gauge, 9, "9");
-  int_gauge->set_value(3456);
+  int_gauge->SetValue(3456);
   AssertValue(int_gauge, 3456, "3456");
 
   AddMetricDef("gauge_with_units", TMetricKind::GAUGE, TUnit::TIME_S);
   IntGauge* int_gauge_with_units =
-      metrics.AddGauge<int64_t>("gauge_with_units", 10);
+      metrics.AddGauge("gauge_with_units", 10);
   AssertValue(int_gauge_with_units, 10, "10s000ms");
+}
+
+TEST_F(MetricsTest, SumGauge) {
+  MetricGroup metrics("SumGauge");
+  AddMetricDef("gauge1", TMetricKind::GAUGE, TUnit::NONE);
+  AddMetricDef("gauge2", TMetricKind::GAUGE, TUnit::NONE);
+  AddMetricDef("sum", TMetricKind::GAUGE, TUnit::NONE);
+  IntGauge* gauge1 = metrics.AddGauge("gauge1", 0);
+  IntGauge* gauge2 = metrics.AddGauge("gauge2", 0);
+
+  vector<IntGauge*> gauges({gauge1, gauge2});
+  IntGauge* sum_gauge =
+      metrics.RegisterMetric(new SumGauge(MetricDefs::Get("sum"), gauges));
+
+  AssertValue(sum_gauge, 0, "0");
+  gauge1->Increment(1);
+  AssertValue(sum_gauge, 1, "1");
+  gauge2->Increment(-1);
+  AssertValue(sum_gauge, 0, "0");
+  gauge2->Increment(100);
+  AssertValue(sum_gauge, 100, "100");
 }
 
 TEST_F(MetricsTest, PropertyMetrics) {
@@ -111,14 +132,14 @@ TEST_F(MetricsTest, PropertyMetrics) {
   AddMetricDef("bool_property", TMetricKind::PROPERTY, TUnit::NONE);
   BooleanProperty* bool_property = metrics.AddProperty("bool_property", false);
   AssertValue(bool_property, false, "false");
-  bool_property->set_value(true);
+  bool_property->SetValue(true);
   AssertValue(bool_property, true, "true");
 
   AddMetricDef("string_property", TMetricKind::PROPERTY, TUnit::NONE);
   StringProperty* string_property = metrics.AddProperty("string_property",
       string("string1"));
   AssertValue(string_property, "string1", "string1");
-  string_property->set_value("string2");
+  string_property->SetValue("string2");
   AssertValue(string_property, "string2", "string2");
 }
 
@@ -126,11 +147,11 @@ TEST_F(MetricsTest, NonFiniteValues) {
   MetricGroup metrics("NanValues");
   AddMetricDef("inf_value", TMetricKind::GAUGE, TUnit::NONE);
   double inf = numeric_limits<double>::infinity();
-  DoubleGauge* gauge = metrics.AddGauge("inf_value", inf);
+  DoubleGauge* gauge = metrics.AddDoubleGauge("inf_value", inf);
   AssertValue(gauge, inf, "inf");
   double nan = numeric_limits<double>::quiet_NaN();
-  gauge->set_value(nan);
-  EXPECT_TRUE(std::isnan(gauge->value()));
+  gauge->SetValue(nan);
+  EXPECT_TRUE(std::isnan(gauge->GetValue()));
   EXPECT_TRUE(gauge->ToHumanReadable() == "nan");
 }
 
@@ -194,51 +215,51 @@ TEST_F(MetricsTest, StatsMetricsSingle) {
 }
 
 TEST_F(MetricsTest, MemMetric) {
-#ifndef ADDRESS_SANITIZER
+#if !defined(ADDRESS_SANITIZER) && !defined(THREAD_SANITIZER)
   MetricGroup metrics("MemMetrics");
-  RegisterMemoryMetrics(&metrics, false);
+  ASSERT_OK(RegisterMemoryMetrics(&metrics, false, nullptr, nullptr));
   // Smoke test to confirm that tcmalloc metrics are returning reasonable values.
-  UIntGauge* bytes_in_use =
-      metrics.FindMetricForTesting<UIntGauge>("tcmalloc.bytes-in-use");
+  IntGauge* bytes_in_use =
+      metrics.FindMetricForTesting<IntGauge>("tcmalloc.bytes-in-use");
   ASSERT_TRUE(bytes_in_use != NULL);
 
-  uint64_t cur_in_use = bytes_in_use->value();
+  uint64_t cur_in_use = bytes_in_use->GetValue();
   EXPECT_GT(cur_in_use, 0);
 
   // Allocate 100MB to increase the number of bytes used. TCMalloc may also give up some
   // bytes during this allocation, so this allocation is deliberately large to ensure that
   // the bytes used metric goes up net.
   scoped_ptr<vector<uint64_t>> chunk(new vector<uint64_t>(100 * 1024 * 1024));
-  EXPECT_GT(bytes_in_use->value(), cur_in_use);
+  EXPECT_GT(bytes_in_use->GetValue(), cur_in_use);
 
-  UIntGauge* total_bytes_reserved =
-      metrics.FindMetricForTesting<UIntGauge>("tcmalloc.total-bytes-reserved");
+  IntGauge* total_bytes_reserved =
+      metrics.FindMetricForTesting<IntGauge>("tcmalloc.total-bytes-reserved");
   ASSERT_TRUE(total_bytes_reserved != NULL);
-  ASSERT_GT(total_bytes_reserved->value(), 0);
+  ASSERT_GT(total_bytes_reserved->GetValue(), 0);
 
-  UIntGauge* pageheap_free_bytes =
-      metrics.FindMetricForTesting<UIntGauge>("tcmalloc.pageheap-free-bytes");
+  IntGauge* pageheap_free_bytes =
+      metrics.FindMetricForTesting<IntGauge>("tcmalloc.pageheap-free-bytes");
   ASSERT_TRUE(pageheap_free_bytes != NULL);
 
-  UIntGauge* pageheap_unmapped_bytes =
-      metrics.FindMetricForTesting<UIntGauge>("tcmalloc.pageheap-unmapped-bytes");
+  IntGauge* pageheap_unmapped_bytes =
+      metrics.FindMetricForTesting<IntGauge>("tcmalloc.pageheap-unmapped-bytes");
   EXPECT_TRUE(pageheap_unmapped_bytes != NULL);
 #endif
 }
 
 TEST_F(MetricsTest, JvmMetrics) {
   MetricGroup metrics("JvmMetrics");
-  RegisterMemoryMetrics(&metrics, true);
-  UIntGauge* jvm_total_used =
-      metrics.GetOrCreateChildGroup("jvm")->FindMetricForTesting<UIntGauge>(
+  ASSERT_OK(RegisterMemoryMetrics(&metrics, true, nullptr, nullptr));
+  IntGauge* jvm_total_used =
+      metrics.GetOrCreateChildGroup("jvm")->FindMetricForTesting<IntGauge>(
           "jvm.total.current-usage-bytes");
   ASSERT_TRUE(jvm_total_used != NULL);
-  EXPECT_GT(jvm_total_used->value(), 0);
-  UIntGauge* jvm_peak_total_used =
-      metrics.GetOrCreateChildGroup("jvm")->FindMetricForTesting<UIntGauge>(
+  EXPECT_GT(jvm_total_used->GetValue(), 0);
+  IntGauge* jvm_peak_total_used =
+      metrics.GetOrCreateChildGroup("jvm")->FindMetricForTesting<IntGauge>(
           "jvm.total.peak-current-usage-bytes");
   ASSERT_TRUE(jvm_peak_total_used != NULL);
-  EXPECT_GT(jvm_peak_total_used->value(), 0);
+  EXPECT_GT(jvm_peak_total_used->GetValue(), 0);
 }
 
 void AssertJson(const Value& val, const string& name, const string& value,
@@ -253,7 +274,7 @@ void AssertJson(const Value& val, const string& name, const string& value,
 TEST_F(MetricsTest, CountersJson) {
   MetricGroup metrics("CounterMetrics");
   AddMetricDef("counter", TMetricKind::COUNTER, TUnit::UNIT, "description");
-  metrics.AddCounter<int64_t>("counter", 0);
+  metrics.AddCounter("counter", 0);
   Document document;
   Value val;
   metrics.ToJson(true, &document, &val);
@@ -265,7 +286,7 @@ TEST_F(MetricsTest, CountersJson) {
 TEST_F(MetricsTest, GaugesJson) {
   MetricGroup metrics("GaugeMetrics");
   AddMetricDef("gauge", TMetricKind::GAUGE, TUnit::NONE);
-  metrics.AddGauge<int64_t>("gauge", 10);
+  metrics.AddGauge("gauge", 10);
   Document document;
   Value val;
   metrics.ToJson(true, &document, &val);

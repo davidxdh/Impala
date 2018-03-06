@@ -18,31 +18,39 @@
 #include "exec/kudu-scanner.h"
 
 #include <kudu/client/row_result.h>
+#include <kudu/client/value.h>
 #include <thrift/protocol/TDebugProtocol.h>
 #include <vector>
 #include <string>
 
-#include "exprs/expr.h"
-#include "exprs/expr-context.h"
 #include "exec/kudu-util.h"
+#include "exprs/scalar-expr.h"
+#include "exprs/scalar-expr-evaluator.h"
+#include "exprs/slot-ref.h"
 #include "runtime/mem-pool.h"
 #include "runtime/mem-tracker.h"
+#include "runtime/raw-value.h"
+#include "runtime/runtime-filter.h"
 #include "runtime/runtime-state.h"
 #include "runtime/row-batch.h"
 #include "runtime/string-value.h"
+#include "runtime/timestamp-value.inline.h"
 #include "runtime/tuple-row.h"
 #include "gutil/gscoped_ptr.h"
 #include "gutil/strings/substitute.h"
 #include "util/jni-util.h"
+#include "util/min-max-filter.h"
 #include "util/periodic-counter-updater.h"
 #include "util/runtime-profile-counters.h"
 
 #include "common/names.h"
 
 using kudu::client::KuduClient;
+using kudu::client::KuduPredicate;
 using kudu::client::KuduScanBatch;
 using kudu::client::KuduSchema;
 using kudu::client::KuduTable;
+using kudu::client::KuduValue;
 
 DEFINE_string(kudu_read_mode, "READ_LATEST", "(Advanced) Sets the Kudu scan ReadMode. "
     "Supported Kudu read modes are READ_LATEST and READ_AT_SNAPSHOT.");
@@ -58,15 +66,23 @@ namespace impala {
 
 const string MODE_READ_AT_SNAPSHOT = "READ_AT_SNAPSHOT";
 
-KuduScanner::KuduScanner(KuduScanNode* scan_node, RuntimeState* state)
+KuduScanner::KuduScanner(KuduScanNodeBase* scan_node, RuntimeState* state)
   : scan_node_(scan_node),
     state_(state),
+    expr_perm_pool_(new MemPool(scan_node->expr_mem_tracker())),
+    expr_results_pool_(new MemPool(scan_node->expr_mem_tracker())),
     cur_kudu_batch_num_read_(0),
     last_alive_time_micros_(0) {
 }
 
 Status KuduScanner::Open() {
-  return scan_node_->GetConjunctCtxs(&conjunct_ctxs_);
+  for (int i = 0; i < scan_node_->tuple_desc()->slots().size(); ++i) {
+    const SlotDescriptor* slot = scan_node_->tuple_desc()->slots()[i];
+    if (slot->type().type != TYPE_TIMESTAMP) continue;
+    timestamp_slots_.push_back(slot);
+  }
+  return ScalarExprEvaluator::Clone(&obj_pool_, state_, expr_perm_pool_.get(),
+      expr_results_pool_.get(), scan_node_->conjunct_evals(), &conjunct_evals_);
 }
 
 void KuduScanner::KeepKuduScannerAlive() {
@@ -121,10 +137,12 @@ Status KuduScanner::GetNext(RowBatch* row_batch, bool* eos) {
 
 void KuduScanner::Close() {
   if (scanner_) CloseCurrentClientScanner();
-  Expr::Close(conjunct_ctxs_, state_);
+  ScalarExprEvaluator::Close(conjunct_evals_, state_);
+  expr_perm_pool_->FreeAll();
+  expr_results_pool_->FreeAll();
 }
 
-Status KuduScanner::OpenNextScanToken(const string& scan_token)  {
+Status KuduScanner::OpenNextScanToken(const string& scan_token, bool* eos) {
   DCHECK(scanner_ == NULL);
   kudu::client::KuduScanner* scanner;
   KUDU_RETURN_IF_ERROR(kudu::client::KuduScanToken::DeserializeIntoScanner(
@@ -146,10 +164,73 @@ Status KuduScanner::OpenNextScanToken(const string& scan_token)  {
   VLOG_ROW << "Starting KuduScanner with ReadMode=" << mode << " timeout=" <<
       FLAGS_kudu_operation_timeout_ms;
 
+  if (!timestamp_slots_.empty()) {
+    uint64_t row_format_flags =
+        kudu::client::KuduScanner::PAD_UNIXTIME_MICROS_TO_16_BYTES;
+    scanner_->SetRowFormatFlags(row_format_flags);
+  }
+
+  if (scan_node_->filter_ctxs_.size() > 0) {
+    for (const FilterContext& ctx : scan_node_->filter_ctxs_) {
+      MinMaxFilter* filter = ctx.filter->get_min_max();
+      if (filter != nullptr && !filter->AlwaysTrue()) {
+        if (filter->AlwaysFalse()) {
+          // We can skip this entire scan.
+          CloseCurrentClientScanner();
+          *eos = true;
+          return Status::OK();
+        } else {
+          auto it = ctx.filter->filter_desc().planid_to_target_ndx.find(scan_node_->id());
+          const TRuntimeFilterTargetDesc& target_desc =
+              ctx.filter->filter_desc().targets[it->second];
+          const string& col_name = target_desc.kudu_col_name;
+          DCHECK(col_name != "");
+          const ColumnType& col_type = ColumnType::FromThrift(target_desc.kudu_col_type);
+
+          void* min = filter->GetMin();
+          void* max = filter->GetMax();
+          // If the type of the filter is not the same as the type of the target column,
+          // there must be an implicit integer cast and we need to ensure the min/max we
+          // pass to Kudu are within the range of the target column.
+          int64_t int_min;
+          int64_t int_max;
+          if (col_type.type != filter->type()) {
+            DCHECK(col_type.IsIntegerType());
+
+            if (!filter->GetCastIntMinMax(col_type, &int_min, &int_max)) {
+              // The min/max for this filter is outside the range for the target column,
+              // so all rows are filtered out and we can skip the scan.
+              CloseCurrentClientScanner();
+              *eos = true;
+              return Status::OK();
+            }
+            min = &int_min;
+            max = &int_max;
+          }
+
+          KuduValue* min_value;
+          RETURN_IF_ERROR(CreateKuduValue(col_type, min, &min_value));
+          KUDU_RETURN_IF_ERROR(
+              scanner_->AddConjunctPredicate(scan_node_->table_->NewComparisonPredicate(
+                  col_name, KuduPredicate::ComparisonOp::GREATER_EQUAL, min_value)),
+              "Failed to add min predicate");
+
+          KuduValue* max_value;
+          RETURN_IF_ERROR(CreateKuduValue(col_type, max, &max_value));
+          KUDU_RETURN_IF_ERROR(
+              scanner_->AddConjunctPredicate(scan_node_->table_->NewComparisonPredicate(
+                  col_name, KuduPredicate::ComparisonOp::LESS_EQUAL, max_value)),
+              "Failed to add max predicate");
+        }
+      }
+    }
+  }
+
   {
     SCOPED_TIMER(state_->total_storage_wait_timer());
     KUDU_RETURN_IF_ERROR(scanner_->Open(), "Unable to open scanner");
   }
+  *eos = false;
   return Status::OK();
 }
 
@@ -163,30 +244,75 @@ Status KuduScanner::HandleEmptyProjection(RowBatch* row_batch) {
   int num_rows_remaining = cur_kudu_batch_.NumRows() - cur_kudu_batch_num_read_;
   int rows_to_add = std::min(row_batch->capacity() - row_batch->num_rows(),
       num_rows_remaining);
+  int num_to_commit = 0;
+  if (LIKELY(conjunct_evals_.empty())) {
+    num_to_commit = rows_to_add;
+  } else {
+    for (int i = 0; i < rows_to_add; ++i) {
+      if (ExecNode::EvalConjuncts(conjunct_evals_.data(),
+              conjunct_evals_.size(), nullptr)) {
+        ++num_to_commit;
+      }
+    }
+  }
+  for (int i = 0; i < num_to_commit; ++i) {
+    // IMPALA-6258: Initialize tuple ptrs to non-null value
+    TupleRow* row = row_batch->GetRow(row_batch->AddRow());
+    row->SetTuple(0, Tuple::POISON);
+    row_batch->CommitLastRow();
+  }
   cur_kudu_batch_num_read_ += rows_to_add;
-  row_batch->CommitRows(rows_to_add);
   return Status::OK();
 }
 
 Status KuduScanner::DecodeRowsIntoRowBatch(RowBatch* row_batch, Tuple** tuple_mem) {
   // Short-circuit the count(*) case.
-  if (scan_node_->tuple_desc_->slots().empty()) {
+  if (scan_node_->tuple_desc()->slots().empty()) {
     return HandleEmptyProjection(row_batch);
   }
 
   // Iterate through the Kudu rows, evaluate conjuncts and deep-copy survivors into
   // 'row_batch'.
-  bool has_conjuncts = !conjunct_ctxs_.empty();
+  bool has_conjuncts = !conjunct_evals_.empty();
   int num_rows = cur_kudu_batch_.NumRows();
+
   for (int krow_idx = cur_kudu_batch_num_read_; krow_idx < num_rows; ++krow_idx) {
+    Tuple* kudu_tuple = const_cast<Tuple*>(
+        reinterpret_cast<const Tuple*>(cur_kudu_batch_.direct_data().data()
+            + (krow_idx * scan_node_->row_desc()->GetRowSize())));
+    ++cur_kudu_batch_num_read_;
+
+    // Kudu tuples containing TIMESTAMP columns (UNIXTIME_MICROS in Kudu, stored as an
+    // int64) have 8 bytes of padding following the timestamp. Because this padding is
+    // provided, Impala can convert these unixtime values to Impala's TimestampValue
+    // format in place and copy the rows to Impala row batches.
+    // TODO: avoid mem copies with a Kudu mem 'release' mechanism, attaching mem to the
+    // batch.
+    // TODO: consider codegen for this per-timestamp col fixup
+    for (const SlotDescriptor* slot : timestamp_slots_) {
+      DCHECK(slot->type().type == TYPE_TIMESTAMP);
+      if (slot->is_nullable() && kudu_tuple->IsNull(slot->null_indicator_offset())) {
+        continue;
+      }
+      int64_t ts_micros = *reinterpret_cast<int64_t*>(
+          kudu_tuple->GetSlot(slot->tuple_offset()));
+      TimestampValue tv = TimestampValue::UtcFromUnixTimeMicros(ts_micros);
+      if (tv.HasDateAndTime()) {
+        RawValue::Write(&tv, kudu_tuple, slot, NULL);
+      } else {
+        kudu_tuple->SetNull(slot->null_indicator_offset());
+        RETURN_IF_ERROR(state_->LogOrReturnError(
+            ErrorMsg::Init(TErrorCode::KUDU_TIMESTAMP_OUT_OF_RANGE,
+              scan_node_->table_->name(),
+              scan_node_->table_->schema().Column(slot->col_pos()).name())));
+      }
+    }
+
     // Evaluate the conjuncts that haven't been pushed down to Kudu. Conjunct evaluation
     // is performed directly on the Kudu tuple because its memory layout is identical to
     // Impala's. We only copy the surviving tuples to Impala's output row batch.
-    KuduScanBatch::RowPtr krow = cur_kudu_batch_.Row(krow_idx);
-    Tuple* kudu_tuple = reinterpret_cast<Tuple*>(const_cast<void*>(krow.cell(0)));
-    ++cur_kudu_batch_num_read_;
-    if (has_conjuncts && !ExecNode::EvalConjuncts(&conjunct_ctxs_[0],
-        conjunct_ctxs_.size(), reinterpret_cast<TupleRow*>(&kudu_tuple))) {
+    if (has_conjuncts && !ExecNode::EvalConjuncts(conjunct_evals_.data(),
+            conjunct_evals_.size(), reinterpret_cast<TupleRow*>(&kudu_tuple))) {
       continue;
     }
     // Deep copy the tuple, set it in a new row, and commit the row.
@@ -200,7 +326,7 @@ Status KuduScanner::DecodeRowsIntoRowBatch(RowBatch* row_batch, Tuple** tuple_me
     // Move to the next tuple in the tuple buffer.
     *tuple_mem = next_tuple(*tuple_mem);
   }
-  ExprContext::FreeLocalAllocations(conjunct_ctxs_);
+  expr_results_pool_->Clear();
 
   // Check the status in case an error status was set during conjunct evaluation.
   return state_->GetQueryStatus();

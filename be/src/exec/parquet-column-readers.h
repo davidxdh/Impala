@@ -22,6 +22,7 @@
 
 #include "exec/hdfs-parquet-scanner.h"
 #include "util/codec.h"
+#include "util/bit-stream-utils.h"
 #include "util/dict-encoding.h"
 #include "util/rle-encoding.h"
 
@@ -36,39 +37,34 @@ class MemPool;
 /// depth of 100, as enforced by the FE. Using a small type saves memory and speeds up
 /// populating the level cache (e.g., with RLE we can memset() repeated values).
 ///
-/// Inherits from RleDecoder instead of containing one for performance reasons.
-/// The containment design would require two BitReaders per column reader. The extra
-/// BitReader causes enough bloat for a column reader to require another cache line.
-/// TODO: It is not clear whether the inheritance vs. containment choice still makes
-/// sense with column-wise materialization. The containment design seems cleaner and
-/// we should revisit.
-class ParquetLevelDecoder : public RleDecoder {
+/// TODO: expose whether we're in a run of repeated values so that callers can
+/// optimise for that case.
+class ParquetLevelDecoder {
  public:
   ParquetLevelDecoder(bool is_def_level_decoder)
-    : cached_levels_(NULL),
-      num_cached_levels_(0),
-      cached_level_idx_(0),
-      encoding_(parquet::Encoding::PLAIN),
-      max_level_(0),
-      cache_size_(0),
-      num_buffered_values_(0),
-      decoding_error_code_(is_def_level_decoder ?
+    : decoding_error_code_(is_def_level_decoder ?
           TErrorCode::PARQUET_DEF_LEVEL_ERROR : TErrorCode::PARQUET_REP_LEVEL_ERROR) {
   }
 
   /// Initialize the LevelDecoder. Reads and advances the provided data buffer if the
-  /// encoding requires reading metadata from the page header.
+  /// encoding requires reading metadata from the page header. 'cache_size' will be
+  /// rounded up to a multiple of 32 internally.
   Status Init(const string& filename, parquet::Encoding::type encoding,
       MemPool* cache_pool, int cache_size, int max_level, int num_buffered_values,
       uint8_t** data, int* data_size);
 
-  /// Returns the next level or INVALID_LEVEL if there was an error.
+  /// Returns the next level or INVALID_LEVEL if there was an error. Not as efficient
+  /// as batched methods.
   inline int16_t ReadLevel();
 
-  /// Decodes and caches the next batch of levels. Resets members associated with the
-  /// cache. Returns a non-ok status if there was a problem decoding a level, or if a
-  /// level was encountered with a value greater than max_level_.
-  Status CacheNextBatch(int batch_size);
+  /// Decodes and caches the next batch of levels given that there are 'vals_remaining'
+  /// values left to decode in the page. Resets members associated with the cache.
+  /// Returns a non-ok status if there was a problem decoding a level, if a level was
+  /// encountered with a value greater than max_level_, or if fewer than
+  /// min(CacheSize(), vals_remaining) levels could be read, which indicates that the
+  /// input did not have the expected number of values. Only valid to call when
+  /// the cache has been exhausted, i.e. CacheHasNext() is false.
+  Status CacheNextBatch(int vals_remaining);
 
   /// Functions for working with the level cache.
   inline bool CacheHasNext() const { return cached_level_idx_ < num_cached_levels_; }
@@ -83,33 +79,57 @@ class ParquetLevelDecoder : public RleDecoder {
   inline int CacheSize() const { return num_cached_levels_; }
   inline int CacheRemaining() const { return num_cached_levels_ - cached_level_idx_; }
   inline int CacheCurrIdx() const { return cached_level_idx_; }
-
  private:
   /// Initializes members associated with the level cache. Allocates memory for
   /// the cache from pool, if necessary.
   Status InitCache(MemPool* pool, int cache_size);
 
-  /// Decodes and writes a batch of levels into the cache. Sets the number of
-  /// values written to the cache in *num_cached_levels. Returns false if there was
-  /// an error decoding a level or if there was a level value greater than max_level_.
+  /// Decodes and writes a batch of levels into the cache. Returns true and sets
+  /// the number of values written to the cache via *num_cached_levels if no errors
+  /// are encountered. *num_cached_levels is < 'batch_size' in this case iff the
+  /// end of input was hit without any other errors. Returns false if there was an
+  /// error decoding a level or if there was an invalid level value greater than
+  /// 'max_level_'. Only valid to call when the cache has been exhausted, i.e.
+  /// CacheHasNext() is false.
   bool FillCache(int batch_size, int* num_cached_levels);
 
-  /// Buffer for a batch of levels. The memory is allocated and owned by a pool in
-  /// passed in Init().
-  uint8_t* cached_levels_;
+  /// Implementation of FillCache() for RLE encoding.
+  bool FillCacheRle(int batch_size, int* num_cached_levels);
+
+  /// RLE decoder, used if 'encoding_' is RLE.
+  RleBatchDecoder<uint8_t> rle_decoder_;
+
+  /// Bit unpacker, used if 'encoding_' is BIT_PACKED.
+  BatchedBitReader bit_reader_;
+
+  /// Buffer for a batch of levels. The memory is allocated and owned by a pool passed
+  /// in Init().
+  uint8_t* cached_levels_ = nullptr;
+
   /// Number of valid level values in the cache.
-  int num_cached_levels_;
+  int num_cached_levels_ = 0;
+
   /// Current index into cached_levels_.
-  int cached_level_idx_;
-  parquet::Encoding::type encoding_;
+  int cached_level_idx_ = 0;
+
+  /// The parquet encoding used for the levels. Usually RLE but the deprecated BIT_PACKED
+  /// encoding is also allowed.
+  parquet::Encoding::type encoding_ = parquet::Encoding::PLAIN;
 
   /// For error checking and reporting.
-  int max_level_;
-  /// Number of level values cached_levels_ has memory allocated for.
-  int cache_size_;
+  int max_level_ = 0;
+
+  /// Number of level values cached_levels_ has memory allocated for. Always
+  /// a multiple of 32 to allow reading directly from 'bit_reader_' in batches.
+  int cache_size_ = 0;
+
   /// Number of remaining data values in the current data page.
-  int num_buffered_values_;
+  int num_buffered_values_ = 0;
+
+  /// Name of the parquet file. Used for reporting level decoding errors.
   string filename_;
+
+  /// Error code to use when reporting level decoding errors.
   TErrorCode::type decoding_error_code_;
 };
 
@@ -278,7 +298,7 @@ class ParquetColumnReader {
       def_level_(HdfsParquetScanner::INVALID_LEVEL),
       max_def_level_(node_.max_def_level),
       tuple_offset_(slot_desc == NULL ? -1 : slot_desc->tuple_offset()),
-      null_indicator_offset_(slot_desc == NULL ? NullIndicatorOffset(-1, -1) :
+      null_indicator_offset_(slot_desc == NULL ? NullIndicatorOffset() :
           slot_desc->null_indicator_offset()) {
     DCHECK_GE(node_.max_rep_level, 0);
     DCHECK_LE(node_.max_rep_level, std::numeric_limits<int16_t>::max());
@@ -288,10 +308,13 @@ class ParquetColumnReader {
     if (max_rep_level() == 0) rep_level_ = 0;
   }
 
-  /// Trigger debug action. Returns false if the debug action deems that the
-  /// parquet column reader should halt execution. In which case, 'parse_status_'
-  /// is also updated.
-  bool TriggerDebugAction();
+  /// Called in the middle of creating a scratch tuple batch to simulate failures
+  /// such as exceeding memory limit or cancellation. Returns false if the debug
+  /// action deems that the parquet column reader should halt execution. 'val_count'
+  /// is the counter which the column reader uses to track the number of tuples
+  /// produced so far. If the column reader should halt execution, 'parse_status_'
+  /// is updated with the error status and 'val_count' is set to 0.
+  bool ColReaderDebugAction(int* val_count);
 };
 
 /// Reader for a single column from the parquet file.  It's associated with a
@@ -312,7 +335,7 @@ class BaseScalarColumnReader : public ParquetColumnReader {
       num_values_read_(0),
       metadata_(NULL),
       stream_(NULL),
-      decompressed_data_pool_(new MemPool(parent->scan_node_->mem_tracker())) {
+      data_page_pool_(new MemPool(parent->scan_node_->mem_tracker())) {
     DCHECK_GE(node_.col_idx, 0) << node_.DebugString();
   }
 
@@ -343,12 +366,14 @@ class BaseScalarColumnReader : public ParquetColumnReader {
   }
 
   virtual void Close(RowBatch* row_batch) {
-    if (row_batch != nullptr) {
-      row_batch->tuple_data_pool()->AcquireData(decompressed_data_pool_.get(), false);
+    if (row_batch != nullptr && PageContainsTupleData(page_encoding_)) {
+      row_batch->tuple_data_pool()->AcquireData(data_page_pool_.get(), false);
     } else {
-      decompressed_data_pool_->FreeAll();
+      data_page_pool_->FreeAll();
     }
     if (decompressor_ != nullptr) decompressor_->Close();
+    DictDecoderBase* dict_decoder = GetDictionaryDecoder();
+    if (dict_decoder != nullptr) dict_decoder->Close();
   }
 
   int64_t total_len() const { return metadata_->total_compressed_size; }
@@ -357,7 +382,6 @@ class BaseScalarColumnReader : public ParquetColumnReader {
     if (metadata_ == NULL) return THdfsCompression::NONE;
     return PARQUET_TO_IMPALA_CODEC[metadata_->codec];
   }
-  MemPool* decompressed_data_pool() const { return decompressed_data_pool_.get(); }
 
   /// Reads the next definition and repetition levels for this column. Initializes the
   /// next data page if necessary.
@@ -404,7 +428,8 @@ class BaseScalarColumnReader : public ParquetColumnReader {
   /// Decoder for repetition levels.
   ParquetLevelDecoder rep_levels_;
 
-  /// Page encoding for values. Cached here for perf.
+  /// Page encoding for values of the current data page. Cached here for perf. Set in
+  /// InitDataPage().
   parquet::Encoding::type page_encoding_;
 
   /// Num values remaining in the current data page
@@ -420,8 +445,10 @@ class BaseScalarColumnReader : public ParquetColumnReader {
   boost::scoped_ptr<Codec> decompressor_;
   ScannerContext::Stream* stream_;
 
-  /// Pool to allocate decompression buffers from.
-  boost::scoped_ptr<MemPool> decompressed_data_pool_;
+  /// Pool to allocate storage for data pages from - either decompression buffers for
+  /// compressed data pages or copies of the data page with var-len data to attach to
+  /// batches.
+  boost::scoped_ptr<MemPool> data_page_pool_;
 
   /// Header for current data page.
   parquet::PageHeader current_page_header_;
@@ -465,6 +492,20 @@ class BaseScalarColumnReader : public ParquetColumnReader {
   /// 'size' bytes remaining.
   virtual Status InitDataPage(uint8_t* data, int size) = 0;
 
+  /// Allocate memory for the uncompressed contents of a data page of 'size' bytes from
+  /// 'data_page_pool_'. 'err_ctx' provides context for error messages. On success, 'buffer'
+  /// points to the allocated memory. Otherwise an error status is returned.
+  Status AllocateUncompressedDataPage(
+      int64_t size, const char* err_ctx, uint8_t** buffer);
+
+  /// Returns true if a data page for this column with the specified 'encoding' may
+  /// contain strings referenced by returned batches. Cases where this is not true are:
+  /// * Dictionary-compressed pages, where any string data lives in 'dictionary_pool_'.
+  /// * Fixed-length slots, where there is no string data.
+  bool PageContainsTupleData(parquet::Encoding::type page_encoding) {
+    return page_encoding != parquet::Encoding::PLAIN_DICTIONARY
+        && slot_desc_ != nullptr && slot_desc_->type().IsVarLenStringType();
+  }
 };
 
 /// Collections are not materialized directly in parquet files; only scalar values appear

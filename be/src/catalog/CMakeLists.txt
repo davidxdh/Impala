@@ -24,4 +24,6 @@ add_library(Catalog
   catalog-util.cc
   catalogd-main.cc
 )
-add_dependencies(Catalog thrift-deps)
+add_dependencies(Catalog gen-deps)
+
+ADD_BE_TEST(catalog-util-test)

@@ -31,6 +31,7 @@ import org.apache.hadoop.fs.CommonConfigurationKeysPublic;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.s3a.S3AFileSystem;
+import org.apache.hadoop.fs.adl.AdlFileSystem;
 import org.apache.hadoop.hdfs.DFSConfigKeys;
 import org.apache.hadoop.hdfs.DistributedFileSystem;
 import org.apache.impala.analysis.DescriptorTable;
@@ -167,30 +168,11 @@ public class JniFrontend {
   }
 
   // Deserialize and merge each thrift catalog update into a single merged update
-  public byte[] updateCatalogCache(byte[][] thriftCatalogUpdates) throws ImpalaException {
-    TUniqueId defaultCatalogServiceId = new TUniqueId(0L, 0L);
-    TUpdateCatalogCacheRequest mergedUpdateRequest = new TUpdateCatalogCacheRequest(
-        false, defaultCatalogServiceId, new ArrayList<TCatalogObject>(),
-        new ArrayList<TCatalogObject>());
-    for (byte[] catalogUpdate: thriftCatalogUpdates) {
-      TUpdateCatalogCacheRequest incrementalRequest = new TUpdateCatalogCacheRequest();
-      JniUtil.deserializeThrift(protocolFactory_, incrementalRequest, catalogUpdate);
-      mergedUpdateRequest.is_delta |= incrementalRequest.is_delta;
-      if (!incrementalRequest.getCatalog_service_id().equals(defaultCatalogServiceId)) {
-        mergedUpdateRequest.setCatalog_service_id(
-            incrementalRequest.getCatalog_service_id());
-      }
-      mergedUpdateRequest.getUpdated_objects().addAll(
-          incrementalRequest.getUpdated_objects());
-      mergedUpdateRequest.getRemoved_objects().addAll(
-          incrementalRequest.getRemoved_objects());
-    }
-    TSerializer serializer = new TSerializer(protocolFactory_);
-    try {
-      return serializer.serialize(frontend_.updateCatalogCache(mergedUpdateRequest));
-    } catch (TException e) {
-      throw new InternalException(e.getMessage());
-    }
+  public byte[] updateCatalogCache(byte[] req) throws ImpalaException, TException {
+    TUpdateCatalogCacheRequest request = new TUpdateCatalogCacheRequest();
+    JniUtil.deserializeThrift(protocolFactory_, request, req);
+    return new TSerializer(protocolFactory_).serialize(
+        frontend_.updateCatalogCache(request));
   }
 
   /**
@@ -579,9 +561,11 @@ public class JniFrontend {
     }
   }
 
-  public void setCatalogInitialized() {
+  public void setCatalogIsReady() {
     frontend_.getCatalog().setIsReady(true);
   }
+
+  public void waitForCatalog() { frontend_.waitForCatalog(); }
 
   // Caching this saves ~50ms per call to getHadoopConfigAsHtml
   private static final Configuration CONF = new Configuration();
@@ -716,7 +700,9 @@ public class JniFrontend {
   private String checkFileSystem(Configuration conf) {
     try {
       FileSystem fs = FileSystem.get(CONF);
-      if (!(fs instanceof DistributedFileSystem || fs instanceof S3AFileSystem)) {
+      if (!(fs instanceof DistributedFileSystem ||
+            fs instanceof S3AFileSystem ||
+            fs instanceof AdlFileSystem)) {
         return "Currently configured default filesystem: " +
             fs.getClass().getSimpleName() + ". " +
             CommonConfigurationKeysPublic.FS_DEFAULT_NAME_KEY +

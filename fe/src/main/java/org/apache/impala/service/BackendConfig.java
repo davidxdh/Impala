@@ -17,13 +17,16 @@
 
 package org.apache.impala.service;
 
-import com.google.common.base.Preconditions;
-import com.google.common.base.Strings;
+import static org.apache.hadoop.fs.CommonConfigurationKeysPublic
+    .HADOOP_SECURITY_AUTH_TO_LOCAL;
 
 import org.apache.hadoop.conf.Configuration;
-import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.HADOOP_SECURITY_AUTH_TO_LOCAL;
 import org.apache.hadoop.security.authentication.util.KerberosName;
+import org.apache.impala.analysis.SqlScanner;
 import org.apache.impala.thrift.TBackendGflags;
+
+import com.google.common.base.Preconditions;
+import com.google.common.base.Strings;
 
 /**
  * This class is meant to provide the FE with impalad backend configuration parameters,
@@ -41,14 +44,19 @@ public class BackendConfig {
   public static void create(TBackendGflags cfg) {
     Preconditions.checkNotNull(cfg);
     INSTANCE = new BackendConfig(cfg);
+    SqlScanner.init(cfg.getReserved_words_version());
     initAuthToLocal();
   }
 
+  public TBackendGflags getBackendCfg() { return backendCfg_; }
   public long getReadSize() { return backendCfg_.read_size; }
   public boolean getComputeLineage() {
     return !Strings.isNullOrEmpty(backendCfg_.lineage_event_log_dir);
   }
   public long getIncStatsMaxSize() { return backendCfg_.inc_stats_size_limit_bytes; }
+  public boolean isStatsExtrapolationEnabled() {
+    return backendCfg_.enable_stats_extrapolation;
+  }
   public boolean isAuthToLocalEnabled() {
     return backendCfg_.load_auth_to_local_rules &&
         !Strings.isNullOrEmpty(backendCfg_.principal);
@@ -57,6 +65,21 @@ public class BackendConfig {
 
   public int getImpalaLogLevel() { return backendCfg_.impala_log_lvl; }
   public int getNonImpalaJavaVlogLevel() { return backendCfg_.non_impala_java_vlog; }
+  public long getSentryCatalogPollingFrequency() {
+    return backendCfg_.sentry_catalog_polling_frequency_s;
+  }
+
+  public int maxHdfsPartsParallelLoad() {
+    return backendCfg_.max_hdfs_partitions_parallel_load;
+  }
+
+  public int maxNonHdfsPartsParallelLoad() {
+    return backendCfg_.max_nonhdfs_partitions_parallel_load;
+  }
+
+  public double getMaxFilterErrorRate() { return backendCfg_.max_filter_error_rate; }
+
+  public long getMinBufferSize() { return backendCfg_.min_buffer_size; }
 
   // Inits the auth_to_local configuration in the static KerberosName class.
   private static void initAuthToLocal() {

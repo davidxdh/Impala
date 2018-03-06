@@ -18,15 +18,17 @@
 #include "exprs/math-functions.h"
 
 #include <iomanip>
+#include <random>
 #include <sstream>
 #include <math.h>
 
 #include "exprs/anyval-util.h"
-#include "exprs/expr.h"
+#include "exprs/scalar-expr.h"
 #include "exprs/operators.h"
 #include "util/string-parser.h"
 #include "runtime/runtime-state.h"
 #include "runtime/string-value.inline.h"
+#include "thirdparty/pcg-cpp-0.98/include/pcg_random.hpp"
 
 #include "common/names.h"
 
@@ -59,12 +61,25 @@ DoubleVal MathFunctions::E(FunctionContext* ctx) {
     return RET_TYPE(FN(v1.val, v2.val)); \
   }
 
-ONE_ARG_MATH_FN(Abs, BigIntVal, BigIntVal, llabs);
+// N.B. - for integer math, we have to promote ABS() to the next highest integer type
+// because in two's complement arithmetic, the largest negative value for any bit width
+// is not representable as a positive value within the same width.  For the largest width,
+// we simply overflow.  In the unlikely event a workaround is needed, one can simply
+// cast to a higher precision decimal type.
+BigIntVal MathFunctions::Abs(FunctionContext* ctx, const BigIntVal& v) {
+  if (v.is_null) return BigIntVal::null();
+  if (UNLIKELY(v.val == std::numeric_limits<BigIntVal::underlying_type_t>::min())) {
+      ctx->AddWarning("abs() overflowed, returning NULL");
+      return BigIntVal::null();
+  }
+  return BigIntVal(llabs(v.val));
+}
+
+ONE_ARG_MATH_FN(Abs, BigIntVal, IntVal, llabs);
+ONE_ARG_MATH_FN(Abs, IntVal, SmallIntVal, abs);
+ONE_ARG_MATH_FN(Abs, SmallIntVal, TinyIntVal, abs);
 ONE_ARG_MATH_FN(Abs, DoubleVal, DoubleVal, fabs);
 ONE_ARG_MATH_FN(Abs, FloatVal, FloatVal, fabs);
-ONE_ARG_MATH_FN(Abs, IntVal, IntVal, abs);
-ONE_ARG_MATH_FN(Abs, SmallIntVal, SmallIntVal, abs);
-ONE_ARG_MATH_FN(Abs, TinyIntVal, TinyIntVal, abs);
 ONE_ARG_MATH_FN(Sin, DoubleVal, DoubleVal, sin);
 ONE_ARG_MATH_FN(Asin, DoubleVal, DoubleVal, asin);
 ONE_ARG_MATH_FN(Cos, DoubleVal, DoubleVal, cos);
@@ -135,9 +150,7 @@ DoubleVal MathFunctions::Pow(FunctionContext* ctx, const DoubleVal& base,
 void MathFunctions::RandPrepare(
     FunctionContext* ctx, FunctionContext::FunctionStateScope scope) {
   if (scope == FunctionContext::THREAD_LOCAL) {
-    uint32_t* seed = ctx->Allocate<uint32_t>();
-    RETURN_IF_NULL(ctx, seed);
-    ctx->SetFunctionState(scope, seed);
+    uint32_t seed = 0;
     if (ctx->GetNumArgs() == 1) {
       // This is a call to RandSeed, initialize the seed
       // TODO: should we support non-constant seed?
@@ -147,26 +160,22 @@ void MathFunctions::RandPrepare(
       }
       DCHECK_EQ(ctx->GetArgType(0)->type, FunctionContext::TYPE_BIGINT);
       BigIntVal* seed_arg = static_cast<BigIntVal*>(ctx->GetConstantArg(0));
-      if (seed_arg->is_null) {
-        *seed = 0;
-      } else {
-        *seed = seed_arg->val;
-      }
-    } else {
-      // This is a call to Rand, initialize seed to 0
-      // TODO: can we change this behavior? This is stupid.
-      *seed = 0;
+      if (!seed_arg->is_null) seed = seed_arg->val;
     }
+    pcg32* generator = ctx->Allocate<pcg32>();
+    RETURN_IF_NULL(ctx, generator);
+    ctx->SetFunctionState(scope, generator);
+    new (generator) pcg32(seed);
   }
 }
 
 DoubleVal MathFunctions::Rand(FunctionContext* ctx) {
-  uint32_t* seed =
-      reinterpret_cast<uint32_t*>(ctx->GetFunctionState(FunctionContext::THREAD_LOCAL));
-  DCHECK(seed != NULL);
-  *seed = rand_r(seed);
-  // Normalize to [0,1].
-  return DoubleVal(static_cast<double>(*seed) / RAND_MAX);
+  pcg32* const generator =
+      reinterpret_cast<pcg32*>(ctx->GetFunctionState(FunctionContext::THREAD_LOCAL));
+  DCHECK(generator != nullptr);
+  static const double min = 0, max = 1;
+  std::uniform_real_distribution<double> distribution(min, max);
+  return DoubleVal(distribution(*generator));
 }
 
 DoubleVal MathFunctions::RandSeed(FunctionContext* ctx, const BigIntVal& seed) {
@@ -177,9 +186,10 @@ DoubleVal MathFunctions::RandSeed(FunctionContext* ctx, const BigIntVal& seed) {
 void MathFunctions::RandClose(FunctionContext* ctx,
     FunctionContext::FunctionStateScope scope) {
   if (scope == FunctionContext::THREAD_LOCAL) {
-    uint8_t* seed = reinterpret_cast<uint8_t*>(
+    uint8_t* generator = reinterpret_cast<uint8_t*>(
         ctx->GetFunctionState(FunctionContext::THREAD_LOCAL));
-    ctx->Free(seed);
+    ctx->Free(generator);
+    ctx->SetFunctionState(FunctionContext::THREAD_LOCAL, nullptr);
   }
 }
 

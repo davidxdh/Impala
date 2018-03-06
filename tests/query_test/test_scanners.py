@@ -32,7 +32,11 @@ from subprocess import check_call
 
 from testdata.common import widetable
 from tests.common.impala_test_suite import ImpalaTestSuite, LOG
-from tests.common.skip import SkipIfS3, SkipIfIsilon, SkipIfOldAggsJoins, SkipIfLocal
+from tests.common.skip import (
+    SkipIfS3,
+    SkipIfADLS,
+    SkipIfIsilon,
+    SkipIfLocal)
 from tests.common.test_dimensions import create_single_exec_option_dimension
 from tests.common.test_result_verifier import (
     parse_column_types,
@@ -67,6 +71,13 @@ class TestScannersAllTableFormats(ImpalaTestSuite):
     new_vector = deepcopy(vector)
     new_vector.get_value('exec_option')['batch_size'] = vector.get_value('batch_size')
     self.run_test_case('QueryTest/scanners', new_vector)
+
+  def test_hdfs_scanner_profile(self, vector):
+    if vector.get_value('table_format').file_format in ('kudu', 'hbase'):
+      pytest.skip()
+    new_vector = deepcopy(vector)
+    new_vector.get_value('exec_option')['num_nodes'] = 0
+    self.run_test_case('QueryTest/hdfs_scanner_profile', new_vector)
 
 # Test all the scanners with a simple limit clause. The limit clause triggers
 # cancellation in the scanner code paths.
@@ -115,7 +126,7 @@ class TestUnmatchedSchema(ImpalaTestSuite):
     cls.ImpalaTestMatrix.add_dimension(create_single_exec_option_dimension())
     # Avro has a more advanced schema evolution process which is covered in more depth
     # in the test_avro_schema_evolution test suite.
-    cls.ImpalaTestMatrix.add_constraint(\
+    cls.ImpalaTestMatrix.add_constraint(
         lambda v: v.get_value('table_format').file_format != 'avro')
 
   def _create_test_table(self, vector):
@@ -239,7 +250,6 @@ class TestParquet(ImpalaTestSuite):
   def test_parquet(self, vector):
     self.run_test_case('QueryTest/parquet', vector)
 
-  @SkipIfOldAggsJoins.nested_types
   def test_corrupt_files(self, vector):
     vector.get_value('exec_option')['abort_on_error'] = 0
     self.run_test_case('QueryTest/parquet-continue-on-error', vector)
@@ -288,6 +298,72 @@ class TestParquet(ImpalaTestSuite):
     vector.get_value('exec_option')['abort_on_error'] = 1
     self.run_test_case('QueryTest/parquet-zero-rows', vector, unique_database)
 
+  def test_repeated_root_schema(self, vector, unique_database):
+    """IMPALA-4826: Tests that running a scan on a schema where the root schema's
+       repetetion level is set to REPEATED succeeds without errors."""
+    self.client.execute("create table %s.repeated_root_schema (i int) "
+        "stored as parquet" % unique_database)
+    repeated_root_schema_loc = get_fs_path(
+        "/test-warehouse/%s.db/%s" % (unique_database, "repeated_root_schema"))
+    check_call(['hdfs', 'dfs', '-copyFromLocal',
+        os.environ['IMPALA_HOME'] + "/testdata/data/repeated_root_schema.parquet",
+        repeated_root_schema_loc])
+
+    result = self.client.execute("select * from %s.repeated_root_schema" % unique_database)
+    assert len(result.data) == 300
+
+  def test_huge_num_rows(self, vector, unique_database):
+    """IMPALA-5021: Tests that a zero-slot scan on a file with a huge num_rows in the
+    footer succeeds without errors."""
+    self.client.execute("create table %s.huge_num_rows (i int) stored as parquet"
+      % unique_database)
+    huge_num_rows_loc = get_fs_path(
+        "/test-warehouse/%s.db/%s" % (unique_database, "huge_num_rows"))
+    check_call(['hdfs', 'dfs', '-copyFromLocal',
+        os.environ['IMPALA_HOME'] + "/testdata/data/huge_num_rows.parquet",
+        huge_num_rows_loc])
+    result = self.client.execute("select count(*) from %s.huge_num_rows"
+      % unique_database)
+    assert len(result.data) == 1
+    assert "4294967294" in result.data
+
+  @SkipIfADLS.hive
+  @SkipIfIsilon.hive
+  @SkipIfLocal.hive
+  @SkipIfS3.hive
+  def test_multi_compression_types(self, vector, unique_database):
+    """IMPALA-5448: Tests that parquet splits with multi compression types are counted
+    correctly. Cases tested:
+    - parquet file with columns using the same compression type
+    - parquet files using snappy and gzip compression types
+    """
+    self.client.execute("create table %s.alltypes_multi_compression like"
+        " functional_parquet.alltypes" % unique_database)
+    hql_format = "set parquet.compression={codec};" \
+        "insert into table %s.alltypes_multi_compression" \
+        "  partition (year = {year}, month = {month})" \
+        "  select id, bool_col, tinyint_col, smallint_col, int_col, bigint_col," \
+        "    float_col, double_col,date_string_col,string_col,timestamp_col" \
+        "  from functional_parquet.alltypes" \
+        "  where year = {year} and month = {month}" % unique_database
+    check_call(['hive', '-e', hql_format.format(codec="snappy", year=2010, month=1)])
+    check_call(['hive', '-e', hql_format.format(codec="gzip", year=2010, month=2)])
+
+    self.client.execute("create table %s.multi_compression (a string, b string)"
+        " stored as parquet" % unique_database)
+    multi_compression_tbl_loc =\
+        get_fs_path("/test-warehouse/%s.db/%s" % (unique_database, "multi_compression"))
+    check_call(['hdfs', 'dfs', '-copyFromLocal', os.environ['IMPALA_HOME'] +
+        "/testdata/multi_compression_parquet_data/tinytable_0_gzip_snappy.parq",
+        multi_compression_tbl_loc])
+    check_call(['hdfs', 'dfs', '-copyFromLocal', os.environ['IMPALA_HOME'] +
+        "/testdata/multi_compression_parquet_data/tinytable_1_snappy_gzip.parq",
+        multi_compression_tbl_loc])
+
+    vector.get_value('exec_option')['num_nodes'] = 1
+    self.run_test_case('QueryTest/hdfs_parquet_scan_node_profile',
+                       vector, unique_database)
+
   def test_corrupt_rle_counts(self, vector, unique_database):
     """IMPALA-3646: Tests that a certain type of file corruption for plain
     dictionary encoded values is gracefully handled. Cases tested:
@@ -312,11 +388,37 @@ class TestParquet(ImpalaTestSuite):
     self.run_test_case('QueryTest/parquet-corrupt-rle-counts-abort',
                        vector, unique_database)
 
-  def test_filtering(self, vector):
-    """IMPALA-4624: Test that dictionary filtering eliminates row groups correctly."""
-    self.run_test_case('QueryTest/parquet-filtering', vector)
+  def test_bad_compressed_page_size(self, vector, unique_database):
+    """IMPALA-6353: Tests that a parquet dict page with 0 compressed_page_size is
+    gracefully handled. """
+    self.client.execute(
+        "create table %s.bad_compressed_dict_page_size (col string) stored as parquet"
+        % unique_database)
+    tbl_loc = get_fs_path("/test-warehouse/%s.db/%s" % (unique_database,
+        "bad_compressed_dict_page_size"))
+    check_call(['hdfs', 'dfs', '-copyFromLocal', os.environ['IMPALA_HOME'] +
+        "/testdata/data/bad_compressed_dict_page_size.parquet", tbl_loc])
+    self.run_test_case('QueryTest/parquet-bad-compressed-dict-page-size', vector,
+        unique_database)
+
+  def test_bitpacked_def_levels(self, vector, unique_database):
+    """Test that Impala can read a Parquet file with the deprecated bit-packed def
+       level encoding."""
+    self.client.execute(("""CREATE TABLE {0}.alltypesagg (
+          id INT, bool_col BOOLEAN, tinyint_col TINYINT, smallint_col SMALLINT,
+          int_col INT, bigint_col BIGINT, float_col FLOAT, double_col DOUBLE,
+          date_string_col STRING, string_col STRING, timestamp_col TIMESTAMP,
+          year INT, month INT, day INT) STORED AS PARQUET""").format(unique_database))
+    alltypesagg_loc = get_fs_path(
+        "/test-warehouse/{0}.db/{1}".format(unique_database, "alltypesagg"))
+    check_call(['hdfs', 'dfs', '-copyFromLocal', os.environ['IMPALA_HOME'] +
+        "/testdata/data/alltypes_agg_bitpacked_def_levels.parquet", alltypesagg_loc])
+    self.client.execute("refresh {0}.alltypesagg".format(unique_database));
+
+    self.run_test_case('QueryTest/parquet-def-levels', vector, unique_database)
 
   @SkipIfS3.hdfs_block_size
+  @SkipIfADLS.hdfs_block_size
   @SkipIfIsilon.hdfs_block_size
   @SkipIfLocal.multiple_impalad
   def test_misaligned_parquet_row_groups(self, vector):
@@ -372,6 +474,7 @@ class TestParquet(ImpalaTestSuite):
     assert total == num_scanners_with_no_reads
 
   @SkipIfS3.hdfs_block_size
+  @SkipIfADLS.hdfs_block_size
   @SkipIfIsilon.hdfs_block_size
   @SkipIfLocal.multiple_impalad
   def test_multiple_blocks(self, vector):
@@ -385,6 +488,7 @@ class TestParquet(ImpalaTestSuite):
     self._multiple_blocks_helper(table_name, 40000, ranges_per_node=2)
 
   @SkipIfS3.hdfs_block_size
+  @SkipIfADLS.hdfs_block_size
   @SkipIfIsilon.hdfs_block_size
   @SkipIfLocal.multiple_impalad
   def test_multiple_blocks_one_row_group(self, vector):
@@ -510,10 +614,27 @@ class TestParquet(ImpalaTestSuite):
     assert c_schema_elt.converted_type == ConvertedType.UTF8
     assert d_schema_elt.converted_type == None
 
-  @SkipIfOldAggsJoins.nested_types
   def test_resolution_by_name(self, vector, unique_database):
     self.run_test_case('QueryTest/parquet-resolution-by-name', vector,
                        use_db=unique_database)
+
+  def test_decimal_encodings(self, vector, unique_database):
+    # Create a table using an existing data file with dictionary-encoded, variable-length
+    # physical encodings for decimals.
+    TABLE_NAME = "decimal_encodings"
+    self.client.execute('''create table if not exists %s.%s
+    (small_dec decimal(9,2), med_dec decimal(18,2), large_dec decimal(38,2))
+    STORED AS PARQUET''' % (unique_database, TABLE_NAME))
+
+    table_loc = get_fs_path(
+      "/test-warehouse/%s.db/%s" % (unique_database, TABLE_NAME))
+    for file_name in ["binary_decimal_dictionary.parquet",
+                      "binary_decimal_no_dictionary.parquet"]:
+      data_file_path = os.path.join(os.environ['IMPALA_HOME'],
+                                    "testdata/data/", file_name)
+      check_call(['hdfs', 'dfs', '-copyFromLocal', data_file_path, table_loc])
+
+    self.run_test_case('QueryTest/parquet-decimal-formats', vector, unique_database)
 
 # We use various scan range lengths to exercise corner cases in the HDFS scanner more
 # thoroughly. In particular, it will exercise:
@@ -556,8 +677,8 @@ class TestTextScanRangeLengths(ImpalaTestSuite):
     super(TestTextScanRangeLengths, cls).add_test_dimensions()
     cls.ImpalaTestMatrix.add_dimension(
         ImpalaTestDimension('max_scan_range_length', *MAX_SCAN_RANGE_LENGTHS))
-    cls.ImpalaTestMatrix.add_constraint(lambda v:\
-        v.get_value('table_format').file_format == 'text' and\
+    cls.ImpalaTestMatrix.add_constraint(lambda v:
+        v.get_value('table_format').file_format == 'text' and
         v.get_value('table_format').compression_codec == 'none')
 
   def test_text_scanner(self, vector):
@@ -587,8 +708,8 @@ class TestTextSplitDelimiters(ImpalaTestSuite):
   @classmethod
   def add_test_dimensions(cls):
     super(TestTextSplitDelimiters, cls).add_test_dimensions()
-    cls.ImpalaTestMatrix.add_constraint(lambda v:\
-        v.get_value('table_format').file_format == 'text' and\
+    cls.ImpalaTestMatrix.add_constraint(lambda v:
+        v.get_value('table_format').file_format == 'text' and
         v.get_value('table_format').compression_codec == 'none')
 
   def test_text_split_delimiters(self, vector, unique_database):
@@ -664,15 +785,18 @@ class TestTextScanRangeLengths(ImpalaTestSuite):
   @classmethod
   def add_test_dimensions(cls):
     super(TestTextScanRangeLengths, cls).add_test_dimensions()
-    cls.ImpalaTestMatrix.add_constraint(
-      lambda v: v.get_value('table_format').file_format == 'text')
+    cls.ImpalaTestMatrix.add_constraint(lambda v:
+        v.get_value('table_format').file_format == 'text' and
+        v.get_value('table_format').compression_codec in ['none', 'gzip'])
 
   def test_text_scanner_with_header(self, vector, unique_database):
-    self.run_test_case('QueryTest/hdfs-text-scan-with-header', vector, unique_database)
+    self.run_test_case('QueryTest/hdfs-text-scan-with-header', vector,
+                       test_file_vars={'$UNIQUE_DB': unique_database})
 
 
 # Missing Coverage: No coverage for truncated files errors or scans.
 @SkipIfS3.hive
+@SkipIfADLS.hive
 @SkipIfIsilon.hive
 @SkipIfLocal.hive
 class TestScanTruncatedFiles(ImpalaTestSuite):
@@ -690,8 +814,8 @@ class TestScanTruncatedFiles(ImpalaTestSuite):
     # strategy.
     # TODO: Test other file formats
     if cls.exploration_strategy() == 'exhaustive':
-      cls.ImpalaTestMatrix.add_constraint(lambda v:\
-          v.get_value('table_format').file_format == 'text' and\
+      cls.ImpalaTestMatrix.add_constraint(lambda v:
+          v.get_value('table_format').file_format == 'text' and
           v.get_value('table_format').compression_codec == 'none')
     else:
       cls.ImpalaTestMatrix.add_constraint(lambda v: False)

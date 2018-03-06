@@ -121,9 +121,6 @@ public class AnalyticPlanner {
             i == 0 ? partitionGroup.partitionByExprs : null);
       }
     }
-
-    // create equiv classes for newly added slots
-    analyzer_.createIdentityEquivClasses();
     return root;
   }
 
@@ -197,8 +194,7 @@ public class AnalyticPlanner {
     for (PartitionGroup pg: partitionGroups) {
       List<Expr> l1 = Lists.newArrayList();
       List<Expr> l2 = Lists.newArrayList();
-      Expr.intersect(analyzer_, pg.partitionByExprs, groupingExprs,
-          analyzer_.getEquivClassSmap(), l1, l2);
+      analyzer_.exprIntersect(pg.partitionByExprs, groupingExprs, l1, l2);
       // TODO: also look at l2 and take the max?
       long ndv = Expr.getNumDistinctValues(l1);
       if (ndv < 0 || ndv < numNodes || ndv < maxNdv) continue;
@@ -288,28 +284,25 @@ public class AnalyticPlanner {
     // by a SlotRef into the sort's tuple in ancestor nodes (IMPALA-1519).
     ExprSubstitutionMap inputSmap = input.getOutputSmap();
     if (inputSmap != null) {
-      List<Expr> tupleIsNullPredsToMaterialize = Lists.newArrayList();
+      List<Expr> relevantRhsExprs = Lists.newArrayList();
       for (int i = 0; i < inputSmap.size(); ++i) {
         Expr rhsExpr = inputSmap.getRhs().get(i);
         // Ignore substitutions that are irrelevant at this plan node and its ancestors.
-        if (!rhsExpr.isBoundByTupleIds(input.getTupleIds())) continue;
-        rhsExpr.collect(TupleIsNullPredicate.class, tupleIsNullPredsToMaterialize);
+        if (rhsExpr.isBoundByTupleIds(input.getTupleIds())) {
+          relevantRhsExprs.add(rhsExpr);
+        }
       }
-      Expr.removeDuplicates(tupleIsNullPredsToMaterialize);
 
-      // Materialize relevant unique TupleIsNullPredicates.
-      for (Expr tupleIsNullPred: tupleIsNullPredsToMaterialize) {
-        SlotDescriptor sortSlotDesc = analyzer_.addSlotDescriptor(sortTupleDesc);
-        sortSlotDesc.setType(tupleIsNullPred.getType());
-        sortSlotDesc.setIsMaterialized(true);
-        sortSlotDesc.setSourceExpr(tupleIsNullPred);
-        sortSlotDesc.setLabel(tupleIsNullPred.toSql());
-        sortSlotExprs.add(tupleIsNullPred.clone());
-      }
+      SortInfo.materializeTupleIsNullPredicates(sortTupleDesc, relevantRhsExprs,
+          sortSlotExprs, sortSmap, analyzer_);
     }
 
-    SortInfo sortInfo = new SortInfo(
-        Expr.substituteList(sortExprs, sortSmap, analyzer_, false), isAsc, nullsFirst);
+    SortInfo sortInfo = new SortInfo(sortExprs, isAsc, nullsFirst);
+    ExprSubstitutionMap smap =
+        sortInfo.createMaterializedOrderExprs(sortTupleDesc, analyzer_);
+    sortSlotExprs.addAll(smap.getLhs());
+    sortSmap = ExprSubstitutionMap.combine(sortSmap, smap);
+    sortInfo.substituteOrderingExprs(sortSmap, analyzer_);
     if (LOG.isTraceEnabled()) {
       LOG.trace("sortinfo exprs: " + Expr.debugString(sortInfo.getOrderingExprs()));
     }
@@ -346,13 +339,18 @@ public class AnalyticPlanner {
 
       // then sort on orderByExprs
       for (OrderByElement orderByElement: sortGroup.orderByElements) {
-        sortExprs.add(orderByElement.getExpr());
-        isAsc.add(orderByElement.isAsc());
-        nullsFirst.add(orderByElement.getNullsFirstParam());
+        // If the expr is in the PARTITION BY and already in 'sortExprs', but also in
+        // the ORDER BY, its unnecessary to add it to 'sortExprs' again.
+        if (!sortExprs.contains(orderByElement.getExpr())) {
+          sortExprs.add(orderByElement.getExpr());
+          isAsc.add(orderByElement.isAsc());
+          nullsFirst.add(orderByElement.getNullsFirstParam());
+        }
       }
 
       SortInfo sortInfo = createSortInfo(root, sortExprs, isAsc, nullsFirst);
-      SortNode sortNode = new SortNode(ctx_.getNextNodeId(), root, sortInfo, false, 0);
+      SortNode sortNode =
+          SortNode.createTotalSortNode(ctx_.getNextNodeId(), root, sortInfo, 0);
 
       // if this sort group does not have partitioning exprs, we want the sort
       // to be executed like a regular distributed sort

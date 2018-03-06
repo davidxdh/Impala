@@ -33,9 +33,9 @@
 #include "gen-cpp/Types_types.h" // for TNetworkAddress
 #include "rapidjson/document.h"
 #include "rpc/thrift-util.h"
-#include "scheduling/admission-controller.h"
 #include "scheduling/backend-config.h"
 #include "scheduling/query-schedule.h"
+#include "scheduling/request-pool-service.h"
 #include "statestore/statestore-subscriber.h"
 #include "util/metrics.h"
 #include "util/network-util.h"
@@ -48,12 +48,12 @@ namespace test {
 class SchedulerWrapper;
 }
 
-/// Performs simple scheduling by matching between a list of backends configured
+/// Performs simple scheduling by matching between a list of executor backends configured
 /// either from the statestore, or from a static list of addresses, and a list
-/// of target data locations. The current set of backends is stored in backend_config_.
-/// When receiving changes to the backend configuration from the statestore we will make a
-/// copy of this configuration, apply the updates to the copy and atomically swap the
-/// contents of the backend_config_ pointer.
+/// of target data locations. The current set of executors is stored in executors_config_.
+/// When receiving changes to the executor configuration from the statestore we will make
+/// a copy of this configuration, apply the updates to the copy and atomically swap the
+/// contents of the executors_config_ pointer.
 ///
 /// TODO: Notice when there are duplicate statestore registrations (IMPALA-23)
 /// TODO: Track assignments (assignment_ctx in ComputeScanRangeAssignment) per query
@@ -65,68 +65,58 @@ class SchedulerWrapper;
 /// TODO: Inject global dependencies into the class (for example ExecEnv::GetInstance(),
 ///       RNG used during scheduling, FLAGS_*)
 ///       to make it testable.
-/// TODO: Benchmark the performance of the scheduler. The tests need to include setups
-///       with:
-///         - Small and large number of backends.
-///         - Small and large query plans.
+/// TODO: Extend the benchmarks of the scheduler. The tests need to include setups with:
 ///         - Scheduling query plans with concurrent updates to the internal backend
 ///           configuration.
 class Scheduler {
  public:
-  static const std::string IMPALA_MEMBERSHIP_TOPIC;
-
   /// List of server descriptors.
   typedef std::vector<TBackendDescriptor> BackendList;
 
   /// Initialize with a subscription manager that we can register with for updates to the
   /// set of available backends.
   ///  - backend_id - unique identifier for this Impala backend (usually a host:port)
-  ///  - backend_address - the address that this backend listens on
   Scheduler(StatestoreSubscriber* subscriber, const std::string& backend_id,
-      const TNetworkAddress& backend_address, MetricGroup* metrics, Webserver* webserver,
+      MetricGroup* metrics, Webserver* webserver,
       RequestPoolService* request_pool_service);
 
-  /// Initialize with a list of <host:port> pairs in 'static' mode - i.e. the set of
-  /// backends is fixed and will not be updated.
-  Scheduler(const std::vector<TNetworkAddress>& backends, MetricGroup* metrics,
-      Webserver* webserver, RequestPoolService* request_pool_service);
-
-  /// Initialises the scheduler, acquiring all resources needed to make scheduling
+  /// Initializes the scheduler, acquiring all resources needed to make scheduling
   /// decisions once this method returns. Register with the subscription manager if
-  /// required.
-  impala::Status Init();
+  /// required. Also initializes the local backend descriptor. Returns error status
+  /// on failure. 'backend_address' is the address of thrift based ImpalaInternalService
+  /// of this backend. If FLAGS_use_krpc is true, 'krpc_address' contains IP-address:port
+  /// on which KRPC based ImpalaInternalService is exported. 'ip' is the resolved
+  /// IP address of this backend.
+  Status Init(const TNetworkAddress& backend_address,
+      const TNetworkAddress& krpc_address, const IpAddr& ip);
 
   /// Populates given query schedule and assigns fragments to hosts based on scan
-  /// ranges in the query exec request. Submits schedule to admission control before
-  /// returning.
+  /// ranges in the query exec request.
   Status Schedule(QuerySchedule* schedule);
 
-  /// Releases the reserved resources (if any) from the given schedule.
-  Status Release(QuerySchedule* schedule);
-
  private:
-  /// Map from a host's IP address to the next backend to be round-robin scheduled for
-  /// that host (needed for setups with multiple backends on a single host)
+  /// Map from a host's IP address to the next executor to be round-robin scheduled for
+  /// that host (needed for setups with multiple executors on a single host)
   typedef boost::unordered_map<IpAddr, BackendConfig::BackendList::const_iterator>
-      NextBackendPerHost;
+      NextExecutorPerHost;
 
-  typedef std::shared_ptr<const BackendConfig> BackendConfigPtr;
+  typedef std::shared_ptr<const BackendConfig> ExecutorsConfigPtr;
 
-  /// Internal structure to track scan range assignments for a backend host. This struct
+  /// Internal structure to track scan range assignments for an executor host. This struct
   /// is used as the heap element in and maintained by AddressableAssignmentHeap.
-  struct BackendAssignmentInfo {
-    /// The number of bytes assigned to a backend host.
+  struct ExecutorAssignmentInfo {
+    /// The number of bytes assigned to an executor.
     int64_t assigned_bytes;
 
     /// Each host gets assigned a random rank to break ties in a random but deterministic
     /// order per plan node.
     const int random_rank;
 
-    /// IP address of the backend.
+    /// IP address of the executor.
     IpAddr ip;
 
     /// Compare two elements of this struct. The key is (assigned_bytes, random_rank).
-    bool operator>(const BackendAssignmentInfo& rhs) const {
+    bool operator>(const ExecutorAssignmentInfo& rhs) const {
       if (assigned_bytes != rhs.assigned_bytes) {
         return assigned_bytes > rhs.assigned_bytes;
       }
@@ -135,87 +125,87 @@ class Scheduler {
   };
 
   /// Heap to compute candidates for scan range assignments. Elements are of type
-  /// BackendAssignmentInfo and track assignment information for each backend. By default
-  /// boost implements a max-heap so we use std::greater<T> to obtain a min-heap. This
-  /// will make the top() element of the heap be the backend with the lowest number of
-  /// assigned bytes and the lowest random rank.
-  typedef boost::heap::binomial_heap<BackendAssignmentInfo,
-      boost::heap::compare<std::greater<BackendAssignmentInfo>>>
+  /// ExecutorAssignmentInfo and track assignment information for each executor. By
+  /// default boost implements a max-heap so we use std::greater<T> to obtain a min-heap.
+  /// This will make the top() element of the heap be the executor with the lowest number
+  /// of assigned bytes and the lowest random rank.
+  typedef boost::heap::binomial_heap<ExecutorAssignmentInfo,
+      boost::heap::compare<std::greater<ExecutorAssignmentInfo>>>
       AssignmentHeap;
 
   /// Map to look up handles to heap elements to modify heap element keys.
-  typedef boost::unordered_map<IpAddr, AssignmentHeap::handle_type> BackendHandleMap;
+  typedef boost::unordered_map<IpAddr, AssignmentHeap::handle_type> ExecutorHandleMap;
 
-  /// Class to store backend information in an addressable heap. In addition to
+  /// Class to store executor information in an addressable heap. In addition to
   /// AssignmentHeap it can be used to look up heap elements by their IP address and
   /// update their key. For each plan node we create a new heap, so they are not shared
   /// between concurrent invocations of the scheduler.
   class AddressableAssignmentHeap {
    public:
-    const AssignmentHeap& backend_heap() const { return backend_heap_; }
-    const BackendHandleMap& backend_handles() const { return backend_handles_; }
+    const AssignmentHeap& executor_heap() const { return executor_heap_; }
+    const ExecutorHandleMap& executor_handles() const { return executor_handles_; }
 
     void InsertOrUpdate(const IpAddr& ip, int64_t assigned_bytes, int rank);
 
     // Forward interface for boost::heap
-    decltype(auto) size() const { return backend_heap_.size(); }
-    decltype(auto) top() const { return backend_heap_.top(); }
+    decltype(auto) size() const { return executor_heap_.size(); }
+    decltype(auto) top() const { return executor_heap_.top(); }
 
     // Forward interface for boost::unordered_map
-    decltype(auto) find(const IpAddr& ip) const { return backend_handles_.find(ip); }
-    decltype(auto) end() const { return backend_handles_.end(); }
+    decltype(auto) find(const IpAddr& ip) const { return executor_handles_.find(ip); }
+    decltype(auto) end() const { return executor_handles_.end(); }
 
    private:
-    // Heap to determine next backend.
-    AssignmentHeap backend_heap_;
-    // Maps backend IPs to handles in the heap.
-    BackendHandleMap backend_handles_;
+    // Heap to determine next executor.
+    AssignmentHeap executor_heap_;
+    // Maps executor IPs to handles in the heap.
+    ExecutorHandleMap executor_handles_;
   };
 
   /// Class to store context information on assignments during scheduling. It is
-  /// initialized with a copy of the global backend information and assigns a random rank
-  /// to each backend to break ties in cases where multiple backends have been assigned
-  /// the same number or bytes. It tracks the number of assigned bytes, which backends
+  /// initialized with a copy of the global executor information and assigns a random rank
+  /// to each executor to break ties in cases where multiple executors have been assigned
+  /// the same number or bytes. It tracks the number of assigned bytes, which executors
   /// have already been used, etc. Objects of this class are created in
   /// ComputeScanRangeAssignment() and thus don't need to be thread safe.
   class AssignmentCtx {
    public:
-    AssignmentCtx(const BackendConfig& backend_config, IntCounter* total_assignments,
+    AssignmentCtx(const BackendConfig& executor_config, IntCounter* total_assignments,
         IntCounter* total_local_assignments);
 
     /// Among hosts in 'data_locations', select the one with the minimum number of
-    /// assigned bytes. If backends have been assigned equal amounts of work and
-    /// 'break_ties_by_rank' is true, then the backend rank is used to break ties.
-    /// Otherwise the first backend according to their order in 'data_locations' is
+    /// assigned bytes. If executors have been assigned equal amounts of work and
+    /// 'break_ties_by_rank' is true, then the executor rank is used to break ties.
+    /// Otherwise the first executor according to their order in 'data_locations' is
     /// selected.
-    const IpAddr* SelectLocalBackendHost(
+    const IpAddr* SelectLocalExecutor(
         const std::vector<IpAddr>& data_locations, bool break_ties_by_rank);
 
-    /// Select a backend host for a remote read. If there are unused backend hosts, then
+    /// Select an executor for a remote read. If there are unused executor hosts, then
     /// those will be preferred. Otherwise the one with the lowest number of assigned
-    /// bytes is picked. If backends have been assigned equal amounts of work, then the
-    /// backend rank is used to break ties.
-    const IpAddr* SelectRemoteBackendHost();
+    /// bytes is picked. If executors have been assigned equal amounts of work, then the
+    /// executor rank is used to break ties.
+    const IpAddr* SelectRemoteExecutor();
 
-    /// Return the next backend that has not been assigned to. This assumes that a
-    /// returned backend will also be assigned to. The caller must make sure that
-    /// HasUnusedBackends() is true.
-    const IpAddr* GetNextUnusedBackendAndIncrement();
+    /// Return the next executor that has not been assigned to. This assumes that a
+    /// returned executor will also be assigned to. The caller must make sure that
+    /// HasUnusedExecutors() is true.
+    const IpAddr* GetNextUnusedExecutorAndIncrement();
 
-    /// Pick a backend in round-robin fashion from multiple backends on a single host.
-    void SelectBackendOnHost(const IpAddr& backend_ip, TBackendDescriptor* backend);
+    /// Pick an executor in round-robin fashion from multiple executors on a single host.
+    void SelectExecutorOnHost(const IpAddr& executor_ip, TBackendDescriptor* executor);
 
     /// Build a new TScanRangeParams object and append it to the assignment list for the
-    /// tuple (backend, node_id) in 'assignment'. Also, update assignment_heap_ and
+    /// tuple (executor, node_id) in 'assignment'. Also, update assignment_heap_ and
     /// assignment_byte_counters_, increase the counters 'total_assignments_' and
     /// 'total_local_assignments_'. 'scan_range_locations' contains information about the
     /// scan range and its replica locations.
-    void RecordScanRangeAssignment(const TBackendDescriptor& backend, PlanNodeId node_id,
+    void RecordScanRangeAssignment(const TBackendDescriptor& executor, PlanNodeId node_id,
         const vector<TNetworkAddress>& host_list,
         const TScanRangeLocationList& scan_range_locations,
         FragmentScanRangeAssignment* assignment);
 
-    const BackendConfig& backend_config() const { return backend_config_; }
+    const BackendConfig& executor_config() const { return executors_config_; }
 
     /// Print the assignment and statistics to VLOG_FILE.
     void PrintAssignment(const FragmentScanRangeAssignment& assignment);
@@ -228,26 +218,26 @@ class Scheduler {
       int64_t cached_bytes = 0;
     };
 
-    /// Used to look up hostnames to IP addresses and IP addresses to backend.
-    const BackendConfig& backend_config_;
+    /// Used to look up hostnames to IP addresses and IP addresses to executors.
+    const BackendConfig& executors_config_;
 
-    // Addressable heap to select remote backends from. Elements are ordered by the number
-    // of already assigned bytes (and a random rank to break ties).
+    // Addressable heap to select remote executors from. Elements are ordered by the
+    // number of already assigned bytes (and a random rank to break ties).
     AddressableAssignmentHeap assignment_heap_;
 
-    /// Store a random rank per backend host to break ties between otherwise equivalent
+    /// Store a random rank per executor host to break ties between otherwise equivalent
     /// replicas (e.g., those having the same number of assigned bytes).
-    boost::unordered_map<IpAddr, int> random_backend_rank_;
+    boost::unordered_map<IpAddr, int> random_executor_rank_;
 
-    // Index into random_backend_order. It points to the first unused backend and is used
-    // to select unused backends and inserting them into the assignment_heap_.
-    int first_unused_backend_idx_;
+    /// Index into random_executor_order. It points to the first unused executor and is
+    /// used to select unused executors and inserting them into the assignment_heap_.
+    int first_unused_executor_idx_;
 
-    /// Store a random permutation of backend hosts to select backends from.
-    std::vector<IpAddr> random_backend_order_;
+    /// Store a random permutation of executor hosts to select executors from.
+    std::vector<IpAddr> random_executor_order_;
 
-    /// Track round robin information per backend host.
-    NextBackendPerHost next_backend_per_host_;
+    /// Track round robin information per executor host.
+    NextExecutorPerHost next_executor_per_host_;
 
     /// Track number of assigned bytes that have been read from cache, locally, or
     /// remotely.
@@ -257,39 +247,40 @@ class Scheduler {
     IntCounter* total_assignments_;
     IntCounter* total_local_assignments_;
 
-    /// Return whether there are backends that have not been assigned a scan range.
-    bool HasUnusedBackends() const;
+    /// Return whether there are executors that have not been assigned a scan range.
+    bool HasUnusedExecutors() const;
 
-    /// Return the rank of a backend.
-    int GetBackendRank(const IpAddr& ip) const;
+    /// Return the rank of an executor.
+    int GetExecutorRank(const IpAddr& ip) const;
   };
 
-  /// The scheduler's backend configuration. When receiving changes to the backend
+  /// The scheduler's executors configuration. When receiving changes to the executors
   /// configuration from the statestore we will make a copy of the stored object, apply
   /// the updates to the copy and atomically swap the contents of this pointer. Each plan
-  /// node creates a read-only copy of the scheduler's current backend_config_ to use
+  /// node creates a read-only copy of the scheduler's current executors_config_ to use
   /// during scheduling.
-  BackendConfigPtr backend_config_;
+  ExecutorsConfigPtr executors_config_;
 
   /// A backend configuration which only contains the local backend. It is used when
   /// scheduling on the coordinator.
   BackendConfig coord_only_backend_config_;
 
-  /// Protect access to backend_config_ which might otherwise be updated asynchronously
+  /// Protect access to executors_config_ which might otherwise be updated asynchronously
   /// with respect to reads.
-  mutable boost::mutex backend_config_lock_;
+  mutable boost::mutex executors_config_lock_;
 
-  /// Total number of scan ranges assigned to backends during the lifetime of the
+  /// Total number of scan ranges assigned to executors during the lifetime of the
   /// scheduler.
   int64_t num_assignments_;
 
-  /// Map from unique backend id to TBackendDescriptor. Used to track the known backends
-  /// from the statestore. It's important to track both the backend ID as well as the
-  /// TBackendDescriptor so we know what is being removed in a given update.
-  /// Locking of this map is not needed since it should only be read/modified from
-  /// within the UpdateMembership() function.
+  /// Map from unique backend ID to TBackendDescriptor. The
+  /// {backend ID, TBackendDescriptor} pairs represent the IMPALA_MEMBERSHIP_TOPIC
+  /// {key, value} pairs of known executors retrieved from the statestore. It's important
+  /// to track both the backend ID as well as the TBackendDescriptor so we know what is
+  /// being removed in a given update. Locking of this map is not needed since it should
+  /// only be read/modified from within the UpdateMembership() function.
   typedef boost::unordered_map<std::string, TBackendDescriptor> BackendIdMap;
-  BackendIdMap current_membership_;
+  BackendIdMap current_executors_;
 
   /// MetricGroup subsystem access
   MetricGroup* metrics_;
@@ -311,38 +302,33 @@ class Scheduler {
   ThriftSerializer thrift_serializer_;
 
   /// Locality metrics
-  IntCounter* total_assignments_;
-  IntCounter* total_local_assignments_;
+  IntCounter* total_assignments_ = nullptr;
+  IntCounter* total_local_assignments_ = nullptr;
 
   /// Initialization metric
-  BooleanProperty* initialized_;
+  BooleanProperty* initialized_ = nullptr;
 
-  /// Current number of backends
-  IntGauge* num_fragment_instances_metric_;
+  /// Current number of executors
+  IntGauge* num_fragment_instances_metric_ = nullptr;
 
   /// Used for user-to-pool resolution and looking up pool configurations. Not owned by
   /// us.
   RequestPoolService* request_pool_service_;
 
-  /// Used to make admission decisions in 'Schedule()'
-  boost::scoped_ptr<AdmissionController> admission_controller_;
+  /// Helper methods to access executors_config_ (the shared_ptr, not its contents),
+  /// protecting the access with executors_config_lock_.
+  ExecutorsConfigPtr GetExecutorsConfig() const;
+  void SetExecutorsConfig(const ExecutorsConfigPtr& executors_config);
 
-  /// Helper methods to access backend_config_ (the shared_ptr, not its contents),
-  /// protecting the access with backend_config_lock_.
-  BackendConfigPtr GetBackendConfig() const;
-  void SetBackendConfig(const BackendConfigPtr& backend_config);
+  /// Returns the backend descriptor corresponding to 'host' which could be a remote
+  /// backend or the local host itself. The returned descriptor should not be retained
+  /// beyond the lifetime of 'executor_config'.
+  const TBackendDescriptor& LookUpBackendDesc(
+      const BackendConfig& executor_config, const TNetworkAddress& host);
 
   /// Called asynchronously when an update is received from the subscription manager
   void UpdateMembership(const StatestoreSubscriber::TopicDeltaMap& incoming_topic_deltas,
       std::vector<TTopicDelta>* subscriber_topic_updates);
-
-  /// Webserver callback that produces a list of known backends.
-  /// Example output:
-  /// "backends": [
-  ///     "henry-metrics-pkg-cdh5.ent.cloudera.com:22000"
-  ///              ],
-  void BackendsUrlCallback(
-      const Webserver::ArgumentMap& args, rapidjson::Document* document);
 
   /// Determine the pool for a user and query options via request_pool_service_.
   Status GetRequestPool(const std::string& user, const TQueryOptions& query_options,
@@ -352,7 +338,10 @@ class Scheduler {
   /// the schedule's TQueryExecRequest.plan_exec_info.
   /// Unpartitioned fragments are assigned to the coordinator. Populate the schedule's
   /// fragment_exec_params_ with the resulting scan range assignment.
-  Status ComputeScanRangeAssignment(QuerySchedule* schedule);
+  /// We have a benchmark for this method in be/src/benchmarks/scheduler-benchmark.cc.
+  /// 'executor_config' is the executor configuration to use for scheduling.
+  Status ComputeScanRangeAssignment(const BackendConfig& executor_config,
+      QuerySchedule* schedule);
 
   /// Process the list of scan ranges of a single plan node and compute scan range
   /// assignments (returned in 'assignment'). The result is a mapping from hosts to their
@@ -362,18 +351,19 @@ class Scheduler {
   /// Otherwise the assignment is computed for each scan range as follows:
   ///
   /// Scan ranges refer to data, which is usually replicated on multiple hosts. All scan
-  /// ranges where one of the replica hosts also runs an impala backend are processed
-  /// first. If more than one of the replicas run an impala backend, then the 'memory
-  /// distance' of each backend is considered. The concept of memory distance reflects the
-  /// cost of moving data into the processing backend's main memory. Reading from cached
-  /// replicas is generally considered less costly than reading from a local disk, which
-  /// in turn is cheaper than reading data from a remote node. If multiple backends of the
-  /// same memory distance are found, then the one with the least amount of previously
-  /// assigned work is picked, thus aiming to distribute the work as evenly as possible.
+  /// ranges where one of the replica hosts also runs an impala executor are processed
+  /// first. If more than one of the replicas run an impala executor, then the 'memory
+  /// distance' of each executor is considered. The concept of memory distance reflects
+  /// the cost of moving data into the processing executor's main memory. Reading from
+  /// cached replicas is generally considered less costly than reading from a local disk,
+  /// which in turn is cheaper than reading data from a remote node. If multiple executors
+  /// of the same memory distance are found, then the one with the least amount of
+  /// previously assigned work is picked, thus aiming to distribute the work as evenly as
+  /// possible.
   ///
-  /// Finally, scan ranges are considered which do not have an impalad backend running on
+  /// Finally, scan ranges are considered which do not have an impalad executor running on
   /// any of their data nodes. They will be load-balanced by assigned bytes across all
-  /// backends
+  /// executors.
   ///
   /// The resulting assignment is influenced by the following query options:
   ///
@@ -390,9 +380,9 @@ class Scheduler {
   ///   false.
   ///
   /// schedule_random_replica:
-  ///   When equivalent backends with a memory distance of DISK_LOCAL are found for a scan
-  ///   range (same memory distance, same amount of assigned work), then the first one
-  ///   will be picked deterministically. This aims to make better use of OS buffer
+  ///   When equivalent executors with a memory distance of DISK_LOCAL are found for a
+  ///   scan range (same memory distance, same amount of assigned work), then the first
+  ///   one will be picked deterministically. This aims to make better use of OS buffer
   ///   caches, but can lead to performance bottlenecks on individual hosts. Setting this
   ///   option to true will randomly change the order in which equivalent replicas are
   ///   picked for different plan nodes. This helps to compute a more even assignment,
@@ -402,28 +392,34 @@ class Scheduler {
   ///
   /// The method takes the following parameters:
   ///
-  /// backend_config:          Backend configuration to use for scheduling.
+  /// executor_config:         Executor configuration to use for scheduling.
   /// node_id:                 ID of the plan node.
   /// node_replica_preference: Query hint equivalent to replica_preference.
   /// node_random_replica:     Query hint equivalent to schedule_random_replica.
-  /// locations:               List of scan ranges to be assigned to backends.
+  /// locations:               List of scan ranges to be assigned to executors.
   /// host_list:               List of hosts, into which 'locations' will index.
   /// exec_at_coord:           Whether to schedule all scan ranges on the coordinator.
   /// query_options:           Query options for the current query.
   /// timer:                   Tracks execution time of ComputeScanRangeAssignment.
   /// assignment:              Output parameter, to which new assignments will be added.
-  Status ComputeScanRangeAssignment(const BackendConfig& backend_config,
+  Status ComputeScanRangeAssignment(const BackendConfig& executor_config,
       PlanNodeId node_id, const TReplicaPreference::type* node_replica_preference,
       bool node_random_replica, const std::vector<TScanRangeLocationList>& locations,
       const std::vector<TNetworkAddress>& host_list, bool exec_at_coord,
       const TQueryOptions& query_options, RuntimeProfile::Counter* timer,
       FragmentScanRangeAssignment* assignment);
 
+  /// Computes BackendExecParams for all backends assigned in the query. Must be called
+  /// after ComputeFragmentExecParams().
+  void ComputeBackendExecParams(QuerySchedule* schedule);
+
   /// Compute the FragmentExecParams for all plans in the schedule's
   /// TQueryExecRequest.plan_exec_info.
   /// This includes the routing information (destinations, per_exch_num_senders,
   /// sender_id)
-  void ComputeFragmentExecParams(QuerySchedule* schedule);
+  /// 'executor_config' is the executor configuration to use for scheduling.
+  void ComputeFragmentExecParams(const BackendConfig& executor_config,
+      QuerySchedule* schedule);
 
   /// Recursively create FInstanceExecParams and set per_node_scan_ranges for
   /// fragment_params and its input fragments via a depth-first traversal.

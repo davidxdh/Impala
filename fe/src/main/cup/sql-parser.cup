@@ -24,6 +24,7 @@ import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java_cup.runtime.Symbol;
@@ -33,6 +34,7 @@ import org.apache.impala.analysis.ColumnDef.Option;
 import org.apache.impala.analysis.UnionStmt.Qualifier;
 import org.apache.impala.analysis.UnionStmt.UnionOperand;
 import org.apache.impala.analysis.RangePartition;
+import org.apache.impala.analysis.TableSampleClause;
 import org.apache.impala.analysis.AlterTableAddDropRangePartitionStmt.Operation;
 import org.apache.impala.catalog.ArrayType;
 import org.apache.impala.catalog.MapType;
@@ -213,6 +215,9 @@ parser code {:
       SqlScanner.tokenIdMap.get(Integer.valueOf(errorToken_.sym));
     if (lastToken != null) {
       result.append(lastToken);
+    } else if (SqlScanner.isReserved((String)errorToken_.value)) {
+      result.append("A reserved word cannot be used as an identifier: ")
+          .append((String)errorToken_.value);
     } else {
       result.append("Unknown last token with id: " + errorToken_.sym);
     }
@@ -242,7 +247,7 @@ parser code {:
 :};
 
 // List of keywords. Please keep them sorted alphabetically.
-// ALL KEYWORDS ALSO NEED TO BE ADDED TO THE ident_or_kw PRODUCTION.
+// ALL KEYWORDS ALSO NEED TO BE ADDED TO THE word PRODUCTION.
 terminal
   KW_ADD, KW_AGGREGATE, KW_ALL, KW_ALTER, KW_ANALYTIC, KW_AND, KW_ANTI, KW_API_VERSION,
   KW_ARRAY, KW_AS, KW_ASC, KW_AVRO, KW_BETWEEN, KW_BIGINT, KW_BINARY, KW_BLOCKSIZE,
@@ -261,15 +266,17 @@ terminal
   KW_MERGE_FN, KW_METADATA, KW_NOT, KW_NULL, KW_NULLS, KW_OFFSET, KW_ON, KW_OR, KW_ORDER,
   KW_OUTER, KW_OVER, KW_OVERWRITE, KW_PARQUET, KW_PARQUETFILE, KW_PARTITION,
   KW_PARTITIONED, KW_PARTITIONS, KW_PRECEDING, KW_PREPARE_FN, KW_PRIMARY, KW_PRODUCED,
-  KW_PURGE, KW_RANGE, KW_RCFILE, KW_RECOVER, KW_REFRESH, KW_REGEXP, KW_RENAME, KW_REPLACE,
-  KW_REPLICATION, KW_RESTRICT, KW_RETURNS, KW_REVOKE, KW_RIGHT, KW_RLIKE, KW_ROLE,
-  KW_ROLES, KW_ROW, KW_ROWS, KW_SCHEMA, KW_SCHEMAS, KW_SELECT, KW_SEMI, KW_SEQUENCEFILE,
-  KW_SERDEPROPERTIES, KW_SERIALIZE_FN, KW_SET, KW_SHOW, KW_SMALLINT, KW_STORED,
-  KW_STRAIGHT_JOIN, KW_STRING, KW_STRUCT, KW_SYMBOL, KW_TABLE, KW_TABLES,
-  KW_TBLPROPERTIES, KW_TERMINATED, KW_TEXTFILE, KW_THEN, KW_TIMESTAMP, KW_TINYINT,
-  KW_TRUNCATE, KW_STATS, KW_TO, KW_TRUE, KW_UNBOUNDED, KW_UNCACHED, KW_UNION, KW_UPDATE,
-  KW_UPDATE_FN, KW_UPSERT, KW_USE, KW_USING, KW_VALUES, KW_VARCHAR, KW_VIEW, KW_WHEN,
-  KW_WHERE, KW_WITH;
+  KW_PURGE, KW_RANGE, KW_RCFILE, KW_RECOVER, KW_REFRESH, KW_REGEXP, KW_RENAME,
+  KW_REPEATABLE, KW_REPLACE, KW_REPLICATION, KW_RESTRICT, KW_RETURNS, KW_REVOKE,
+  KW_RIGHT, KW_RLIKE, KW_ROLE, KW_ROLES, KW_ROW, KW_ROWS, KW_SCHEMA, KW_SCHEMAS,
+  KW_SELECT, KW_SEMI, KW_SEQUENCEFILE, KW_SERDEPROPERTIES, KW_SERIALIZE_FN, KW_SET,
+  KW_SHOW, KW_SMALLINT, KW_SORT, KW_STORED, KW_STRAIGHT_JOIN, KW_STRING, KW_STRUCT,
+  KW_SYMBOL, KW_TABLE, KW_TABLES, KW_TABLESAMPLE, KW_TBLPROPERTIES, KW_TERMINATED,
+  KW_TEXTFILE, KW_THEN, KW_TIMESTAMP, KW_TINYINT, KW_TRUNCATE, KW_STATS, KW_TO, KW_TRUE,
+  KW_UNBOUNDED, KW_UNCACHED, KW_UNION, KW_UNKNOWN, KW_UPDATE, KW_UPDATE_FN, KW_UPSERT,
+  KW_USE, KW_USING, KW_VALUES, KW_VARCHAR, KW_VIEW, KW_WHEN, KW_WHERE, KW_WITH;
+
+terminal UNUSED_RESERVED_WORD;
 
 terminal COLON, SEMICOLON, COMMA, DOT, DOTDOTDOT, STAR, LPAREN, RPAREN, LBRACKET,
   RBRACKET, DIVIDE, MOD, ADD, SUBTRACT;
@@ -290,7 +297,11 @@ terminal String UNEXPECTED_CHAR;
 // IMPALA-3726 introduced the DEFAULT keyword which could break existing applications
 // that use the identifier "KEYWORD" as database, column or table names. To avoid that,
 // the ident_or_default non-terminal is introduced and should be used instead of IDENT.
-nonterminal String ident_or_keyword, ident_or_default;
+nonterminal String ident_or_default;
+// A word is an arbitrary token composed of digits and at least one letter. Reserved
+// words cannot be used as identifiers but they are words and can be used in query
+// options, column attributes, etc.
+nonterminal String word;
 nonterminal StatementBase stmt;
 // Single select statement.
 nonterminal SelectStmt select_stmt;
@@ -333,12 +344,13 @@ nonterminal Expr expr, non_pred_expr, arithmetic_expr, timestamp_arithmetic_expr
 nonterminal ArrayList<Expr> expr_list;
 nonterminal String alias_clause;
 nonterminal ArrayList<String> ident_list, primary_keys;
-nonterminal ArrayList<String> opt_ident_list;
+nonterminal ArrayList<String> opt_ident_list, opt_sort_cols;
 nonterminal TableName table_name;
 nonterminal FunctionName function_name;
 nonterminal Expr where_clause;
-nonterminal Predicate predicate, between_predicate, comparison_predicate,
-  compound_predicate, in_predicate, like_predicate, exists_predicate;
+nonterminal Expr predicate, bool_test_expr;
+nonterminal Predicate between_predicate, comparison_predicate, compound_predicate,
+  in_predicate, like_predicate, exists_predicate;
 nonterminal ArrayList<Expr> group_by_clause, opt_partition_by_clause;
 nonterminal Expr having_clause;
 nonterminal ArrayList<OrderByElement> order_by_elements, opt_order_by_clause;
@@ -354,6 +366,7 @@ nonterminal AnalyticWindow opt_window_clause;
 nonterminal AnalyticWindow.Type window_type;
 nonterminal AnalyticWindow.Boundary window_boundary;
 nonterminal LiteralExpr literal;
+nonterminal NumericLiteral numeric_literal;
 nonterminal CaseExpr case_expr;
 nonterminal ArrayList<CaseWhenClause> case_when_clause_list;
 nonterminal FunctionParams function_params;
@@ -361,6 +374,7 @@ nonterminal ArrayList<String> dotted_path;
 nonterminal SlotRef slot_ref;
 nonterminal FromClause from_clause;
 nonterminal ArrayList<TableRef> table_ref_list;
+nonterminal TableSampleClause opt_tablesample;
 nonterminal WithClause opt_with_clause;
 nonterminal ArrayList<View> with_view_def_list;
 nonterminal View with_view_def;
@@ -369,7 +383,7 @@ nonterminal Subquery subquery;
 nonterminal JoinOperator join_operator;
 nonterminal opt_inner, opt_outer;
 nonterminal PlanHint plan_hint;
-nonterminal List<PlanHint> opt_plan_hints, plan_hint_list;
+nonterminal List<PlanHint> plan_hints, opt_plan_hints, plan_hint_list;
 nonterminal TypeDef type_def;
 nonterminal Type type;
 nonterminal Expr sign_chain_expr;
@@ -403,6 +417,7 @@ nonterminal DropStatsStmt drop_stats_stmt;
 nonterminal DropTableOrViewStmt drop_tbl_or_view_stmt;
 nonterminal CreateDbStmt create_db_stmt;
 nonterminal CreateTableAsSelectStmt create_tbl_as_select_stmt;
+nonterminal CreateTableAsSelectStmt.CtasParams create_tbl_as_select_params;
 nonterminal CreateTableLikeStmt create_tbl_like_stmt;
 nonterminal CreateTableStmt create_tbl_stmt;
 nonterminal TableDef tbl_def_without_col_defs, tbl_def_with_col_defs;
@@ -426,7 +441,7 @@ nonterminal ArrayList<ColumnDef> column_def_list, partition_column_defs,
   view_column_def_list, view_column_defs;
 nonterminal ArrayList<StructField> struct_field_def_list;
 // Options for DDL commands - CREATE/DROP/ALTER
-nonterminal HdfsCachingOp cache_op_val;
+nonterminal HdfsCachingOp cache_op_val, opt_cache_op_val;
 nonterminal BigDecimal opt_cache_op_replication;
 nonterminal String comment_val, opt_comment_val;
 nonterminal Boolean external_val;
@@ -439,7 +454,7 @@ nonterminal Boolean if_not_exists_val;
 nonterminal Boolean is_primary_key_val;
 nonterminal Boolean replace_existing_cols_val;
 nonterminal HdfsUri location_val;
-nonterminal RowFormat row_format_val;
+nonterminal RowFormat row_format_val, opt_row_format_val;
 nonterminal String field_terminator_val;
 nonterminal String line_terminator_val;
 nonterminal String escaped_by_val;
@@ -483,6 +498,7 @@ nonterminal Boolean opt_kw_role;
 // identifiers rather than keywords. Throws a parse exception if the identifier does not
 // match the expected string.
 nonterminal key_ident;
+nonterminal system_ident;
 nonterminal Boolean option_ident;
 nonterminal Boolean server_ident;
 nonterminal Boolean source_ident;
@@ -534,6 +550,8 @@ precedence left KW_FINALIZE_FN;
 precedence left KW_INIT_FN;
 precedence left KW_MERGE_FN;
 precedence left KW_SERIALIZE_FN;
+precedence left KW_OVERWRITE;
+precedence left KW_INTO;
 
 precedence left KW_OVER;
 
@@ -658,13 +676,15 @@ overwrite_val ::=
 
 reset_metadata_stmt ::=
   KW_INVALIDATE KW_METADATA
-  {: RESULT = new ResetMetadataStmt(null, false, null); :}
+  {: RESULT = ResetMetadataStmt.createInvalidateStmt(null); :}
   | KW_INVALIDATE KW_METADATA table_name:table
-  {: RESULT = new ResetMetadataStmt(table, false, null); :}
+  {: RESULT = ResetMetadataStmt.createInvalidateStmt(table); :}
   | KW_REFRESH table_name:table
-  {: RESULT = new ResetMetadataStmt(table, true, null); :}
+  {: RESULT = ResetMetadataStmt.createRefreshTableStmt(table, null); :}
   | KW_REFRESH table_name:table partition_spec:partition
-  {: RESULT = new ResetMetadataStmt(table, true, partition); :}
+  {: RESULT = ResetMetadataStmt.createRefreshTableStmt(table, partition); :}
+  | KW_REFRESH KW_FUNCTIONS ident_or_default:db
+  {: RESULT = ResetMetadataStmt.createRefreshFunctionsStmt(db); :}
   ;
 
 explain_stmt ::=
@@ -703,29 +723,62 @@ explain_stmt ::=
 // Insert statements have two optional clauses: the column permutation (INSERT into
 // tbl(col1,...) etc) and the PARTITION clause. If the column permutation is present, the
 // query statement clause is optional as well.
+// Note: when extending INSERT/UPSERT syntax, hinting is supported at the beginning of
+// the statement and before the query.
 insert_stmt ::=
   opt_with_clause:w KW_INSERT KW_OVERWRITE opt_kw_table table_name:table
   LPAREN opt_ident_list:col_perm RPAREN partition_clause:list opt_plan_hints:hints
   opt_query_stmt:query
   {:
-    RESULT = InsertStmt.createInsert(w, table, true, list, hints, query, col_perm);
+    RESULT = InsertStmt.createInsert(w, table, true, list, hints,
+        InsertStmt.HintLocation.End, query, col_perm);
   :}
   | opt_with_clause:w KW_INSERT KW_OVERWRITE
   opt_kw_table table_name:table
   partition_clause:list opt_plan_hints:hints query_stmt:query
   {:
-    RESULT = InsertStmt.createInsert(w, table, true, list, hints, query, null);
+    RESULT = InsertStmt.createInsert(w, table, true, list, hints,
+        InsertStmt.HintLocation.End, query, null);
   :}
   | opt_with_clause:w KW_INSERT KW_INTO opt_kw_table table_name:table
   LPAREN opt_ident_list:col_perm RPAREN
   partition_clause:list opt_plan_hints:hints opt_query_stmt:query
   {:
-    RESULT = InsertStmt.createInsert(w, table, false, list, hints, query, col_perm);
+    RESULT = InsertStmt.createInsert(w, table, false, list, hints,
+        InsertStmt.HintLocation.End, query, col_perm);
   :}
   | opt_with_clause:w KW_INSERT KW_INTO opt_kw_table table_name:table
   partition_clause:list opt_plan_hints:hints query_stmt:query
   {:
-    RESULT = InsertStmt.createInsert(w, table, false, list, hints, query, null);
+    RESULT = InsertStmt.createInsert(w, table, false, list, hints,
+        InsertStmt.HintLocation.End, query, null);
+  :}
+  | opt_with_clause:w KW_INSERT opt_plan_hints:hints KW_OVERWRITE opt_kw_table
+  table_name:table LPAREN opt_ident_list:col_perm RPAREN partition_clause:list
+  opt_query_stmt:query
+  {:
+    RESULT = InsertStmt.createInsert(w, table, true, list, hints,
+        InsertStmt.HintLocation.Start, query, col_perm);
+  :}
+  | opt_with_clause:w KW_INSERT opt_plan_hints:hints KW_OVERWRITE
+  opt_kw_table table_name:table
+  partition_clause:list query_stmt:query
+  {:
+    RESULT = InsertStmt.createInsert(w, table, true, list, hints,
+        InsertStmt.HintLocation.Start, query, null);
+  :}
+  | opt_with_clause:w KW_INSERT opt_plan_hints:hints KW_INTO opt_kw_table
+  table_name:table LPAREN opt_ident_list:col_perm RPAREN
+  partition_clause:list opt_query_stmt:query
+  {:
+    RESULT = InsertStmt.createInsert(w, table, false, list, hints,
+        InsertStmt.HintLocation.Start, query, col_perm);
+  :}
+  | opt_with_clause:w KW_INSERT opt_plan_hints:hints KW_INTO opt_kw_table
+  table_name:table partition_clause:list query_stmt:query
+  {:
+    RESULT = InsertStmt.createInsert(w, table, false, list, hints,
+        InsertStmt.HintLocation.Start, query, null);
   :}
   ;
 
@@ -760,13 +813,25 @@ update_set_expr_list ::=
 
 // Upsert statements have an optional column permutation clause. If the column permutation
 // is present, the query statement clause is optional as well.
+// Note: when extending INSERT/UPSERT syntax, hinting is supported at the beginning of
+// the statement and before the query.
 upsert_stmt ::=
   opt_with_clause:w KW_UPSERT KW_INTO opt_kw_table table_name:table
     LPAREN opt_ident_list:col_perm RPAREN opt_plan_hints:hints opt_query_stmt:query
-  {: RESULT = InsertStmt.createUpsert(w, table, hints, query, col_perm); :}
+  {: RESULT = InsertStmt.createUpsert(w, table, hints, InsertStmt.HintLocation.End,
+         query, col_perm); :}
   | opt_with_clause:w KW_UPSERT KW_INTO opt_kw_table table_name:table
     opt_plan_hints:hints query_stmt:query
-  {: RESULT = InsertStmt.createUpsert(w, table, hints, query, null); :}
+  {: RESULT = InsertStmt.createUpsert(w, table, hints, InsertStmt.HintLocation.End,
+         query, null); :}
+  | opt_with_clause:w KW_UPSERT opt_plan_hints:hints KW_INTO opt_kw_table table_name:table
+    LPAREN opt_ident_list:col_perm RPAREN opt_query_stmt:query
+  {: RESULT = InsertStmt.createUpsert(w, table, hints, InsertStmt.HintLocation.Start,
+         query, col_perm); :}
+  | opt_with_clause:w KW_UPSERT opt_plan_hints:hints KW_INTO opt_kw_table table_name:table
+    query_stmt:query
+  {: RESULT = InsertStmt.createUpsert(w, table, hints, InsertStmt.HintLocation.Start,
+         query, null); :}
   ;
 
 // A DELETE statement comes in two main representations, the DELETE keyword with a path
@@ -919,7 +984,7 @@ opt_kw_role ::=
   ;
 
 partition_def ::=
-  partition_spec:partition location_val:location cache_op_val:cache_op
+  partition_spec:partition location_val:location opt_cache_op_val:cache_op
   {: RESULT = new PartitionDef(partition, location, cache_op); :}
   ;
 
@@ -953,7 +1018,7 @@ alter_tbl_stmt ::=
   :}
   | KW_ALTER KW_TABLE table_name:table KW_CHANGE opt_kw_column ident_or_default:col_name
     column_def:col_def
-  {: RESULT = new AlterTableChangeColStmt(table, col_name, col_def); :}
+  {: RESULT = AlterTableAlterColStmt.createChangeColStmt(table, col_name, col_def); :}
   | KW_ALTER KW_TABLE table_name:table KW_DROP if_exists_val:if_exists
     partition_set:partitions purge_val:purge
   {: RESULT = new AlterTableDropPartitionStmt(table, partitions, if_exists, purge); :}
@@ -979,6 +1044,9 @@ alter_tbl_stmt ::=
   | KW_ALTER KW_TABLE table_name:table opt_partition_set:partitions KW_SET
     table_property_type:target LPAREN properties_map:properties RPAREN
   {: RESULT = new AlterTableSetTblProperties(table, partitions, target, properties); :}
+  | KW_ALTER KW_TABLE table_name:table KW_SORT KW_BY LPAREN opt_ident_list:col_names
+    RPAREN
+  {: RESULT = new AlterTableSortByStmt(table, col_names); :}
   | KW_ALTER KW_TABLE table_name:table opt_partition_set:partition KW_SET
     KW_COLUMN KW_STATS ident_or_default:col LPAREN properties_map:map RPAREN
   {:
@@ -988,15 +1056,27 @@ alter_tbl_stmt ::=
     if (partition != null) parser.parseError("set", SqlParserSymbols.KW_SET);
     RESULT = new AlterTableSetColumnStats(table, col, map);
   :}
+  | KW_ALTER KW_TABLE table_name:table opt_partition_set:partition KW_SET
+    row_format_val:row_format
+  {:
+    RESULT = new AlterTableSetRowFormatStmt(table, partition, row_format);
+  :}
   | KW_ALTER KW_TABLE table_name:table opt_partition_set:partitions KW_SET
     cache_op_val:cache_op
   {:
-    // Ensure a parser error is thrown for ALTER statements if no cache op is specified.
-    if (cache_op == null) parser.parseError("set", SqlParserSymbols.KW_SET);
     RESULT = new AlterTableSetCachedStmt(table, partitions, cache_op);
   :}
   | KW_ALTER KW_TABLE table_name:table KW_RECOVER KW_PARTITIONS
   {: RESULT = new AlterTableRecoverPartitionsStmt(table); :}
+  | KW_ALTER KW_TABLE table_name:table KW_ALTER opt_kw_column ident_or_default:col_name
+    KW_SET column_options_map:options
+  {:
+    RESULT = new AlterTableAlterColStmt(
+        table, col_name, new ColumnDef(col_name, null, options));
+  :}
+  | KW_ALTER KW_TABLE table_name:table KW_ALTER opt_kw_column ident_or_default:col_name
+    KW_DROP KW_DEFAULT
+  {: RESULT = AlterTableAlterColStmt.createDropDefaultStmt(table, col_name); :}
   ;
 
 table_property_type ::=
@@ -1024,13 +1104,30 @@ create_db_stmt ::=
   {: RESULT = new CreateDbStmt(db_name, comment, location, if_not_exists); :}
   ;
 
+
+// Merging the two cases using opt_plan_hints would lead to reduce-reduce conflict,
+// because if there are no hints, CTAS cannot be distinguished from normal CREATE
+// statements until the AS SELECT part, but the decision whether to reduce empty string
+// to opt_plan_hints must happen before reaching that part.
 create_tbl_as_select_stmt ::=
+  KW_CREATE create_tbl_as_select_params:ctas_params
+  {:
+    RESULT = new CreateTableAsSelectStmt(ctas_params, null);
+  :}
+  | KW_CREATE plan_hints:hints create_tbl_as_select_params:ctas_params
+  {:
+    RESULT = new CreateTableAsSelectStmt(ctas_params, hints);
+  :}
+  ;
+
+create_tbl_as_select_params ::=
   tbl_def_without_col_defs:tbl_def
   tbl_options:options
   KW_AS query_stmt:select_stmt
   {:
     tbl_def.setOptions(options);
-    RESULT = new CreateTableAsSelectStmt(new CreateTableStmt(tbl_def), select_stmt, null);
+    RESULT = new CreateTableAsSelectStmt.CtasParams(new CreateTableStmt(tbl_def),
+        select_stmt, null);
   :}
   | tbl_def_without_col_defs:tbl_def
     // An optional clause cannot be used directly below because it would conflict with
@@ -1043,7 +1140,8 @@ create_tbl_as_select_stmt ::=
     tbl_def.getPrimaryKeyColumnNames().addAll(primary_keys);
     tbl_def.getKuduPartitionParams().addAll(partition_params.getKuduPartitionParams());
     tbl_def.setOptions(options);
-    RESULT = new CreateTableAsSelectStmt(new CreateTableStmt(tbl_def), select_stmt, null);
+    RESULT = new CreateTableAsSelectStmt.CtasParams(new CreateTableStmt(tbl_def),
+        select_stmt, null);
   :}
   | tbl_def_without_col_defs:tbl_def
     KW_PARTITIONED KW_BY LPAREN ident_list:partition_cols RPAREN
@@ -1051,19 +1149,19 @@ create_tbl_as_select_stmt ::=
     KW_AS query_stmt:select_stmt
   {:
     tbl_def.setOptions(options);
-    RESULT = new CreateTableAsSelectStmt(new CreateTableStmt(tbl_def),
+    RESULT = new CreateTableAsSelectStmt.CtasParams(new CreateTableStmt(tbl_def),
         select_stmt, partition_cols);
   :}
   ;
 
 create_tbl_stmt ::=
-  tbl_def_without_col_defs:tbl_def
+  KW_CREATE tbl_def_without_col_defs:tbl_def
   tbl_options:options
   {:
     tbl_def.setOptions(options);
     RESULT = new CreateTableStmt(tbl_def);
   :}
-  | tbl_def_without_col_defs:tbl_def
+  | KW_CREATE tbl_def_without_col_defs:tbl_def
     // If "opt_tbl_data_layout" were used instead so that this rule could be combined with
     // the rule above, there would be a conflict with the first rule in
     // "create_tbl_as_select_stmt".
@@ -1075,7 +1173,7 @@ create_tbl_stmt ::=
     create_tbl_stmt.getPartitionColumnDefs().addAll(partition_column_defs);
     RESULT = create_tbl_stmt;
   :}
-  | tbl_def_with_col_defs:tbl_def
+  | KW_CREATE tbl_def_with_col_defs:tbl_def
     opt_tbl_data_layout:data_layout
     tbl_options:options
   {:
@@ -1084,7 +1182,7 @@ create_tbl_stmt ::=
     tbl_def.setOptions(options);
     RESULT = new CreateTableStmt(tbl_def);
   :}
-  | tbl_def_with_col_defs:tbl_def
+  | KW_CREATE tbl_def_with_col_defs:tbl_def
     KW_PRODUCED KW_BY KW_DATA source_ident:is_source_id ident_or_default:data_src_name
     opt_init_string_val:init_string
     opt_comment_val:comment
@@ -1098,7 +1196,7 @@ create_tbl_stmt ::=
     RESULT = new CreateTableDataSrcStmt(new CreateTableStmt(tbl_def),
         data_src_name, init_string);
   :}
-  | tbl_def_without_col_defs:tbl_def
+  | KW_CREATE tbl_def_without_col_defs:tbl_def
     KW_LIKE file_format_val:schema_file_format
     STRING_LITERAL:schema_location
     opt_tbl_data_layout:data_layout
@@ -1118,12 +1216,23 @@ create_tbl_stmt ::=
 // TODO: Refactor the CREATE TABLE statements to improve the grammar and the way we
 // handle table options.
 create_tbl_like_stmt ::=
-  tbl_def_without_col_defs:tbl_def
+  KW_CREATE tbl_def_without_col_defs:tbl_def
   KW_LIKE table_name:other_table
   opt_comment_val:comment
   file_format_create_table_val:file_format location_val:location
   {:
-    RESULT = new CreateTableLikeStmt(tbl_def.getTblName(), other_table,
+    RESULT = new CreateTableLikeStmt(tbl_def.getTblName(), null, other_table,
+        tbl_def.isExternal(), comment, file_format, location, tbl_def.getIfNotExists());
+  :}
+  // This extra production is necessary since without it the parser will not be able to
+  // parse "CREATE TABLE A LIKE B".
+  | KW_CREATE tbl_def_without_col_defs:tbl_def
+    opt_sort_cols:sort_cols
+    KW_LIKE table_name:other_table
+    opt_comment_val:comment
+    file_format_create_table_val:file_format location_val:location
+  {:
+    RESULT = new CreateTableLikeStmt(tbl_def.getTblName(), sort_cols, other_table,
         tbl_def.isExternal(), comment, file_format, location, tbl_def.getIfNotExists());
   :}
   ;
@@ -1131,8 +1240,8 @@ create_tbl_like_stmt ::=
 // Used for creating tables where the schema is inferred externally, e.g., from an Avro
 // schema, Kudu table or query statement.
 tbl_def_without_col_defs ::=
-  KW_CREATE external_val:external KW_TABLE if_not_exists_val:if_not_exists
-  table_name:table
+  external_val:external KW_TABLE
+  if_not_exists_val:if_not_exists table_name:table
   {: RESULT = new TableDef(table, external, if_not_exists); :}
   ;
 
@@ -1157,15 +1266,23 @@ primary_keys ::=
   ;
 
 tbl_options ::=
-  opt_comment_val:comment row_format_val:row_format serde_properties:serde_props
-  file_format_create_table_val:file_format location_val:location cache_op_val:cache_op
+  opt_sort_cols:sort_cols opt_comment_val:comment opt_row_format_val:row_format
+  serde_properties:serde_props file_format_create_table_val:file_format
+  location_val:location opt_cache_op_val:cache_op
   tbl_properties:tbl_props
   {:
     CreateTableStmt.unescapeProperties(serde_props);
     CreateTableStmt.unescapeProperties(tbl_props);
-    RESULT = new TableDef.Options(comment, row_format, serde_props, file_format,
-        location, cache_op, tbl_props);
+    RESULT = new TableDef.Options(sort_cols, comment, row_format, serde_props,
+        file_format, location, cache_op, tbl_props);
   :}
+  ;
+
+opt_sort_cols ::=
+  KW_SORT KW_BY LPAREN opt_ident_list:col_names RPAREN
+  {: RESULT = col_names; :}
+  | /* empty */
+  {: RESULT = null; :}
   ;
 
 opt_tbl_data_layout ::=
@@ -1316,13 +1433,18 @@ create_uda_stmt ::=
   :}
   ;
 
+opt_cache_op_val ::=
+  cache_op_val:cache_op
+  {: RESULT = cache_op; :}
+  | /* empty */
+  {: RESULT = null; :}
+  ;
+
 cache_op_val ::=
   KW_CACHED KW_IN STRING_LITERAL:pool_name opt_cache_op_replication:replication
   {: RESULT = new HdfsCachingOp(pool_name, replication); :}
   | KW_UNCACHED
   {: RESULT = new HdfsCachingOp(); :}
-  | /* empty */
-  {: RESULT = null; :}
   ;
 
 opt_cache_op_replication ::=
@@ -1379,12 +1501,17 @@ if_not_exists_val ::=
   {: RESULT = false; :}
   ;
 
+opt_row_format_val ::=
+  row_format_val:row_format
+  {: RESULT = row_format; :}
+  |/* empty */
+  {: RESULT = null; :}
+  ;
+
 row_format_val ::=
   KW_ROW KW_FORMAT KW_DELIMITED field_terminator_val:field_terminator
   escaped_by_val:escaped_by line_terminator_val:line_terminator
   {: RESULT = new RowFormat(field_terminator, line_terminator, escaped_by); :}
-  |/* empty */
-  {: RESULT = null; :}
   ;
 
 escaped_by_val ::=
@@ -1441,20 +1568,20 @@ tbl_properties ::=
   KW_TBLPROPERTIES LPAREN properties_map:map RPAREN
   {: RESULT = map; :}
   | /* empty */
-  {: RESULT = new HashMap<String, String>(); :}
+  {: RESULT = new LinkedHashMap<String, String>(); :}
   ;
 
 serde_properties ::=
   KW_WITH KW_SERDEPROPERTIES LPAREN properties_map:map RPAREN
   {: RESULT = map; :}
   | /* empty */
-  {: RESULT = new HashMap<String, String>(); :}
+  {: RESULT = new LinkedHashMap<String, String>(); :}
   ;
 
 properties_map ::=
   STRING_LITERAL:key EQUAL STRING_LITERAL:value
   {:
-    HashMap<String, String> properties = new HashMap<String, String>();
+    LinkedHashMap<String, String> properties = new LinkedHashMap<String, String>();
     properties.put(key, value);
     RESULT = properties;
   :}
@@ -1497,7 +1624,7 @@ column_options_map ::=
   :}
   | column_option:col_option
   {:
-    Map<Option, Object> options = Maps.newHashMap();
+    LinkedHashMap<Option, Object> options = Maps.newLinkedHashMap();
     options.put(col_option.first, col_option.second);
     RESULT = options;
   :}
@@ -1533,13 +1660,13 @@ nullability_val ::=
   ;
 
 encoding_val ::=
-  KW_ENCODING ident_or_default:encoding_ident
-  {: RESULT = encoding_ident; :}
+  KW_ENCODING word:value
+  {: RESULT = value; :}
   ;
 
 compression_val ::=
-  KW_COMPRESSION ident_or_default:compression_ident
-  {: RESULT = compression_ident; :}
+  KW_COMPRESSION word:value
+  {: RESULT = value; :}
   ;
 
 default_val ::=
@@ -1577,6 +1704,15 @@ key_ident ::=
   {:
     if (!ident.toUpperCase().equals("KEY")) {
       parser.parseError("identifier", SqlParserSymbols.IDENT, "KEY");
+    }
+  :}
+  ;
+
+system_ident ::=
+  IDENT:ident
+  {:
+    if (!ident.toUpperCase().equals("SYSTEM")) {
+      parser.parseError("identifier", SqlParserSymbols.IDENT, "SYSTEM");
     }
   :}
   ;
@@ -1655,7 +1791,7 @@ view_column_def_list ::=
 view_column_def ::=
   ident_or_default:col_name opt_comment_val:comment
   {:
-    Map<Option, Object> options = Maps.newHashMap();
+    LinkedHashMap<Option, Object> options = Maps.newLinkedHashMap();
     if (comment != null) options.put(Option.COMMENT, comment);
     RESULT = new ColumnDef(col_name, null, options);
   :}
@@ -1678,12 +1814,15 @@ cascade_val ::=
   ;
 
 compute_stats_stmt ::=
-  KW_COMPUTE KW_STATS table_name:table
-  {: RESULT = new ComputeStatsStmt(table); :}
+  KW_COMPUTE KW_STATS table_name:table opt_tablesample:tblsmpl
+  {: RESULT = ComputeStatsStmt.createStatsStmt(table, tblsmpl, null); :}
+  | KW_COMPUTE KW_STATS table_name:table LPAREN opt_ident_list:cols RPAREN
+    opt_tablesample:tblsmpl
+  {: RESULT = ComputeStatsStmt.createStatsStmt(table, tblsmpl, cols); :}
   | KW_COMPUTE KW_INCREMENTAL KW_STATS table_name:table
-  {: RESULT = new ComputeStatsStmt(table, true, null); :}
-  | KW_COMPUTE KW_INCREMENTAL KW_STATS table_name:table partition_set:partitions
-  {: RESULT = new ComputeStatsStmt(table, true, partitions); :}
+  {: RESULT = ComputeStatsStmt.createIncrementalStatsStmt(table, null); :}
+  | KW_COMPUTE KW_INCREMENTAL KW_STATS table_name:table partition_set:parts
+  {: RESULT = ComputeStatsStmt.createIncrementalStatsStmt(table, parts); :}
   ;
 
 drop_stats_stmt ::=
@@ -1868,8 +2007,8 @@ opt_aggregate_fn_intermediate_type_def ::=
 function_def_args_map ::=
   function_def_arg_key:key EQUAL STRING_LITERAL:value
   {:
-    HashMap<CreateFunctionStmtBase.OptArg, String> args =
-        new HashMap<CreateFunctionStmtBase.OptArg, String>();
+    LinkedHashMap<CreateFunctionStmtBase.OptArg, String> args =
+        new LinkedHashMap<CreateFunctionStmtBase.OptArg, String>();
     args.put(key, value);
     RESULT = args;
   :}
@@ -1880,7 +2019,7 @@ function_def_args_map ::=
     RESULT = args;
   :}
   |
-  {: RESULT = new HashMap<CreateFunctionStmtBase.OptArg, String>(); :}
+  {: RESULT = new LinkedHashMap<CreateFunctionStmtBase.OptArg, String>(); :}
   ;
 
 // Any keys added here must also be added to the end of the precedence list.
@@ -2239,12 +2378,20 @@ select_clause ::=
   ;
 
 set_stmt ::=
-  KW_SET ident_or_default:key EQUAL literal:l
-  {: RESULT = new SetStmt(key, l.getStringValue()); :}
-  | KW_SET ident_or_default:key EQUAL ident_or_default:ident
-  {: RESULT = new SetStmt(key, ident); :}
+  KW_SET ident_or_default:key EQUAL numeric_literal:l
+  {: RESULT = new SetStmt(key, l.getStringValue(), false); :}
+  | KW_SET ident_or_default:key EQUAL STRING_LITERAL:l
+  {: RESULT = new SetStmt(key, l, false); :}
+  | KW_SET ident_or_default:key EQUAL SUBTRACT numeric_literal:l
+  {:
+    l.swapSign();
+    RESULT = new SetStmt(key, l.getStringValue(), false); :}
+  | KW_SET ident_or_default:key EQUAL word:value
+  {: RESULT = new SetStmt(key, value, false); :}
+  | KW_SET KW_ALL
+  {: RESULT = new SetStmt(null, null, true); :}
   | KW_SET
-  {: RESULT = new SetStmt(null, null); :}
+  {: RESULT = new SetStmt(null, null, false); :}
   ;
 
 select_list ::=
@@ -2363,12 +2510,12 @@ table_ref_list ::=
   ;
 
 table_ref ::=
-  dotted_path:path
-  {: RESULT = new TableRef(path, null); :}
-  | dotted_path:path alias_clause:alias
-  {: RESULT = new TableRef(path, alias); :}
-  | LPAREN query_stmt:query RPAREN alias_clause:alias
-  {: RESULT = new InlineViewRef(alias, query); :}
+  dotted_path:path opt_tablesample:tblsmpl
+  {: RESULT = new TableRef(path, null, tblsmpl); :}
+  | dotted_path:path alias_clause:alias opt_tablesample:tblsmpl
+  {: RESULT = new TableRef(path, alias, tblsmpl); :}
+  | LPAREN query_stmt:query RPAREN alias_clause:alias opt_tablesample:tblsmpl
+  {: RESULT = new InlineViewRef(alias, query, tblsmpl); :}
   ;
 
 join_operator ::=
@@ -2401,6 +2548,13 @@ opt_outer ::=
   ;
 
 opt_plan_hints ::=
+  plan_hints:hints
+  {: RESULT = hints; :}
+  | /* empty */
+  {: RESULT = Lists.newArrayList(); :}
+  ;
+
+plan_hints ::=
   COMMENTED_PLAN_HINT_START plan_hint_list:hints COMMENTED_PLAN_HINT_END
   {: RESULT = hints; :}
   /* legacy straight_join hint style */
@@ -2409,8 +2563,6 @@ opt_plan_hints ::=
   /* legacy plan-hint style */
   | LBRACKET plan_hint_list:hints RBRACKET
   {: RESULT = hints; :}
-  | /* empty */
-  {: RESULT = Lists.newArrayList(); :}
   ;
 
 plan_hint ::=
@@ -2435,6 +2587,16 @@ plan_hint_list ::=
     if (hint != null) hints.add(hint);
     RESULT = hints;
   :}
+  ;
+
+opt_tablesample ::=
+  KW_TABLESAMPLE system_ident LPAREN INTEGER_LITERAL:p RPAREN
+  {: RESULT = new TableSampleClause(p.longValue(), null); :}
+  | KW_TABLESAMPLE system_ident LPAREN INTEGER_LITERAL:p RPAREN
+    KW_REPEATABLE LPAREN INTEGER_LITERAL:s RPAREN
+  {: RESULT = new TableSampleClause(p.longValue(), Long.valueOf(s.longValue())); :}
+  | /* empty */
+  {: RESULT = null; :}
   ;
 
 ident_list ::=
@@ -2637,13 +2799,17 @@ non_pred_expr ::=
   {: RESULT = e; :}
   | analytic_expr:e
   {: RESULT = e; :}
-  /* Since "IF", "REPLACE", "TRUNCATE" are keywords, need to special case these functions */
+  /* Additional rules for function names that are also keywords */
   | KW_IF LPAREN expr_list:exprs RPAREN
   {: RESULT = new FunctionCallExpr("if", exprs); :}
   | KW_REPLACE LPAREN expr_list:exprs RPAREN
   {: RESULT = new FunctionCallExpr("replace", exprs); :}
   | KW_TRUNCATE LPAREN expr_list:exprs RPAREN
   {: RESULT = new FunctionCallExpr("truncate", exprs); :}
+  | KW_LEFT LPAREN expr_list:exprs RPAREN
+  {: RESULT = new FunctionCallExpr("left", exprs); :}
+  | KW_RIGHT LPAREN expr_list:exprs RPAREN
+  {: RESULT = new FunctionCallExpr("right", exprs); :}
   | cast_expr:c
   {: RESULT = c; :}
   | case_expr:c
@@ -2803,11 +2969,16 @@ timestamp_arithmetic_expr ::=
   :}
   ;
 
-literal ::=
+numeric_literal ::=
   INTEGER_LITERAL:l
   {: RESULT = new NumericLiteral(l); :}
   | DECIMAL_LITERAL:l
   {: RESULT = new NumericLiteral(l); :}
+  ;
+
+literal ::=
+  numeric_literal:l
+  {: RESULT = l; :}
   | STRING_LITERAL:l
   {: RESULT = new StringLiteral(l); :}
   | KW_TRUE
@@ -2867,6 +3038,8 @@ predicate ::=
   {: RESULT = p; :}
   | like_predicate:p
   {: RESULT = p; :}
+  | bool_test_expr:e
+  {: RESULT = e; :}
   | LPAREN predicate:p RPAREN
   {:
     p.setPrintSqlInParens(true);
@@ -2949,6 +3122,22 @@ in_predicate ::=
   {: RESULT = new InPredicate(e, s, false); :}
   | expr:e KW_NOT KW_IN subquery:s
   {: RESULT = new InPredicate(e, s, true); :}
+  ;
+
+// Boolean test expression: <expr> IS [NOT] (TRUE | FALSE | UNKNOWN)
+bool_test_expr ::=
+  expr:e KW_IS KW_TRUE
+  {: RESULT = new FunctionCallExpr("istrue", Lists.newArrayList(e)); :}
+  | expr:e KW_IS KW_NOT KW_TRUE
+  {: RESULT = new FunctionCallExpr("isnottrue", Lists.newArrayList(e)); :}
+  | expr:e KW_IS KW_FALSE
+  {: RESULT = new FunctionCallExpr("isfalse", Lists.newArrayList(e)); :}
+  | expr:e KW_IS KW_NOT KW_FALSE
+  {: RESULT = new FunctionCallExpr("isnotfalse", Lists.newArrayList(e)); :}
+  | expr:e KW_IS KW_UNKNOWN
+  {: RESULT = new IsNullPredicate(e, false); :}
+  | expr:e KW_IS KW_NOT KW_UNKNOWN
+  {: RESULT = new IsNullPredicate(e, true); :}
   ;
 
 subquery ::=
@@ -3042,7 +3231,7 @@ type ::=
 // that we can parse type strings from the Hive Metastore which
 // may have unquoted identifiers corresponding to keywords.
 struct_field_def ::=
-  ident_or_keyword:name COLON type:t opt_comment_val:comment
+  word:name COLON type:t opt_comment_val:comment
   {: RESULT = new StructField(name, t, comment); :}
   ;
 
@@ -3067,7 +3256,7 @@ ident_or_default ::=
   {: RESULT = name.toString(); :}
   ;
 
-ident_or_keyword ::=
+word ::=
   IDENT:r
   {: RESULT = r.toString(); :}
   | KW_ADD:r
@@ -3330,6 +3519,8 @@ ident_or_keyword ::=
   {: RESULT = r.toString(); :}
   | KW_RENAME:r
   {: RESULT = r.toString(); :}
+  | KW_REPEATABLE:r
+  {: RESULT = r.toString(); :}
   | KW_REPLACE:r
   {: RESULT = r.toString(); :}
   | KW_REPLICATION:r
@@ -3372,6 +3563,8 @@ ident_or_keyword ::=
   {: RESULT = r.toString(); :}
   | KW_SMALLINT:r
   {: RESULT = r.toString(); :}
+  | KW_SORT:r
+  {: RESULT = r.toString(); :}
   | KW_STORED:r
   {: RESULT = r.toString(); :}
   | KW_STRAIGHT_JOIN:r
@@ -3385,6 +3578,8 @@ ident_or_keyword ::=
   | KW_TABLE:r
   {: RESULT = r.toString(); :}
   | KW_TABLES:r
+  {: RESULT = r.toString(); :}
+  | KW_TABLESAMPLE:r
   {: RESULT = r.toString(); :}
   | KW_TBLPROPERTIES:r
   {: RESULT = r.toString(); :}
@@ -3412,6 +3607,8 @@ ident_or_keyword ::=
   {: RESULT = r.toString(); :}
   | KW_UNION:r
   {: RESULT = r.toString(); :}
+  | KW_UNKNOWN:r
+  {: RESULT = r.toString(); :}
   | KW_UPDATE:r
   {: RESULT = r.toString(); :}
   | KW_UPDATE_FN:r
@@ -3433,5 +3630,7 @@ ident_or_keyword ::=
   | KW_WHERE:r
   {: RESULT = r.toString(); :}
   | KW_WITH:r
+  {: RESULT = r.toString(); :}
+  | UNUSED_RESERVED_WORD:r
   {: RESULT = r.toString(); :}
   ;

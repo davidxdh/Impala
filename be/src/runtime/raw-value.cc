@@ -60,13 +60,13 @@ void RawValue::PrintValueAsBytes(const void* value, const ColumnType& type,
     case TYPE_STRING:
     case TYPE_VARCHAR:
       string_val = reinterpret_cast<const StringValue*>(value);
-      stream->write(static_cast<char*>(string_val->ptr), string_val->len);
+      stream->write(string_val->ptr, string_val->len);
       break;
     case TYPE_TIMESTAMP:
       stream->write(chars, TimestampValue::Size());
       break;
     case TYPE_CHAR:
-      stream->write(StringValue::CharSlotToPtr(chars, type), type.len);
+      stream->write(chars, type.len);
       break;
     case TYPE_DECIMAL:
       stream->write(chars, type.GetByteSize());
@@ -98,11 +98,11 @@ void RawValue::PrintValue(const void* value, const ColumnType& type, int scale,
     case TYPE_STRING:
     case TYPE_VARCHAR:
       string_val = reinterpret_cast<const StringValue*>(value);
-      tmp.assign(static_cast<char*>(string_val->ptr), string_val->len);
+      tmp.assign(string_val->ptr, string_val->len);
       str->swap(tmp);
       return;
     case TYPE_CHAR:
-      *str = string(StringValue::CharSlotToPtr(value, type), type.len);
+      *str = string(reinterpret_cast<const char*>(value), type.len);
       return;
     default:
       PrintValue(value, type, scale, &out);
@@ -117,7 +117,11 @@ void RawValue::Write(const void* value, void* dst, const ColumnType& type,
     case TYPE_NULL:
       break;
     case TYPE_BOOLEAN:
-      *reinterpret_cast<bool*>(dst) = *reinterpret_cast<const bool*>(value);
+      // Unlike the other scalar types, bool has a limited set of valid values, so if
+      // 'dst' is uninitialized memory and happens to point to a value that is not a valid
+      // bool, then dereferencing it via *reinterpret_cast<bool*>(dst) is undefined
+      // behavior.
+      memcpy(dst, value, sizeof(bool));
       break;
     case TYPE_TINYINT:
       *reinterpret_cast<int8_t*>(dst) = *reinterpret_cast<const int8_t*>(value);
@@ -142,13 +146,7 @@ void RawValue::Write(const void* value, void* dst, const ColumnType& type,
           *reinterpret_cast<const TimestampValue*>(value);
       break;
     case TYPE_STRING:
-    case TYPE_VARCHAR:
-    case TYPE_CHAR: {
-      if (!type.IsVarLenStringType()) {
-        DCHECK_EQ(type.type, TYPE_CHAR);
-        memcpy(StringValue::CharSlotToPtr(dst, type), value, type.len);
-        break;
-      }
+    case TYPE_VARCHAR: {
       const StringValue* src = reinterpret_cast<const StringValue*>(value);
       StringValue* dest = reinterpret_cast<StringValue*>(dst);
       dest->len = src->len;
@@ -156,7 +154,7 @@ void RawValue::Write(const void* value, void* dst, const ColumnType& type,
       if (pool != NULL) {
         // Note: if this changes to TryAllocate(), CodegenAnyVal::WriteToSlot() will need
         // to reflect this change as well (the codegen'd Allocate() call is actually
-        // generated in CodegenAnyVal::ToNativeValue()).
+        // generated in CodegenAnyVal::StoreToNativePtr()).
         dest->ptr = reinterpret_cast<char*>(pool->Allocate(dest->len));
         memcpy(dest->ptr, src->ptr, dest->len);
       } else {
@@ -164,6 +162,10 @@ void RawValue::Write(const void* value, void* dst, const ColumnType& type,
       }
       break;
     }
+    case TYPE_CHAR:
+      DCHECK_EQ(type.type, TYPE_CHAR);
+      memcpy(dst, value, type.len);
+      break;
     case TYPE_DECIMAL:
       memcpy(dst, value, type.GetByteSize());
       break;
@@ -191,31 +193,29 @@ void RawValue::Write(const void* value, Tuple* tuple, const SlotDescriptor* slot
   }
 }
 
-uint32_t RawValue::GetHashValueFnv(const void* v, const ColumnType& type, uint32_t seed) {
-  // Use HashCombine with arbitrary constant to ensure we don't return seed.
-  if (v == NULL) return HashUtil::HashCombine32(HASH_VAL_NULL, seed);
-
+uint64_t RawValue::GetHashValueFastHash(const void* v, const ColumnType& type,
+    uint64_t seed) {
+  // Hash with an arbitrary constant to ensure we don't return seed.
+  if (v == nullptr) {
+    return HashUtil::FastHash64(&HASH_VAL_NULL, sizeof(HASH_VAL_NULL), seed);
+  }
   switch (type.type) {
     case TYPE_STRING:
     case TYPE_VARCHAR: {
       const StringValue* string_value = reinterpret_cast<const StringValue*>(v);
-      if (string_value->len == 0) {
-        return HashUtil::HashCombine32(HASH_VAL_EMPTY, seed);
-      }
-      return HashUtil::FnvHash64to32(string_value->ptr, string_value->len, seed);
+      return HashUtil::FastHash64(string_value->ptr,
+          static_cast<size_t>(string_value->len), seed);
     }
-    case TYPE_BOOLEAN:
-      return HashUtil::HashCombine32(*reinterpret_cast<const bool*>(v), seed);
-    case TYPE_TINYINT: return HashUtil::FnvHash64to32(v, 1, seed);
-    case TYPE_SMALLINT: return HashUtil::FnvHash64to32(v, 2, seed);
-    case TYPE_INT: return HashUtil::FnvHash64to32(v, 4, seed);
-    case TYPE_BIGINT: return HashUtil::FnvHash64to32(v, 8, seed);
-    case TYPE_FLOAT: return HashUtil::FnvHash64to32(v, 4, seed);
-    case TYPE_DOUBLE: return HashUtil::FnvHash64to32(v, 8, seed);
-    case TYPE_TIMESTAMP: return HashUtil::FnvHash64to32(v, 12, seed);
-    case TYPE_CHAR:
-      return HashUtil::FnvHash64to32(StringValue::CharSlotToPtr(v, type), type.len, seed);
-    case TYPE_DECIMAL: return HashUtil::FnvHash64to32(v, type.GetByteSize(), seed);
+    case TYPE_BOOLEAN: return HashUtil::FastHash64(v, 1, seed);
+    case TYPE_TINYINT: return HashUtil::FastHash64(v, 1, seed);
+    case TYPE_SMALLINT: return HashUtil::FastHash64(v, 2, seed);
+    case TYPE_INT: return HashUtil::FastHash64(v, 4, seed);
+    case TYPE_BIGINT: return HashUtil::FastHash64(v, 8, seed);
+    case TYPE_FLOAT: return HashUtil::FastHash64(v, 4, seed);
+    case TYPE_DOUBLE: return HashUtil::FastHash64(v, 8, seed);
+    case TYPE_TIMESTAMP: return HashUtil::FastHash64(v, 12, seed);
+    case TYPE_CHAR: return HashUtil::FastHash64(v, type.len, seed);
+    case TYPE_DECIMAL: return HashUtil::FastHash64(v, type.GetByteSize(), seed);
     default: DCHECK(false); return 0;
   }
 }
@@ -284,7 +284,7 @@ void RawValue::PrintValue(
       *stream << *reinterpret_cast<const TimestampValue*>(value);
       break;
     case TYPE_CHAR:
-      stream->write(StringValue::CharSlotToPtr(value, type), type.len);
+      stream->write(reinterpret_cast<const char*>(value), type.len);
       break;
     case TYPE_DECIMAL:
       switch (type.GetByteSize()) {

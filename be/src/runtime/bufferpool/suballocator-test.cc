@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <limits>
 #include <random>
 #include <string>
 #include <vector>
@@ -26,8 +27,11 @@
 #include "common/object-pool.h"
 #include "runtime/bufferpool/reservation-tracker.h"
 #include "runtime/bufferpool/suballocator.h"
+#include "runtime/test-env.h"
+#include "service/fe-support.h"
 #include "testutil/death-test-util.h"
 #include "testutil/gtest-util.h"
+#include "testutil/rand-util.h"
 #include "util/bit-util.h"
 
 #include "common/names.h"
@@ -42,8 +46,10 @@ namespace impala {
 class SuballocatorTest : public ::testing::Test {
  public:
   virtual void SetUp() override {
-    SeedRng();
-    profile_.reset(new RuntimeProfile(&obj_pool_, "test profile"));
+    test_env_.reset(new TestEnv);
+    ASSERT_OK(test_env_->Init());
+    RandTestUtil::SeedRng("SUBALLOCATOR_TEST_SEED", &rng_);
+    profile_ = RuntimeProfile::Create(&obj_pool_, "test profile");
   }
 
   virtual void TearDown() override {
@@ -53,7 +59,6 @@ class SuballocatorTest : public ::testing::Test {
     clients_.clear();
     buffer_pool_.reset();
     global_reservation_.Close();
-    profile_.reset();
     obj_pool_.Clear();
   }
 
@@ -62,34 +67,21 @@ class SuballocatorTest : public ::testing::Test {
   const static int64_t TEST_BUFFER_LEN = Suballocator::MIN_ALLOCATION_BYTES * 16;
 
  protected:
-  /// Seed 'rng_' with a seed either for the environment or based on the current time.
-  void SeedRng() {
-    const char* seed_str = getenv("SUBALLOCATOR_TEST_SEED");
-    int64_t seed;
-    if (seed_str != nullptr) {
-      seed = atoi(seed_str);
-    } else {
-      seed = time(nullptr);
-    }
-    LOG(INFO) << "Random seed: " << seed;
-    rng_.seed(seed);
-  }
-
   /// Initialize 'buffer_pool_' and 'global_reservation_' with a limit of 'total_mem'
   /// bytes of buffers of minimum length 'min_buffer_len'.
   void InitPool(int64_t min_buffer_len, int total_mem) {
     global_reservation_.InitRootTracker(nullptr, total_mem);
-    buffer_pool_.reset(new BufferPool(min_buffer_len, total_mem));
+    buffer_pool_.reset(new BufferPool(min_buffer_len, total_mem, 0));
   }
 
   /// Register a client with 'buffer_pool_'. The client is automatically deregistered
   /// and freed at the end of the test.
   void RegisterClient(
-      ReservationTracker* reservation, BufferPool::ClientHandle** client) {
+      ReservationTracker* parent_reservation, BufferPool::ClientHandle** client) {
     clients_.push_back(make_unique<BufferPool::ClientHandle>());
     *client = clients_.back().get();
-    ASSERT_OK(buffer_pool_->RegisterClient(
-        "test client", reservation, NULL, profile(), *client));
+    ASSERT_OK(buffer_pool_->RegisterClient("test client", NULL, parent_reservation, NULL,
+        numeric_limits<int64_t>::max(), profile_, *client));
   }
 
   /// Assert that the memory for all of the suballocations is writable and disjoint by
@@ -104,11 +96,10 @@ class SuballocatorTest : public ::testing::Test {
     allocs->clear();
   }
 
-  static void ExpectReservationUnused(ReservationTracker& reservation) {
-    EXPECT_EQ(reservation.GetUsedReservation(), 0) << reservation.DebugString();
+  static void ExpectReservationUnused(BufferPool::ClientHandle* client) {
+    EXPECT_EQ(client->GetUsedReservation(), 0) << client->DebugString();
   }
 
-  RuntimeProfile* profile() { return profile_.get(); }
   BufferPool* buffer_pool() { return buffer_pool_.get(); }
 
   /// Pool for objects with per-test lifetime. Cleared after every test.
@@ -124,8 +115,10 @@ class SuballocatorTest : public ::testing::Test {
   /// Clients for the buffer pool. Deregistered and freed after every test.
   vector<unique_ptr<BufferPool::ClientHandle>> clients_;
 
+  boost::scoped_ptr<TestEnv> test_env_;
+
   /// Global profile - recreated for every test.
-  scoped_ptr<RuntimeProfile> profile_;
+  RuntimeProfile* profile_;
 
   /// Per-test random number generator. Seeded before every test.
   mt19937 rng_;
@@ -165,10 +158,10 @@ TEST_F(SuballocatorTest, SameSizeAllocations) {
   AssertMemoryValid(allocs);
 
   // Check that reservation usage matches the amount allocated.
-  EXPECT_EQ(global_reservation_.GetUsedReservation(), allocated_mem)
+  EXPECT_EQ(client->GetUsedReservation(), allocated_mem)
       << global_reservation_.DebugString();
   FreeAllocations(&allocator, &allocs);
-  ExpectReservationUnused(global_reservation_);
+  ExpectReservationUnused(client);
 }
 
 /// Check behaviour of zero-length allocation.
@@ -185,7 +178,7 @@ TEST_F(SuballocatorTest, ZeroLengthAllocation) {
   ASSERT_TRUE(alloc != nullptr) << global_reservation_.DebugString();
   EXPECT_EQ(alloc->len(), Suballocator::MIN_ALLOCATION_BYTES);
   allocator.Free(move(alloc));
-  ExpectReservationUnused(global_reservation_);
+  ExpectReservationUnused(client);
 }
 
 /// Check behaviour of out-of-range allocation.
@@ -203,7 +196,7 @@ TEST_F(SuballocatorTest, OutOfRangeAllocations) {
   // Too-large allocations fail gracefully.
   ASSERT_FALSE(allocator.Allocate(Suballocator::MAX_ALLOCATION_BYTES + 1, &alloc).ok())
       << global_reservation_.DebugString();
-  ExpectReservationUnused(global_reservation_);
+  ExpectReservationUnused(client);
 }
 
 /// Basic test to make sure that non-power-of-two suballocations are handled as expected
@@ -235,14 +228,13 @@ TEST_F(SuballocatorTest, NonPowerOfTwoAllocations) {
     // Check that it was rounded up to a power-of-two.
     EXPECT_EQ(alloc->len(), max(Suballocator::MIN_ALLOCATION_BYTES,
                                 BitUtil::RoundUpToPowerOfTwo(alloc_size)));
-    EXPECT_EQ(
-        max(TEST_BUFFER_LEN, alloc->len()), global_reservation_.GetUsedReservation())
+    EXPECT_EQ(max(TEST_BUFFER_LEN, alloc->len()), client->GetUsedReservation())
         << global_reservation_.DebugString();
     memset(alloc->data(), 0, alloc->len()); // Check memory is writable.
 
     allocator.Free(move(alloc));
   }
-  ExpectReservationUnused(global_reservation_);
+  ExpectReservationUnused(client);
 }
 
 /// Test that simulates hash table's patterns of doubling suballocations and validates
@@ -292,12 +284,12 @@ TEST_F(SuballocatorTest, DoublingAllocations) {
     // coalesced two buddies of curr_alloc_size / 2) and one buffer with only
     // 'curr_alloc_size' bytes in use (if an Allocate() call couldn't recycle memory and
     // had to allocate a new buffer).
-    EXPECT_LE(global_reservation_.GetUsedReservation(),
+    EXPECT_LE(client->GetUsedReservation(),
         TEST_BUFFER_LEN + max(TEST_BUFFER_LEN, curr_alloc_size * NUM_ALLOCS));
   }
   // Check that reservation usage behaves as expected.
   FreeAllocations(&allocator, &allocs);
-  ExpectReservationUnused(global_reservation_);
+  ExpectReservationUnused(client);
 }
 
 /// Do some randomised testing of the allocator. Simulate some interesting patterns with
@@ -352,7 +344,7 @@ TEST_F(SuballocatorTest, RandomAllocations) {
   }
   // Check that memory is released when suballocations are freed.
   FreeAllocations(&allocator, &allocs);
-  ExpectReservationUnused(global_reservation_);
+  ExpectReservationUnused(client);
 }
 
 void SuballocatorTest::AssertMemoryValid(
@@ -376,4 +368,9 @@ void SuballocatorTest::AssertMemoryValid(
 }
 }
 
-IMPALA_TEST_MAIN();
+int main(int argc, char** argv) {
+  ::testing::InitGoogleTest(&argc, argv);
+  impala::InitCommonRuntime(argc, argv, true, impala::TestInfo::BE_TEST);
+  impala::InitFeSupport();
+  return RUN_ALL_TESTS();
+}

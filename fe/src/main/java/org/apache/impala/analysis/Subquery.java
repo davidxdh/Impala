@@ -20,11 +20,11 @@ package org.apache.impala.analysis;
 import java.util.ArrayList;
 import java.util.List;
 
-import org.apache.hadoop.hive.metastore.MetaStoreUtils;
 import org.apache.impala.catalog.ArrayType;
 import org.apache.impala.catalog.StructField;
 import org.apache.impala.catalog.StructType;
 import org.apache.impala.common.AnalysisException;
+import org.apache.impala.compat.MetastoreShim;
 import org.apache.impala.thrift.TExprNode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -99,6 +99,9 @@ public class Subquery extends Expr {
   }
 
   @Override
+  protected float computeEvalCost() { return UNKNOWN_COST; }
+
+  @Override
   protected boolean isConstantImpl() { return false; }
 
   /**
@@ -128,7 +131,7 @@ public class Subquery extends Expr {
       Expr expr = stmtResultExprs.get(i);
       String fieldName = null;
       // Check if the label meets the Metastore's requirements.
-      if (MetaStoreUtils.validateName(labels.get(i))) {
+      if (MetastoreShim.validateName(labels.get(i))) {
         fieldName = labels.get(i);
         // Make sure the field names are unique.
         if (!hasUniqueLabels) {
@@ -151,9 +154,9 @@ public class Subquery extends Expr {
    * TODO: Switch to a less restrictive implementation.
    */
   @Override
-  public boolean equals(Object o) {
-    if (!super.equals(o)) return false;
-    return stmt_.toSql().equals(((Subquery)o).stmt_.toSql());
+  public boolean localEquals(Expr that) {
+    return super.localEquals(that) &&
+        stmt_.toSql().equals(((Subquery)that).stmt_.toSql());
   }
 
   @Override

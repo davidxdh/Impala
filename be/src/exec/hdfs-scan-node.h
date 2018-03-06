@@ -20,6 +20,7 @@
 #define IMPALA_EXEC_HDFS_SCAN_NODE_H_
 
 #include <map>
+#include <memory>
 #include <stdint.h>
 #include <vector>
 
@@ -28,7 +29,7 @@
 
 #include "exec/filter-context.h"
 #include "exec/hdfs-scan-node-base.h"
-#include "runtime/disk-io-mgr.h"
+#include "runtime/io/disk-io-mgr.h"
 #include "util/counting-barrier.h"
 #include "util/thread.h"
 
@@ -66,10 +67,11 @@ class HdfsScanNode : public HdfsScanNodeBase {
   HdfsScanNode(ObjectPool* pool, const TPlanNode& tnode, const DescriptorTbl& descs);
   ~HdfsScanNode();
 
-  virtual Status Init(const TPlanNode& tnode, RuntimeState* state);
-  virtual Status Prepare(RuntimeState* state);
-  virtual Status Open(RuntimeState* state);
-  virtual Status GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos);
+  virtual Status Init(const TPlanNode& tnode, RuntimeState* state) WARN_UNUSED_RESULT;
+  virtual Status Prepare(RuntimeState* state) WARN_UNUSED_RESULT;
+  virtual Status Open(RuntimeState* state) WARN_UNUSED_RESULT;
+  virtual Status GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos)
+      WARN_UNUSED_RESULT;
   virtual void Close(RuntimeState* state);
 
   virtual bool HasRowBatchQueue() const { return true; }
@@ -77,23 +79,13 @@ class HdfsScanNode : public HdfsScanNodeBase {
   bool done() const { return done_; }
 
   /// Adds ranges to the io mgr queue and starts up new scanner threads if possible.
-  virtual Status AddDiskIoRanges(const std::vector<DiskIoMgr::ScanRange*>& ranges,
-      int num_files_queued);
+  virtual Status AddDiskIoRanges(const std::vector<io::ScanRange*>& ranges,
+      int num_files_queued) WARN_UNUSED_RESULT;
 
   /// Adds a materialized row batch for the scan node.  This is called from scanner
   /// threads.
   /// This function will block if materialized_row_batches_ is full.
-  void AddMaterializedRowBatch(RowBatch* row_batch);
-
-  /// Sets the scanner specific metadata for 'filename'.
-  /// This is thread safe.
-  void SetFileMetadata(const std::string& filename, void* metadata);
-
-  /// Gets scanner specific metadata for 'filename'.  Scanners can use this to store
-  /// file header information.
-  /// Returns NULL if there is no metadata.
-  /// This is thread safe.
-  void* GetFileMetadata(const std::string& filename);
+  void AddMaterializedRowBatch(std::unique_ptr<RowBatch> row_batch);
 
   /// Called by scanners when a range is complete. Used to record progress and set done_.
   /// This *must* only be called after a scanner has completely finished its
@@ -101,10 +93,10 @@ class HdfsScanNode : public HdfsScanNodeBase {
   /// batch queue. Otherwise, we may lose the last batch due to racing with shutting down
   /// the RowBatch queue.
   virtual void RangeComplete(const THdfsFileFormat::type& file_type,
-      const std::vector<THdfsCompression::type>& compression_type);
+      const std::vector<THdfsCompression::type>& compression_type, bool skipped = false);
 
-  /// Acquires all allocations from pool into scan_node_pool_. Thread-safe.
-  void TransferToScanNodePool(MemPool* pool);
+  /// Transfers all memory from 'pool' to 'scan_node_pool_'.
+  virtual void TransferToScanNodePool(MemPool* pool);
 
  private:
   /// Released when initial ranges are issued in the first call to GetNext().
@@ -114,11 +106,6 @@ class HdfsScanNode : public HdfsScanNodeBase {
   /// left (due to limits) is less than this value, we won't start up optional
   /// scanner threads.
   int64_t scanner_thread_bytes_required_;
-
-  /// Scanner specific per file metadata (e.g. header information) and associated lock.
-  /// This lock cannot be taken together with any other locks except lock_.
-  boost::mutex metadata_lock_;
-  std::map<std::string, void*> per_file_metadata_;
 
   /// Thread group for all scanner worker threads
   ThreadGroup scanner_threads_;
@@ -179,7 +166,7 @@ class HdfsScanNode : public HdfsScanNodeBase {
   /// thread. 'filter_ctxs' is a clone of the class-wide filter_ctxs_, used to filter rows
   /// in this split.
   Status ProcessSplit(const std::vector<FilterContext>& filter_ctxs,
-      DiskIoMgr::ScanRange* scan_range);
+      MemPool* expr_results_pool, io::ScanRange* scan_range) WARN_UNUSED_RESULT;
 
   /// Returns true if there is enough memory (against the mem tracker limits) to
   /// have a scanner thread.
@@ -190,10 +177,14 @@ class HdfsScanNode : public HdfsScanNodeBase {
   bool EnoughMemoryForScannerThread(bool new_thread);
 
   /// Checks for eos conditions and returns batches from materialized_row_batches_.
-  Status GetNextInternal(RuntimeState* state, RowBatch* row_batch, bool* eos);
+  Status GetNextInternal(RuntimeState* state, RowBatch* row_batch, bool* eos)
+      WARN_UNUSED_RESULT;
 
-  /// sets done_ to true and triggers threads to cleanup. Cannot be called with
-  /// any locks taken. Calling it repeatedly ignores subsequent calls.
+  /// Sets done_ to true and triggers threads to cleanup. Must be called with lock_
+  /// taken. Calling it repeatedly ignores subsequent calls.
+  void SetDoneInternal();
+
+  /// Gets lock_ and calls SetDoneInternal()
   void SetDone();
 };
 

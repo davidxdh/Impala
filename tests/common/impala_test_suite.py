@@ -24,7 +24,9 @@ import pprint
 import pwd
 import pytest
 import re
+import shutil
 import subprocess
+import tempfile
 import time
 from functools import wraps
 from getpass import getuser
@@ -51,7 +53,13 @@ from tests.common.test_vector import ImpalaTestDimension
 from tests.performance.query import Query
 from tests.performance.query_exec_functions import execute_using_jdbc
 from tests.performance.query_executor import JdbcQueryExecConfig
-from tests.util.filesystem_utils import IS_S3, S3_BUCKET_NAME, FILESYSTEM_PREFIX
+from tests.util.filesystem_utils import (
+    IS_S3,
+    IS_ADLS,
+    S3_BUCKET_NAME,
+    ADLS_STORE_NAME,
+    FILESYSTEM_PREFIX)
+
 from tests.util.hdfs_util import (
   HdfsConfig,
   get_hdfs_client,
@@ -68,8 +76,18 @@ from tests.util.thrift_util import create_transport
 from hive_metastore import ThriftHiveMetastore
 from thrift.protocol import TBinaryProtocol
 
+# Initializing the logger before conditional imports, since we will need it
+# for them.
 logging.basicConfig(level=logging.INFO, format='-- %(message)s')
 LOG = logging.getLogger('impala_test_suite')
+
+# The ADLS python client isn't downloaded when ADLS isn't the target FS, so do a
+# conditional import.
+if IS_ADLS:
+  try:
+    from tests.util.adls_util import ADLSClient
+  except ImportError:
+    LOG.error("Need the ADLSClient for testing with ADLS")
 
 IMPALAD_HOST_PORT_LIST = pytest.config.option.impalad.split(',')
 assert len(IMPALAD_HOST_PORT_LIST) > 0, 'Must specify at least 1 impalad to target'
@@ -81,9 +99,14 @@ WORKLOAD_DIR = os.environ['IMPALA_WORKLOAD_DIR']
 HDFS_CONF = HdfsConfig(pytest.config.option.minicluster_xml_conf)
 TARGET_FILESYSTEM = os.getenv("TARGET_FILESYSTEM") or "hdfs"
 IMPALA_HOME = os.getenv("IMPALA_HOME")
+EE_TEST_LOGS_DIR = os.getenv("IMPALA_EE_TEST_LOGS_DIR")
 # Match any SET statement. Assume that query options' names
-# only contain alphabets and underscores.
-SET_PATTERN = re.compile(r'\s*set\s*([a-zA-Z_]+)=*', re.I)
+# only contain alphabets, underscores and digits after position 1.
+# The statement may include SQL line comments starting with --, which we need to
+# strip out. The test file parser already strips out comments starting with #.
+COMMENT_LINES_REGEX = r'(?:\s*--.*\n)*'
+SET_PATTERN = re.compile(
+    COMMENT_LINES_REGEX + r'\s*set\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*=*', re.I)
 
 # Base class for Impala tests. All impala test cases should inherit from this class
 class ImpalaTestSuite(BaseTestSuite):
@@ -126,8 +149,11 @@ class ImpalaTestSuite(BaseTestSuite):
 
     cls.impalad_test_service = cls.create_impala_service()
     cls.hdfs_client = cls.create_hdfs_client()
-    cls.s3_client = S3Client(S3_BUCKET_NAME)
-    cls.filesystem_client = cls.s3_client if IS_S3 else cls.hdfs_client
+    cls.filesystem_client = cls.hdfs_client
+    if IS_S3:
+      cls.filesystem_client = S3Client(S3_BUCKET_NAME)
+    elif IS_ADLS:
+      cls.filesystem_client = ADLSClient(ADLS_STORE_NAME)
 
   @classmethod
   def teardown_class(cls):
@@ -161,16 +187,16 @@ class ImpalaTestSuite(BaseTestSuite):
     return hdfs_client
 
   @classmethod
-  def all_db_names(self):
-    results = self.client.execute("show databases").data
+  def all_db_names(cls):
+    results = cls.client.execute("show databases").data
     # Extract first column - database name
     return [row.split("\t")[0] for row in results]
 
   @classmethod
-  def cleanup_db(self, db_name, sync_ddl=1):
-    self.client.execute("use default")
-    self.client.set_configuration({'sync_ddl': sync_ddl})
-    self.client.execute("drop database if exists `" + db_name + "` cascade")
+  def cleanup_db(cls, db_name, sync_ddl=1):
+    cls.client.execute("use default")
+    cls.client.set_configuration({'sync_ddl': sync_ddl})
+    cls.client.execute("drop database if exists `" + db_name + "` cascade")
 
   def __restore_query_options(self, query_options_changed, impalad_client):
     """
@@ -191,7 +217,7 @@ class ImpalaTestSuite(BaseTestSuite):
       if not query_option in self.default_query_options:
         continue
       default_val = self.default_query_options[query_option]
-      query_str = 'SET '+ query_option + '=' + default_val + ';'
+      query_str = 'SET ' + query_option + '="' + default_val + '"'
       try:
         impalad_client.execute(query_str)
       except Exception as e:
@@ -274,7 +300,7 @@ class ImpalaTestSuite(BaseTestSuite):
 
 
   def run_test_case(self, test_file_name, vector, use_db=None, multiple_impalad=False,
-      encoding=None):
+      encoding=None, test_file_vars=None):
     """
     Runs the queries in the specified test based on the vector values
 
@@ -285,6 +311,9 @@ class ImpalaTestSuite(BaseTestSuite):
     Additionally, the encoding for all test data can be specified using the 'encoding'
     parameter. This is useful when data is ingested in a different encoding (ex.
     latin). If not set, the default system encoding will be used.
+    If a dict 'test_file_vars' is provided, then all keys will be replaced with their
+    values in queries before they are executed. Callers need to avoid using reserved key
+    names, see 'reserved_keywords' below.
     """
     table_format_info = vector.get_value('table_format')
     exec_options = vector.get_value('exec_option')
@@ -335,6 +364,15 @@ class ImpalaTestSuite(BaseTestSuite):
           .replace('$FILESYSTEM_PREFIX', FILESYSTEM_PREFIX)
           .replace('$SECONDARY_FILESYSTEM', os.getenv("SECONDARY_FILESYSTEM") or str()))
       if use_db: query = query.replace('$DATABASE', use_db)
+
+      reserved_keywords = ["$DATABASE", "$FILESYSTEM_PREFIX", "$GROUP_NAME",
+                           "$IMPALA_HOME", "$NAMENODE", "$QUERY", "$SECONDARY_FILESYSTEM"]
+
+      if test_file_vars:
+        for key, value in test_file_vars.iteritems():
+          if key in reserved_keywords:
+            raise RuntimeError("Key {0} is reserved".format(key))
+          query = query.replace(key, value)
 
       if 'QUERY_NAME' in test_section:
         LOG.info('Query Name: \n%s\n' % test_section['QUERY_NAME'])
@@ -395,7 +433,13 @@ class ImpalaTestSuite(BaseTestSuite):
         test_section['RESULTS'] = test_section['RESULTS'] \
             .replace(NAMENODE, '$NAMENODE') \
             .replace('$IMPALA_HOME', IMPALA_HOME)
-      if 'RUNTIME_PROFILE' in test_section:
+      if 'RUNTIME_PROFILE_%s' % table_format_info.file_format in test_section:
+        # If this table format has a RUNTIME_PROFILE section specifically for it, evaluate
+        # that section and ignore any general RUNTIME_PROFILE sections.
+        verify_runtime_profile(
+            test_section['RUNTIME_PROFILE_%s' % table_format_info.file_format],
+            result.runtime_profile)
+      elif 'RUNTIME_PROFILE' in test_section:
         verify_runtime_profile(test_section['RUNTIME_PROFILE'], result.runtime_profile)
 
       if 'DML_RESULTS' in test_section:
@@ -409,7 +453,8 @@ class ImpalaTestSuite(BaseTestSuite):
             vector.get_value('table_format').file_format,
             pytest.config.option.update_results, result_section='DML_RESULTS')
     if pytest.config.option.update_results:
-      output_file = os.path.join('/tmp', test_file_name.replace('/','_') + ".test")
+      output_file = os.path.join(EE_TEST_LOGS_DIR,
+                                 test_file_name.replace('/','_') + ".test")
       write_test_file(output_file, sections, encoding=encoding)
 
   def execute_test_case_setup(self, setup_section, table_format):
@@ -580,6 +625,19 @@ class ImpalaTestSuite(BaseTestSuite):
     self.hive_client.drop_table(db_name, table_name, True)
     self.hive_client.create_table(table)
 
+  def clone_table(self, src_tbl, dst_tbl, recover_partitions, vector):
+    src_loc = self._get_table_location(src_tbl, vector)
+    self.client.execute("create external table {0} like {1} location '{2}'"\
+        .format(dst_tbl, src_tbl, src_loc))
+    if recover_partitions:
+      self.client.execute("alter table {0} recover partitions".format(dst_tbl))
+
+  def appx_equals(self, a, b, diff_perc):
+    """Returns True if 'a' and 'b' are within 'diff_perc' percent of each other,
+    False otherwise. 'diff_perc' must be a float in [0,1]."""
+    if a == b: return True # Avoid division by 0
+    assert abs(a - b) / float(max(a,b)) <= diff_perc
+
   def _get_table_location(self, table_name, vector):
     """ Returns the HDFS location of the table """
     result = self.execute_query_using_client(self.client,
@@ -590,24 +648,43 @@ class ImpalaTestSuite(BaseTestSuite):
     # This should never happen.
     assert 0, 'Unable to get location for table: ' + table_name
 
-  def run_stmt_in_hive(self, stmt):
+  def run_stmt_in_hive(self, stmt, username=getuser()):
     """
     Run a statement in Hive, returning stdout if successful and throwing
     RuntimeError(stderr) if not.
     """
-    call = subprocess.Popen(
-        ['beeline',
-         '--outputformat=csv2',
-         '-u', 'jdbc:hive2://' + pytest.config.option.hive_server2,
-         '-n', getuser(),
-         '-e', stmt],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE)
-    (stdout, stderr) = call.communicate()
-    call.wait()
-    if call.returncode != 0:
-      raise RuntimeError(stderr)
-    return stdout
+    # When HiveServer2 is configured to use "local" mode (i.e., MR jobs are run
+    # in-process rather than on YARN), Hadoop's LocalDistributedCacheManager has a
+    # race, wherein it tires to localize jars into
+    # /tmp/hadoop-$USER/mapred/local/<millis>. Two simultaneous Hive queries
+    # against HS2 can conflict here. Weirdly LocalJobRunner handles a similar issue
+    # (with the staging directory) by appending a random number. To overcome this,
+    # in the case that HS2 is on the local machine (which we conflate with also
+    # running MR jobs locally), we move the temporary directory into a unique
+    # directory via configuration. This workaround can be removed when
+    # https://issues.apache.org/jira/browse/MAPREDUCE-6441 is resolved.
+    # A similar workaround is used in bin/load-data.py.
+    tmpdir = None
+    beeline_opts = []
+    if pytest.config.option.hive_server2.startswith("localhost:"):
+      tmpdir = tempfile.mkdtemp(prefix="impala-tests-")
+      beeline_opts += ['--hiveconf', 'mapreduce.cluster.local.dir={0}'.format(tmpdir)]
+    try:
+      call = subprocess.Popen(
+          ['beeline',
+           '--outputformat=csv2',
+           '-u', 'jdbc:hive2://' + pytest.config.option.hive_server2,
+           '-n', username,
+           '-e', stmt] + beeline_opts,
+          stdout=subprocess.PIPE,
+          stderr=subprocess.PIPE)
+      (stdout, stderr) = call.communicate()
+      call.wait()
+      if call.returncode != 0:
+        raise RuntimeError(stderr)
+      return stdout
+    finally:
+      if tmpdir is not None: shutil.rmtree(tmpdir)
 
   def hive_partition_names(self, table_name):
     """Find the names of the partitions of a table, as Hive sees them.
@@ -633,7 +710,7 @@ class ImpalaTestSuite(BaseTestSuite):
     # If 'skip_hbase' is specified or the filesystem is isilon, s3 or local, we don't
     # need the hbase dimension.
     if pytest.config.option.skip_hbase or TARGET_FILESYSTEM.lower() \
-        in ['s3', 'isilon', 'local']:
+        in ['s3', 'isilon', 'local', 'adls']:
       for tf_dimension in tf_dimensions:
         if tf_dimension.value.file_format == "hbase":
           tf_dimensions.remove(tf_dimension)
@@ -651,7 +728,8 @@ class ImpalaTestSuite(BaseTestSuite):
       cluster_sizes = ALL_NODES_ONLY
     return create_exec_option_dimension(cluster_sizes, disable_codegen_options,
                                         batch_sizes,
-                                        exec_single_node_option=exec_single_node_option)
+                                        exec_single_node_option=exec_single_node_option,
+                                        disable_codegen_rows_threshold_options=[0])
 
   @classmethod
   def exploration_strategy(cls):

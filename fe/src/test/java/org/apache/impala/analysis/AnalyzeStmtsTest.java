@@ -18,20 +18,23 @@
 package org.apache.impala.analysis;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 import java.lang.reflect.Field;
 import java.util.List;
 
+import org.apache.impala.catalog.Column;
 import org.apache.impala.catalog.PrimitiveType;
 import org.apache.impala.catalog.ScalarType;
+import org.apache.impala.catalog.Table;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.AnalysisException;
+import org.apache.impala.common.RuntimeEnv;
 import org.junit.Assert;
 import org.junit.Test;
 
-import org.apache.impala.common.RuntimeEnv;
-import org.apache.impala.testutil.TestUtils;
+import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
@@ -119,7 +122,7 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     // Parent/collection join requires the child to use an alias of the parent.
     AnalysisError(String.format(
         "select %s from allcomplextypes, %s", collectionField, collectionTable),
-        createAnalyzer("functional"),
+        createAnalysisCtx("functional"),
         String.format("Could not resolve table reference: '%s'", collectionTable));
     AnalysisError(String.format(
         "select %s from functional.allcomplextypes, %s",
@@ -312,8 +315,53 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     AnalysisError("select alltypes.smallint_col, functional.alltypes.int_col " +
         "from alltypes inner join functional.alltypes " +
         "on (alltypes.id = functional.alltypes.id)",
-        createAnalyzer("functional"),
+        createAnalysisCtx("functional"),
         "Duplicate table alias: 'functional.alltypes'");
+  }
+
+  @Test
+  public void TestTableSampleClause() {
+    long bytesPercVals[] = new long[] { 0, 10, 50, 100 };
+    long randomSeedVals[] = new long[] { 0, 10, 100, Integer.MAX_VALUE, Long.MAX_VALUE };
+    for (long bytesPerc: bytesPercVals) {
+      String tblSmpl = String.format("tablesample system (%s)", bytesPerc);
+      AnalyzesOk("select * from functional.alltypes  " + tblSmpl);
+      for (long randomSeed: randomSeedVals) {
+        String repTblSmpl = String.format("%s repeatable (%s)", tblSmpl, randomSeed);
+        AnalyzesOk("select * from functional.alltypes  " + repTblSmpl);
+      }
+    }
+
+    // Invalid bytes percent. Negative values do not parse.
+    AnalysisError("select * from functional.alltypes tablesample system (101)",
+        "Invalid percent of bytes value '101'. " +
+        "The percent of bytes to sample must be between 0 and 100.");
+    AnalysisError("select * from functional.alltypes tablesample system (1000)",
+        "Invalid percent of bytes value '1000'. " +
+        "The percent of bytes to sample must be between 0 and 100.");
+
+    // Only applicable to HDFS base table refs.
+    AnalysisError("select * from functional_kudu.alltypes tablesample system (10)",
+        "TABLESAMPLE is only supported on HDFS tables: functional_kudu.alltypes");
+    AnalysisError("select * from functional_hbase.alltypes tablesample system (10)",
+        "TABLESAMPLE is only supported on HDFS tables: functional_hbase.alltypes");
+    AnalysisError("select * from functional.alltypes_datasource tablesample system (10)",
+        "TABLESAMPLE is only supported on HDFS tables: " +
+        "functional.alltypes_datasource");
+    AnalysisError("select * from (select * from functional.alltypes) v " +
+        "tablesample system (10)",
+        "TABLESAMPLE is only supported on HDFS tables: v");
+    AnalysisError("with v as (select * from functional.alltypes) " +
+        "select * from v tablesample system (10)",
+        "TABLESAMPLE is only supported on HDFS tables: v");
+    AnalysisError("select * from functional.alltypes_view tablesample system (10)",
+        "TABLESAMPLE is only supported on HDFS tables: functional.alltypes_view");
+    AnalysisError("select * from functional.allcomplextypes.int_array_col " +
+        "tablesample system (10)",
+        "TABLESAMPLE is only supported on HDFS tables: int_array_col");
+    AnalysisError("select * from functional.allcomplextypes a, a.int_array_col " +
+        "tablesample system (10)",
+        "TABLESAMPLE is only supported on HDFS tables: int_array_col");
   }
 
   /**
@@ -362,7 +410,6 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     }
     List<List<Integer>> expectedPaths = Lists.newArrayList(expectedAbsPaths);
     Assert.assertEquals("Mismatched absolute paths.", expectedPaths, actualAbsPaths);
-
   }
 
   /**
@@ -757,13 +804,13 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     AnalyzesOk("select 1 from a.a");
     AnalyzesOk("select 1 from a.a.a");
     AnalyzesOk("select 1 from a.a.a.a");
-    AnalyzesOk("select 1 from a", createAnalyzer("a"));
-    AnalyzesOk("select 1 from a.a.a.a", createAnalyzer("a"));
+    AnalyzesOk("select 1 from a", createAnalysisCtx("a"));
+    AnalyzesOk("select 1 from a.a.a.a", createAnalysisCtx("a"));
 
     // Table paths are ambiguous.
-    AnalysisError("select 1 from a.a", createAnalyzer("a"),
+    AnalysisError("select 1 from a.a", createAnalysisCtx("a"),
         "Table reference is ambiguous: 'a.a'");
-    AnalysisError("select 1 from a.a.a", createAnalyzer("a"),
+    AnalysisError("select 1 from a.a.a", createAnalysisCtx("a"),
         "Table reference is ambiguous: 'a.a.a'");
 
     // Ambiguous reference to registered table aliases.
@@ -1080,18 +1127,18 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     // test auto-generated column labels by enforcing their use in inline views
     AnalyzesOk("select _c0, a, int_col, _c3 from " +
         "(select int_col * 1, int_col as a, int_col, !bool_col, concat(string_col) " +
-        "from functional.alltypes) t", createAnalyzerUsingHiveColLabels());
+        "from functional.alltypes) t", createAnalysisCtxUsingHiveColLabels());
     // test auto-generated column labels in group by and order by
     AnalyzesOk("select _c0, count(a), count(int_col), _c3 from " +
         "(select int_col * 1, int_col as a, int_col, !bool_col, concat(string_col) " +
         "from functional.alltypes) t group by _c0, _c3 order by _c0 limit 10",
-        createAnalyzerUsingHiveColLabels());
+        createAnalysisCtxUsingHiveColLabels());
     // test auto-generated column labels in multiple scopes
     AnalyzesOk("select x.front, x._c1, x._c2 from " +
         "(select y.back as front, y._c0 * 10, y._c2 + 2 from " +
         "(select int_col * 10, int_col as back, int_col + 2 from " +
         "functional.alltypestiny) y) x",
-        createAnalyzerUsingHiveColLabels());
+        createAnalysisCtxUsingHiveColLabels());
     // IMPALA-3537: Test that auto-generated column labels are only applied in
     // the appropriate child query blocks.
     SelectStmt colLabelsStmt =
@@ -1105,13 +1152,13 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         "(select int_col * 2, id from functional.alltypes) a inner join " +
         "(select int_col + 6, id from functional.alltypes) b " +
         "on (a.id = b.id)",
-        createAnalyzerUsingHiveColLabels(),
+        createAnalysisCtxUsingHiveColLabels(),
         "Column/field reference is ambiguous: '_c0'");
     // auto-generated column doesn't exist
     AnalysisError("select _c0, a, _c2, _c3 from " +
         "(select int_col * 1, int_col as a, int_col, !bool_col, concat(string_col) " +
         "from functional.alltypes) t",
-        createAnalyzerUsingHiveColLabels(),
+        createAnalysisCtxUsingHiveColLabels(),
         "Could not resolve column/field reference: '_c2'");
 
     // Regression test for IMPALA-984.
@@ -1201,7 +1248,7 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     AnalyzesOk("select cnt from functional.allcomplextypes, " +
         "(select count(1) cnt from functional.allcomplextypes) v");
     AnalyzesOk("select cnt from functional.allcomplextypes, " +
-        "(select count(1) cnt from allcomplextypes) v", createAnalyzer("functional"));
+        "(select count(1) cnt from allcomplextypes) v", createAnalysisCtx("functional"));
     // Illegal correlated reference.
     AnalysisError("select cnt from functional.allcomplextypes t, " +
         "(select count(1) cnt from t) v",
@@ -1311,6 +1358,11 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         "join functional.alltypes b on (a.bigint_col = " +
         "lag(b.int_col) over(order by a.bigint_col))",
         "analytic expression not allowed in ON clause");
+    AnalysisError(
+        "select a.int_col from functional.alltypes a " +
+        "join functional.alltypes b on (a.id = b.id) and " +
+        "a.int_col < (select min(id) from functional.alltypes c)",
+        "Subquery is not allowed in ON clause");
     // unknown column
     AnalysisError(
         "select a.int_col from functional.alltypes a " +
@@ -1685,12 +1737,7 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
 
   @Test
   public void TestSelectListHints() throws AnalysisException {
-    String[][] hintStyles = new String[][] {
-        new String[] { "/* +", "*/" }, // traditional commented hint
-        new String[] { "\n-- +", "\n" }, // eol commented hint
-        new String[] { "", "" } // without surrounding characters
-    };
-    for (String[] hintStyle: hintStyles) {
+    for (String[] hintStyle: hintStyles_) {
       String prefix = hintStyle[0];
       String suffix = hintStyle[1];
       AnalyzesOk(String.format(
@@ -1713,6 +1760,12 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
 
   @Test
   public void TestInsertHints() throws AnalysisException {
+    // Test table to make sure that conflicting hints and table properties result in a
+    // warning.
+    addTestDb("test_sort_by", "Test DB for SORT BY clause.");
+    addTestTable("create table test_sort_by.alltypes (id int, int_col int, " +
+        "bool_col boolean) partitioned by (year int, month int) " +
+        "sort by (int_col, bool_col) location '/'");
     for (String[] hintStyle: getHintStyles()) {
       String prefix = hintStyle[0];
       String suffix = hintStyle[1];
@@ -1732,6 +1785,10 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
       AnalyzesOk(String.format(
           "insert into table functional.alltypesnopart %sshuffle%s " +
           "select * from functional.alltypesnopart", prefix, suffix));
+      // Insert hints are ok for Kudu tables.
+      AnalyzesOk(String.format(
+          "insert into table functional_kudu.alltypes %sshuffle%s " +
+          "select * from functional_kudu.alltypes", prefix, suffix));
       // Plan hints do not make sense for inserting into HBase tables.
       AnalysisError(String.format(
           "insert into table functional_hbase.alltypes %sshuffle%s " +
@@ -1760,45 +1817,13 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
           "/* +clustered,noclustered */ select * from functional.alltypes", prefix,
           suffix), "Conflicting INSERT hints: clustered and noclustered");
 
-      // Below are tests for hints that are not supported by the legacy syntax.
-      if (prefix == "[") continue;
-
-      // Tests for sortby hint
-      AnalyzesOk(String.format("insert into functional.alltypessmall " +
-          "partition (year, month) %ssortby(int_col)%s select * from functional.alltypes",
-          prefix, suffix));
-      AnalyzesOk(String.format("insert into functional.alltypessmall " +
-          "partition (year, month) %sshuffle,clustered,sortby(int_col)%s select * from " +
-          "functional.alltypes", prefix, suffix));
-      AnalyzesOk(String.format("insert into functional.alltypessmall " +
-          "partition (year, month) %ssortby(int_col, bool_col)%s select * from " +
-          "functional.alltypes", prefix, suffix));
-      AnalyzesOk(String.format("insert into functional.alltypessmall " +
-          "partition (year, month) %sshuffle,clustered,sortby(int_col,bool_col)%s " +
-          "select * from functional.alltypes", prefix, suffix));
-      AnalyzesOk(String.format("insert into functional.alltypessmall " +
-          "partition (year, month) %sshuffle,sortby(int_col,bool_col),clustered%s " +
-          "select * from functional.alltypes", prefix, suffix));
-      AnalyzesOk(String.format("insert into functional.alltypessmall " +
-          "partition (year, month) %ssortby(int_col,bool_col),shuffle,clustered%s " +
-          "select * from functional.alltypes", prefix, suffix));
-      // Column in sortby hint must exist.
-      AnalysisError(String.format("insert into functional.alltypessmall " +
-          "partition (year, month) %ssortby(foo)%s select * from functional.alltypes",
-          prefix, suffix), "Could not find SORTBY hint column 'foo' in table.");
-      // Column in sortby hint must not be a Hdfs partition column.
-      AnalysisError(String.format("insert into functional.alltypessmall " +
-          "partition (year, month) %ssortby(year)%s select * from " +
+      // noclustered hint on a table with sort.columns issues a warning.
+      AnalyzesOk(String.format(
+          "insert into test_sort_by.alltypes partition (year, month) " +
+          "%snoclustered%s select id, int_col, bool_col, year, month from " +
           "functional.alltypes", prefix, suffix),
-          "SORTBY hint column list must not contain Hdfs partition column: 'year'");
-      // Column in sortby hint must not be a Kudu primary key column.
-      AnalysisError(String.format("insert into functional_kudu.alltypessmall " +
-          "%ssortby(id)%s select * from functional_kudu.alltypes", prefix, suffix),
-          "SORTBY hint column list must not contain Kudu primary key column: 'id'");
-      // sortby() hint is not supported in UPSERT queries
-      AnalysisError(String.format("upsert into functional_kudu.alltypessmall " +
-          "%ssortby(id)%s select * from functional_kudu.alltypes", prefix, suffix),
-          "SORTBY hint is not supported in UPSERT statements.");
+          "Insert statement has 'noclustered' hint, but table has 'sort.columns' " +
+          "property. The 'noclustered' hint will be ignored.");
     }
 
     // Multiple non-conflicting hints and case insensitivity of hints.
@@ -1913,6 +1938,9 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     AnalysisError("select functional.alltypes.*, max(string_col) from " +
         "functional.alltypes", "cannot combine '*' in select list with grouping or " +
         "aggregation");
+    AnalysisError("select * from functional.alltypes order by count(*)",
+        "select list expression not produced by aggregation output " +
+        "(missing from GROUP BY clause?): *");
 
     // only count() allows '*'
     AnalysisError("select avg(*) from functional.testtbl",
@@ -2018,6 +2046,59 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     AnalyzesOk("select tinyint_col, count(distinct int_col),"
         + "min(distinct smallint_col), max(distinct string_col) "
         + "from functional.alltypesagg group by 1");
+
+    // IMPALA-6114: Test that numeric literals having the same value, but different types are
+    // considered distinct.
+    AnalyzesOk("select distinct cast(0 as decimal(14)), 0 from functional.alltypes");
+  }
+
+  @Test
+  public void TestSampledNdv() throws AnalysisException {
+    Table allScalarTypes = addAllScalarTypesTestTable();
+    String tblName = allScalarTypes.getFullName();
+
+    // Positive tests: Test all scalar types and valid sampling percents.
+    double validSamplePercs[] = new double[] { 0.0, 0.1, 0.2, 0.5, 0.8, 1.0 };
+    for (double perc: validSamplePercs) {
+      List<String> allAggFnCalls = Lists.newArrayList();
+      for (Column col: allScalarTypes.getColumns()) {
+        String aggFnCall = String.format("sampled_ndv(%s, %s)", col.getName(), perc);
+        allAggFnCalls.add(aggFnCall);
+        String stmtSql = String.format("select %s from %s", aggFnCall, tblName);
+        SelectStmt stmt = (SelectStmt) AnalyzesOk(stmtSql);
+        // Verify that the resolved function signature matches as expected.
+        Type[] args = stmt.getAggInfo().getAggregateExprs().get(0).getFn().getArgs();
+        assertEquals(args.length, 2);
+        assertTrue(col.getType().matchesType(args[0]) ||
+            col.getType().isStringType() && args[0].equals(Type.STRING));
+        assertEquals(Type.DOUBLE, args[1]);
+      }
+      // Test several calls in the same query block.
+      AnalyzesOk(String.format(
+          "select %s from %s", Joiner.on(",").join(allAggFnCalls), tblName));
+    }
+
+    // Negative tests: Incorrect number of args.
+    AnalysisError(
+        String.format("select sampled_ndv() from %s", tblName),
+        "No matching function with signature: sampled_ndv().");
+    AnalysisError(
+        String.format("select sampled_ndv(int_col) from %s", tblName),
+        "No matching function with signature: sampled_ndv(INT).");
+    AnalysisError(
+        String.format("select sampled_ndv(int_col, 0.1, 10) from %s", tblName),
+        "No matching function with signature: sampled_ndv(INT, DECIMAL(1,1), TINYINT).");
+
+    // Negative tests: Invalid sampling percent.
+    String invalidSamplePercs[] = new String[] {
+        "int_col", "double_col", "100 / 10", "-0.1", "1.1", "100", "50", "-50", "NULL"
+    };
+    for (String invalidPerc: invalidSamplePercs) {
+      AnalysisError(
+          String.format("select sampled_ndv(int_col, %s) from %s", invalidPerc, tblName),
+          "Second parameter of SAMPLED_NDV() must be a numeric literal in [0,1]: " +
+          invalidPerc);
+    }
   }
 
   @Test
@@ -2671,19 +2752,19 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     AnalyzesOk("with t1 as (select int_col x, bigint_col y from alltypes), " +
         "alltypes as (select x a, y b from t1)" +
         "select a, b from alltypes",
-        createAnalyzer("functional"));
+        createAnalysisCtx("functional"));
     // Recursion is prevented because of scoping rules. The inner 'complex_view'
     // refers to a view in the catalog.
     AnalyzesOk("with t1 as (select abc x, xyz y from complex_view), " +
         "complex_view as (select x a, y b from t1)" +
         "select a, b from complex_view",
-        createAnalyzer("functional"));
+        createAnalysisCtx("functional"));
     // Nested WITH clauses. Scoping prevents recursion.
     AnalyzesOk("with t1 as (with t1 as (select int_col x, bigint_col y from alltypes) " +
         "select x, y from t1), " +
         "alltypes as (select x a, y b from t1) " +
         "select a, b from alltypes",
-        createAnalyzer("functional"));
+        createAnalysisCtx("functional"));
     // Nested WITH clause inside a subquery.
     AnalyzesOk("with t1 as " +
         "(select * from (with t2 as (select * from functional.alltypes) " +
@@ -2756,7 +2837,7 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     // The inner alltypes_view gets resolved to the catalog view.
     AnalyzesOk("with alltypes_view as (select int_col x from alltypes_view) " +
         "select x from alltypes_view",
-        createAnalyzer("functional"));
+        createAnalysisCtx("functional"));
     // The inner 't' is resolved to a non-existent base table.
     AnalysisError("with t as (select int_col x, bigint_col y from t1) " +
         "select x, y from t",
@@ -2966,11 +3047,7 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
       AnalysisError(String.format("load data inpath '%s' %s into table " +
           "tpch.lineitem", "file:///test-warehouse/test.out", overwrite),
           "INPATH location 'file:/test-warehouse/test.out' must point to an " +
-          "HDFS or S3A filesystem");
-      AnalysisError(String.format("load data inpath '%s' %s into table " +
-          "tpch.lineitem", "s3n://bucket/test-warehouse/test.out", overwrite),
-          "INPATH location 's3n://bucket/test-warehouse/test.out' must point to an " +
-          "HDFS or S3A filesystem");
+          "HDFS, S3A or ADL filesystem.");
 
       // File type / table type mismatch.
       AnalyzesOk(String.format("load data inpath '%s' %s into table " +
@@ -3213,7 +3290,8 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
 
     // Unknown target DB
     AnalysisError("INSERT " + qualifier + " table UNKNOWNDB.alltypesnopart SELECT * " +
-        "from functional.alltypesnopart", "Database does not exist: UNKNOWNDB");
+        "from functional.alltypesnopart",
+        "Database does not exist: UNKNOWNDB");
   }
 
   /**
@@ -3511,11 +3589,11 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
   @Test
   public void TestClone() {
     testNumberOfMembers(QueryStmt.class, 9);
-    testNumberOfMembers(UnionStmt.class, 8);
+    testNumberOfMembers(UnionStmt.class, 9);
     testNumberOfMembers(ValuesStmt.class, 0);
 
     // Also check TableRefs.
-    testNumberOfMembers(TableRef.class, 19);
+    testNumberOfMembers(TableRef.class, 20);
     testNumberOfMembers(BaseTableRef.class, 0);
     testNumberOfMembers(InlineViewRef.class, 8);
   }

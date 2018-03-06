@@ -20,10 +20,10 @@ package org.apache.impala.analysis;
 import java.util.ArrayList;
 import java.util.List;
 
+import org.apache.impala.catalog.AggregateFunction;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.InternalException;
-import org.apache.impala.planner.DataPartition;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -246,7 +246,10 @@ public class AggregateInfo extends AggregateInfoBase {
         throw new AnalysisException(
             "all DISTINCT aggregate functions need to have the same set of "
             + "parameters as " + distinctAggExprs.get(0).toSql()
-            + "; deviating function: " + distinctAggExprs.get(i).toSql());
+            + "; deviating function: " + distinctAggExprs.get(i).toSql() + "\n"
+            + "Consider using NDV() instead of COUNT(DISTINCT) if estimated "
+            + "counts are acceptable. Enable the APPX_COUNT_DISTINCT query "
+            + "option to perform this rewrite automatically.");
       }
     }
 
@@ -574,7 +577,7 @@ public class AggregateInfo extends AggregateInfoBase {
           new SlotRef(outputTupleDesc_.getSlots().get(i)),
           new SlotRef(intermediateTupleDesc_.getSlots().get(i)));
       if (i < groupingExprs_.size()) {
-        analyzer.createAuxEquivPredicate(
+        analyzer.createAuxEqPredicate(
             new SlotRef(outputTupleDesc_.getSlots().get(i)),
             new SlotRef(intermediateTupleDesc_.getSlots().get(i)));
       }
@@ -652,6 +655,17 @@ public class AggregateInfo extends AggregateInfoBase {
   }
 
   /**
+   * Returns true if there is a single count(*) materialized aggregate expression.
+   */
+  public boolean hasCountStarOnly() {
+    if (getMaterializedAggregateExprs().size() != 1) return false;
+    if (isDistinctAgg()) return false;
+    FunctionCallExpr origExpr = getMaterializedAggregateExprs().get(0);
+    if (!origExpr.getFnName().getFunction().equalsIgnoreCase("count")) return false;
+    return origExpr.getParams().isStar();
+  }
+
+  /**
    * Validates the internal state of this agg info: Checks that the number of
    * materialized slots of the output tuple corresponds to the number of materialized
    * aggregate functions plus the number of grouping exprs. Also checks that the return
@@ -698,6 +712,17 @@ public class AggregateInfo extends AggregateInfoBase {
         mergeAggExpr.validateMergeAggFn(aggregateExprs_.get(i));
       }
     }
+  }
+
+  /// Return true if any aggregate functions have a serialize function.
+  /// Only valid to call once analyzed.
+  public boolean needsSerialize() {
+    for (FunctionCallExpr aggregateExpr: aggregateExprs_) {
+      Preconditions.checkState(aggregateExpr.isAnalyzed());
+      AggregateFunction fn = (AggregateFunction)aggregateExpr.getFn();
+      if (fn.getSerializeFnSymbol() != null) return true;
+    }
+    return false;
   }
 
   @Override

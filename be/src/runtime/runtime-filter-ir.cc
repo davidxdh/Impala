@@ -17,15 +17,13 @@
 
 #include "runtime/runtime-filter.h"
 
-#include "runtime/raw-value.h"
-
 using namespace impala;
 
-bool RuntimeFilter::Eval(void* val, const ColumnType& col_type) const noexcept {
-  // Safe to read bloom_filter_ concurrently with any ongoing SetBloomFilter() thanks
-  // to a) the atomicity of / pointer assignments and b) the x86 TSO memory model.
-  if (bloom_filter_ == BloomFilter::ALWAYS_TRUE_FILTER) return true;
+bool IR_ALWAYS_INLINE RuntimeFilter::Eval(
+    void* val, const ColumnType& col_type) const noexcept {
+  DCHECK(is_bloom_filter());
+  if (bloom_filter_.Load() == BloomFilter::ALWAYS_TRUE_FILTER) return true;
   uint32_t h = RawValue::GetHashValue(val, col_type,
       RuntimeFilterBank::DefaultHashSeed());
-  return bloom_filter_->Find(h);
+  return bloom_filter_.Load()->Find(h);
 }

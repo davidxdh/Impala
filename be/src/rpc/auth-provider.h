@@ -19,12 +19,12 @@
 #define IMPALA_RPC_AUTH_PROVIDER_H
 
 #include <string>
-#include <boost/scoped_ptr.hpp>
 #include <boost/thread/mutex.hpp>
 #include <sasl/sasl.h>
 
 #include "common/status.h"
 #include "util/promise.h"
+#include "util/thread.h"
 
 namespace sasl { class TSasl; }
 
@@ -39,19 +39,21 @@ class Thread;
 class AuthProvider {
  public:
   /// Initialises any state required to perform authentication using this provider.
-  virtual Status Start() = 0;
+  virtual Status Start() WARN_UNUSED_RESULT = 0;
 
   /// Creates a new Thrift transport factory in the out parameter that performs
   /// authorisation per this provider's protocol.
   virtual Status GetServerTransportFactory(
-      boost::shared_ptr<apache::thrift::transport::TTransportFactory>* factory) = 0;
+      boost::shared_ptr<apache::thrift::transport::TTransportFactory>* factory)
+      WARN_UNUSED_RESULT = 0;
 
-  /// Called by Thrift clients to wrap a raw transport with any intermediate transport that
-  /// an auth protocol requires.
+  /// Called by Thrift clients to wrap a raw transport with any intermediate transport
+  /// that an auth protocol requires.
   virtual Status WrapClientTransport(const std::string& hostname,
       boost::shared_ptr<apache::thrift::transport::TTransport> raw_transport,
       const std::string& service_name,
-      boost::shared_ptr<apache::thrift::transport::TTransport>* wrapped_transport) = 0;
+      boost::shared_ptr<apache::thrift::transport::TTransport>* wrapped_transport)
+      WARN_UNUSED_RESULT = 0;
 
   /// Returns true if this provider uses Sasl at the transport layer.
   virtual bool is_sasl() = 0;
@@ -76,6 +78,7 @@ class SaslAuthProvider : public AuthProvider {
   /// Wrap the client transport with a new TSaslClientTransport.  This is only for
   /// internal connections.  Since, as a daemon, we only do Kerberos and not LDAP,
   /// we can go straight to Kerberos.
+  /// This is only applicable to Thrift connections and not KRPC connections.
   virtual Status WrapClientTransport(const std::string& hostname,
       boost::shared_ptr<apache::thrift::transport::TTransport> raw_transport,
       const std::string& service_name,
@@ -85,6 +88,7 @@ class SaslAuthProvider : public AuthProvider {
   /// When a connection comes in, thrift will see one of the above on the wire, do
   /// a table lookup, and associate the appropriate callbacks with the connection.
   /// Then presto! You've got authentication for the connection.
+  /// This is only applicable to Thrift connections and not KRPC connections.
   virtual Status GetServerTransportFactory(
       boost::shared_ptr<apache::thrift::transport::TTransportFactory>* factory);
 
@@ -139,8 +143,10 @@ class SaslAuthProvider : public AuthProvider {
   /// function as a client.
   bool needs_kinit_;
 
-  /// Runs "RunKinit" below if needs_kinit_ is true.
-  boost::scoped_ptr<Thread> kinit_thread_;
+  /// Runs "RunKinit" below if needs_kinit_ is true and FLAGS_use_kudu_kinit is false.
+  /// Once started, this thread lives as long as the process does and periodically forks
+  /// impalad and execs the 'kinit' process.
+  std::unique_ptr<Thread> kinit_thread_;
 
   /// Periodically (roughly once every FLAGS_kerberos_reinit_interval minutes) calls kinit
   /// to get a ticket granting ticket from the kerberos server for principal_, which is
@@ -150,11 +156,8 @@ class SaslAuthProvider : public AuthProvider {
   /// Additionally, if the first attempt fails, this method will return.
   void RunKinit(Promise<Status>* first_kinit);
 
-  /// We use this to ensure that we only set up environment variables one time.
-  static bool env_setup_complete_;
-
   /// One-time kerberos-specific environment variable setup.  Called by InitKerberos().
-  Status InitKerberosEnv();
+  Status InitKerberosEnv() WARN_UNUSED_RESULT;
 };
 
 /// This provider implements no authentication, so any connection is immediately
@@ -178,7 +181,10 @@ class NoAuthProvider : public AuthProvider {
 
 /// The first entry point to the authentication subsystem.  Performs initialization
 /// of Sasl, the global AuthManager, and the two authentication providers.  Appname
-/// should generally be argv[0].
+/// should generally be argv[0]. Normally, InitAuth() should only be called once.
+/// In certain test cases, we may call it more than once. It's important that InitAuth()
+/// is called with the same 'appname' if it's called more than once. Otherwise, error
+/// status will be returned.
 Status InitAuth(const std::string& appname);
 
 }

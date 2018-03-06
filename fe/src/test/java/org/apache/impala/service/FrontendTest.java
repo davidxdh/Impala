@@ -18,37 +18,30 @@
 package org.apache.impala.service;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.fail;
 
+import java.util.Arrays;
 import java.util.List;
 import java.util.Set;
 
-import org.apache.commons.lang.exception.ExceptionUtils;
-import org.apache.hive.service.cli.thrift.TGetCatalogsReq;
-import org.apache.hive.service.cli.thrift.TGetColumnsReq;
-import org.apache.hive.service.cli.thrift.TGetFunctionsReq;
-import org.apache.hive.service.cli.thrift.TGetInfoReq;
-import org.apache.hive.service.cli.thrift.TGetSchemasReq;
-import org.apache.hive.service.cli.thrift.TGetTablesReq;
-import org.junit.Test;
-import org.apache.impala.analysis.AuthorizationTest;
-import org.apache.impala.authorization.AuthorizationConfig;
-import org.apache.impala.catalog.Catalog;
+import org.apache.hive.service.rpc.thrift.TGetCatalogsReq;
+import org.apache.hive.service.rpc.thrift.TGetColumnsReq;
+import org.apache.hive.service.rpc.thrift.TGetFunctionsReq;
+import org.apache.hive.service.rpc.thrift.TGetInfoReq;
+import org.apache.hive.service.rpc.thrift.TGetSchemasReq;
+import org.apache.hive.service.rpc.thrift.TGetTablesReq;
+import org.apache.impala.catalog.Db;
 import org.apache.impala.catalog.PrimitiveType;
-import org.apache.impala.common.AnalysisException;
+import org.apache.impala.catalog.Table;
+import org.apache.impala.common.FrontendTestBase;
 import org.apache.impala.common.ImpalaException;
-import org.apache.impala.testutil.ImpaladTestCatalog;
-import org.apache.impala.testutil.TestUtils;
-import org.apache.impala.thrift.TExecRequest;
 import org.apache.impala.thrift.TMetadataOpRequest;
 import org.apache.impala.thrift.TMetadataOpcode;
-import org.apache.impala.thrift.TQueryCtx;
-import org.apache.impala.thrift.TQueryOptions;
 import org.apache.impala.thrift.TResultRow;
 import org.apache.impala.thrift.TResultSet;
+import org.junit.Test;
 
-import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
 
@@ -60,73 +53,7 @@ import com.google.common.collect.Sets;
  * result set.
  *
  */
-public class FrontendTest {
-  private static Frontend fe_ = new Frontend(
-      AuthorizationConfig.createAuthDisabledConfig(), new ImpaladTestCatalog());
-
-  @Test
-  public void TestCatalogReadiness() throws ImpalaException {
-    // Test different authorization configurations.
-    List<AuthorizationConfig> authzConfigs = Lists.newArrayList();
-    authzConfigs.add(AuthorizationConfig.createAuthDisabledConfig());
-    authzConfigs.add(AuthorizationTest.createPolicyFileAuthzConfig());
-    authzConfigs.add(AuthorizationTest.createSentryServiceAuthzConfig());
-    // Test the behavior with different stmt types.
-    List<String> testStmts = Lists.newArrayList();
-    testStmts.add("select * from functional.alltypesagg");
-    testStmts.add("select 1");
-    testStmts.add("show tables in tpch");
-    testStmts.add("create table tpch.ready_test (i int)");
-    testStmts.add("insert into functional.alltypes partition (year, month) " +
-        "select * from functional.alltypestiny");
-    for (AuthorizationConfig authzConfig: authzConfigs) {
-      ImpaladTestCatalog catalog = new ImpaladTestCatalog(authzConfig);
-      Frontend fe = new Frontend(authzConfig, catalog);
-
-      // When the catalog is ready, all stmts should pass analysis.
-      Preconditions.checkState(catalog.isReady());
-      for (String stmt: testStmts) testCatalogIsReady(stmt, fe);
-
-      // When the catalog is not ready, all stmts should fail analysis.
-      catalog.setIsReady(false);
-      for (String stmt: testStmts) testCatalogIsNotReady(stmt, fe);
-    }
-  }
-
-  /**
-   * Creates an exec request from 'stmt' using the given 'fe'.
-   * Expects that no exception is thrown.
-   */
-  private void testCatalogIsReady(String stmt, Frontend fe) {
-    System.out.println(stmt);
-    TQueryCtx queryCtx = TestUtils.createQueryContext(
-        Catalog.DEFAULT_DB, AuthorizationTest.USER.getName());
-    queryCtx.client_request.setStmt(stmt);
-    try {
-      fe.createExecRequest(queryCtx, new StringBuilder());
-    } catch (Exception e) {
-      fail("Failed to create exec request due to: " + ExceptionUtils.getStackTrace(e));
-    }
-  }
-
-  /**
-   * Creates an exec request from 'stmt' using the given 'fe'.
-   * Expects that the stmt fails to analyze because the catalog is not ready.
-   */
-  private void testCatalogIsNotReady(String stmt, Frontend fe) {
-    TQueryCtx queryCtx = TestUtils.createQueryContext(
-        Catalog.DEFAULT_DB, AuthorizationTest.USER.getName());
-    queryCtx.client_request.setStmt(stmt);
-    try {
-      fe.createExecRequest(queryCtx, new StringBuilder());
-      fail("Expected failure to due uninitialized catalog.");
-    } catch (AnalysisException e) {
-      assertEquals("This Impala daemon is not ready to accept user requests. " +
-          "Status: Waiting for catalog update from the StateStore.", e.getMessage());
-    } catch (Exception e) {
-      fail("Failed to create exec request due to: " + ExceptionUtils.getStackTrace(e));
-    }
-  }
+public class FrontendTest extends FrontendTestBase {
 
   @Test
   public void TestGetTypeInfo() throws ImpalaException {
@@ -139,9 +66,9 @@ public class FrontendTest {
     assertEquals(18, resp.schema.columns.size());
     assertEquals(18, resp.rows.get(0).colVals.size());
     // All primitives types, except INVALID_TYPE, DATE, DATETIME, DECIMAL, CHAR,
-    // and VARCHAR should be returned.
-    // Therefore #supported types =  PrimitiveType.values().length - 6.
-    assertEquals(PrimitiveType.values().length - 6, resp.rows.size());
+    // VARCHAR, and FIXED_UDA_INTERMEDIATE should be returned.
+    // Therefore #supported types =  PrimitiveType.values().length - 7.
+    assertEquals(PrimitiveType.values().length - 7, resp.rows.size());
   }
 
   @Test
@@ -173,6 +100,161 @@ public class FrontendTest {
     assertEquals(5, resp.rows.get(0).colVals.size());
     assertEquals(1, resp.rows.size());
     assertEquals("alltypes", resp.rows.get(0).colVals.get(2).string_val.toLowerCase());
+  }
+
+  @Test
+  public void TestGetTablesTypeTable() throws ImpalaException {
+    // Make sure these views are loaded so they can be distinguished from tables.
+    AnalyzesOk("select * from functional.alltypes_hive_view");
+    AnalyzesOk("select * from functional.alltypes_parens");
+    AnalyzesOk("select * from functional.alltypes_view");
+    AnalyzesOk("select * from functional.alltypes_view_sub");
+
+    TMetadataOpRequest req = new TMetadataOpRequest();
+    req.opcode = TMetadataOpcode.GET_TABLES;
+    req.get_tables_req = new TGetTablesReq();
+    req.get_tables_req.setSchemaName("functional");
+    req.get_tables_req.setTableName("alltypes\\_%");
+    req.get_tables_req.setTableTypes(Arrays.asList("TABLE"));
+    TResultSet resp = execMetadataOp(req);
+    // HiveServer2 GetTables has 5 columns.
+    assertEquals(5, resp.schema.columns.size());
+    assertEquals(5, resp.rows.get(0).colVals.size());
+    assertEquals(1, resp.rows.size());
+    assertEquals("alltypes_datasource",
+        resp.rows.get(0).colVals.get(2).string_val.toLowerCase());
+  }
+
+  @Test
+  public void TestGetTablesTypeView() throws ImpalaException {
+    // Make sure these views are loaded so they can be distinguished from tables.
+    AnalyzesOk("select * from functional.alltypes_hive_view");
+    AnalyzesOk("select * from functional.alltypes_parens");
+    AnalyzesOk("select * from functional.alltypes_view");
+    AnalyzesOk("select * from functional.alltypes_view_sub");
+
+    TMetadataOpRequest req = new TMetadataOpRequest();
+    req.opcode = TMetadataOpcode.GET_TABLES;
+    req.get_tables_req = new TGetTablesReq();
+    req.get_tables_req.setSchemaName("functional");
+    req.get_tables_req.setTableName("alltypes%");
+    req.get_tables_req.setTableTypes(Arrays.asList("VIEW"));
+    TResultSet resp = execMetadataOp(req);
+    // HiveServer2 GetTables has 5 columns.
+    assertEquals(5, resp.schema.columns.size());
+    assertEquals(5, resp.rows.get(0).colVals.size());
+    assertEquals(4, resp.rows.size());
+    assertEquals("alltypes_hive_view",
+        resp.rows.get(0).colVals.get(2).string_val.toLowerCase());
+    assertEquals("alltypes_parens",
+        resp.rows.get(1).colVals.get(2).string_val.toLowerCase());
+    assertEquals("alltypes_view",
+        resp.rows.get(2).colVals.get(2).string_val.toLowerCase());
+    assertEquals("alltypes_view_sub",
+        resp.rows.get(3).colVals.get(2).string_val.toLowerCase());
+  }
+
+  @Test
+  public void TestGetTablesWithComments() throws ImpalaException {
+    // Add test db and test tables with comments
+    final String dbName = "tbls_with_comments_test_db";
+    Db testDb = addTestDb(dbName, "Stores tables with comments");
+    assertNotNull(testDb);
+    final String tableComment = "this table has a comment";
+    final String columnComment = "this column has a comment";
+    final String columnWithCommentName = "column_with_comment";
+    final String columnWithoutCommentName = "column_without_comment";
+    final String tableWithCommentsStmt = String.format(
+        "create table %s.tbl_with_comments (%s int comment '%s', %s int) comment '%s'",
+         dbName, columnWithCommentName, columnComment, columnWithoutCommentName,
+         tableComment);
+    Table tbl = addTestTable(tableWithCommentsStmt);
+    assertNotNull(tbl);
+    final String tableWithoutCommentsStmt = String.format(
+        "create table %s.tbl_without_comments (a int)", dbName);
+    tbl = addTestTable(tableWithoutCommentsStmt);
+    assertNotNull(tbl);
+
+    // Prepare and perform the GetTables request
+    TMetadataOpRequest req = new TMetadataOpRequest();
+    req.opcode = TMetadataOpcode.GET_TABLES;
+    req.get_tables_req = new TGetTablesReq();
+    req.get_tables_req.setSchemaName(dbName);
+    TResultSet resp = execMetadataOp(req);
+    assertEquals(2, resp.rows.size());
+    for (TResultRow row: resp.rows) {
+      if (row.colVals.get(2).string_val.toLowerCase().equals("tbl_with_comments")) {
+        assertEquals(tableComment, row.colVals.get(4).string_val.toLowerCase());
+      } else {
+        assertEquals("", row.colVals.get(4).string_val);
+      }
+    }
+
+    // Test column comments
+    req = new TMetadataOpRequest();
+    req.opcode = TMetadataOpcode.GET_COLUMNS;
+    req.get_columns_req = new TGetColumnsReq();
+    req.get_columns_req.setSchemaName(dbName);
+    req.get_columns_req.setTableName("tbl_with_comments");
+    resp = execMetadataOp(req);
+    assertEquals(2, resp.rows.size());
+    for (TResultRow row: resp.rows) {
+      if (row.colVals.get(3).string_val.equals(columnWithCommentName)) {
+        assertEquals(columnComment, row.colVals.get(11).string_val);
+      } else {
+        assertEquals(null, row.colVals.get(11).string_val);
+      }
+    }
+
+    // IMPALA-5579: GetTables() should succeed and display the available information for
+    // tables that cannot be loaded.
+    req = new TMetadataOpRequest();
+    req.opcode = TMetadataOpcode.GET_TABLES;
+    req.get_tables_req = new TGetTablesReq();
+    req.get_tables_req.setSchemaName("functional");
+    req.get_tables_req.setTableName("hive_index_tbl");
+    resp = execMetadataOp(req);
+    assertEquals(1, resp.rows.size());
+  }
+
+  @Test
+  public void TestUnloadedView() throws ImpalaException {
+    final String dbName = "tbls_for_views_test_db";
+    Db testDb = addTestDb(dbName, "Stores views");
+    assertNotNull(testDb);
+    Table view = addTestView(String.format(
+        "create view %s.test_view as select * from functional.alltypes", dbName));
+    assertNotNull(view);
+
+    // Prepare and perform the GetTables request
+    TMetadataOpRequest req = new TMetadataOpRequest();
+    req.opcode = TMetadataOpcode.GET_TABLES;
+    req.get_tables_req = new TGetTablesReq();
+    req.get_tables_req.setSchemaName(dbName);
+    TResultSet resp = execMetadataOp(req);
+    assertEquals(1, resp.rows.size());
+    for (TResultRow row : resp.rows) {
+      assertEquals(row.colVals.get(2).string_val.toLowerCase(), "test_view");
+      assertEquals("table", row.colVals.get(3).string_val.toLowerCase());
+    }
+  }
+
+  @Test
+  public void TestLoadedView() throws ImpalaException {
+    // Issue the statement to make sure the view is loaded
+    AnalyzesOk("select * from functional.alltypes_view");
+    // Prepare and perform the GetTables request
+    TMetadataOpRequest req = new TMetadataOpRequest();
+    req.opcode = TMetadataOpcode.GET_TABLES;
+    req.get_tables_req = new TGetTablesReq();
+    req.get_tables_req.setSchemaName("functional");
+    req.get_tables_req.setTableName("alltypes_view");
+
+    TResultSet resp = execMetadataOp(req);
+    assertEquals(1, resp.rows.size());
+    for (TResultRow row : resp.rows) {
+      assertEquals("VIEW", row.colVals.get(3).string_val);
+    }
   }
 
   @Test
@@ -213,15 +295,15 @@ public class FrontendTest {
 
   @Test
   public void TestGetTableTypes() throws ImpalaException {
-    // Impala should only return TABLE as the only table type.
     TMetadataOpRequest req = new TMetadataOpRequest();
     req.opcode = TMetadataOpcode.GET_TABLE_TYPES;
     TResultSet resp = execMetadataOp(req);
     // HiveServer2 GetTableTypes() has 1 column.
+    assertEquals(2, resp.rows.size());
     assertEquals(1, resp.schema.columns.size());
     assertEquals(1, resp.rows.get(0).colVals.size());
-    assertEquals(1, resp.rows.size());
     assertEquals("TABLE", resp.rows.get(0).getColVals().get(0).string_val);
+    assertEquals("VIEW", resp.rows.get(1).getColVals().get(0).string_val);
   }
 
   @Test
@@ -255,6 +337,6 @@ public class FrontendTest {
 
   private TResultSet execMetadataOp(TMetadataOpRequest req)
       throws ImpalaException {
-    return fe_.execHiveServer2MetadataOp(req);
+    return frontend_.execHiveServer2MetadataOp(req);
   }
 }

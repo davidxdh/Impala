@@ -17,6 +17,7 @@
 
 #include "service/frontend.h"
 
+#include <jni.h>
 #include <list>
 #include <string>
 
@@ -24,8 +25,13 @@
 #include "rpc/jni-thrift-util.h"
 #include "util/backend-gflag-util.h"
 #include "util/jni-util.h"
+#include "util/time.h"
 
 #include "common/names.h"
+
+#ifndef NDEBUG
+DECLARE_int32(stress_catalog_init_delay_ms);
+#endif
 
 using namespace impala;
 
@@ -63,7 +69,7 @@ Frontend::Frontend() {
     {"getHadoopConfig", "([B)[B", &get_hadoop_config_id_},
     {"getAllHadoopConfigs", "()[B", &get_hadoop_configs_id_},
     {"checkConfiguration", "()Ljava/lang/String;", &check_config_id_},
-    {"updateCatalogCache", "([[B)[B", &update_catalog_cache_id_},
+    {"updateCatalogCache", "([B)[B", &update_catalog_cache_id_},
     {"updateMembership", "([B)V", &update_membership_id_},
     {"getTableNames", "([B)[B", &get_table_names_id_},
     {"describeDb", "([B)[B", &describe_db_id_},
@@ -77,7 +83,8 @@ Frontend::Frontend() {
     {"getRoles", "([B)[B", &show_roles_id_},
     {"getRolePrivileges", "([B)[B", &get_role_privileges_id_},
     {"execHiveServer2MetadataOp", "([B)[B", &exec_hs2_metadata_op_id_},
-    {"setCatalogInitialized", "()V", &set_catalog_initialized_id_},
+    {"setCatalogIsReady", "()V", &set_catalog_is_ready_id_},
+    {"waitForCatalog", "()V", &wait_for_catalog_id_},
     {"loadTableData", "([B)[B", &load_table_data_id_},
     {"getTableFiles", "([B)[B", &get_table_files_id_},
     {"showCreateFunction", "([B)Ljava/lang/String;", &show_create_function_id_},
@@ -102,7 +109,7 @@ Frontend::Frontend() {
   ABORT_IF_ERROR(JniUtil::LocalToGlobalRef(jni_env, fe, &fe_));
 }
 
-Status Frontend::UpdateCatalogCache(const vector<TUpdateCatalogCacheRequest>& req,
+Status Frontend::UpdateCatalogCache(const TUpdateCatalogCacheRequest& req,
     TUpdateCatalogCacheResponse* resp) {
   return JniUtil::CallJniMethod(fe_, update_catalog_cache_id_, req, resp);
 }
@@ -238,13 +245,19 @@ bool Frontend::IsAuthorizationError(const Status& status) {
   return !status.ok() && status.GetDetail().find("AuthorizationException") == 0;
 }
 
-Status Frontend::SetCatalogInitialized() {
+void Frontend::SetCatalogIsReady() {
   JNIEnv* jni_env = getJNIEnv();
-  JniLocalFrame jni_frame;
-  RETURN_IF_ERROR(jni_frame.push(jni_env));
-  jni_env->CallObjectMethod(fe_, set_catalog_initialized_id_);
-  RETURN_ERROR_IF_EXC(jni_env);
-  return Status::OK();
+  jni_env->CallVoidMethod(fe_, set_catalog_is_ready_id_);
+}
+
+void Frontend::WaitForCatalog() {
+#ifndef NDEBUG
+  if (FLAGS_stress_catalog_init_delay_ms > 0) {
+    SleepForMs(FLAGS_stress_catalog_init_delay_ms);
+  }
+#endif
+  JNIEnv* jni_env = getJNIEnv();
+  jni_env->CallVoidMethod(fe_, wait_for_catalog_id_);
 }
 
 Status Frontend::GetTableFiles(const TShowFilesParams& params, TResultSet* result) {

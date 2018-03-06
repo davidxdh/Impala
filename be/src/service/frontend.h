@@ -38,10 +38,11 @@ class Frontend {
   /// or if there is any further exception, the constructor will terminate the process.
   Frontend();
 
-  /// Request to update the Impalad catalog cache. The req argument contains a vector of
-  /// updates that each contain objects that should be added/removed from the Catalog.
-  /// Returns a response that contains details such as the new max catalog version.
-  Status UpdateCatalogCache(const vector<TUpdateCatalogCacheRequest>& req,
+  /// Request to update the Impalad catalog cache. The 'req' argument contains a pointer
+  /// to a CatalogServer used for the FE to call NativeGetNextCatalogTopicItem() back to
+  /// get the catalog objects iteratively. Returns a response that contains details such
+  /// as the new max catalog version.
+  Status UpdateCatalogCache(const TUpdateCatalogCacheRequest& req,
       TUpdateCatalogCacheResponse *resp);
 
   /// Request to update the Impalad frontend cluster membership snapshot.  The
@@ -159,11 +160,14 @@ class Frontend {
   /// Returns true if the error returned by the FE was due to an AuthorizationException.
   static bool IsAuthorizationError(const Status& status);
 
-  /// Sets the FE catalog to be initialized. This is only used for testing in
-  /// conjunction with InProcessImpalaServer. This sets the FE catalog to
-  /// be initialized, ready to receive queries without needing a catalog
-  /// server.
-  Status SetCatalogInitialized();
+  /// Sets the frontend's catalog in the ready state. This is only used for testing in
+  /// conjunction with InProcessImpalaServer. This sets the frontend's catalog as
+  /// ready, so can receive queries without needing a catalog server.
+  void SetCatalogIsReady();
+
+  /// Waits for the FE catalog to be initialized and ready to receive queries.
+  /// There is no bound on the wait time.
+  void WaitForCatalog();
 
   /// Call FE to get files info for a table or partition.
   Status GetTableFiles(const TShowFilesParams& params, TResultSet* result);
@@ -197,7 +201,8 @@ class Frontend {
   jmethodID get_role_privileges_id_; // JniFrontend.getRolePrivileges
   jmethodID exec_hs2_metadata_op_id_; // JniFrontend.execHiveServer2MetadataOp
   jmethodID load_table_data_id_; // JniFrontend.loadTableData
-  jmethodID set_catalog_initialized_id_; // JniFrontend.setCatalogInitialized
+  jmethodID set_catalog_is_ready_id_; // JniFrontend.setCatalogIsReady
+  jmethodID wait_for_catalog_id_; // JniFrontend.waitForCatalog
   jmethodID get_table_files_id_; // JniFrontend.getTableFiles
   jmethodID show_create_function_id_; // JniFrontend.showCreateFunction
 

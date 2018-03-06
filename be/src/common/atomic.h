@@ -116,6 +116,40 @@ class AtomicInt {
 typedef internal::AtomicInt<int32_t> AtomicInt32;
 typedef internal::AtomicInt<int64_t> AtomicInt64;
 
+/// Atomic pointer. Operations have the same semantics as AtomicInt.
+template<typename T>
+class AtomicPtr {
+ public:
+  AtomicPtr(T* initial = nullptr) : ptr_(reinterpret_cast<intptr_t>(initial)) {}
+
+  /// Atomic load with "acquire" memory-ordering semantic.
+  ALWAYS_INLINE T* Load() const { return reinterpret_cast<T*>(ptr_.Load()); }
+
+  /// Atomic store with "release" memory-ordering semantic.
+  ALWAYS_INLINE void Store(T* val) { ptr_.Store(reinterpret_cast<intptr_t>(val)); }
+
+ private:
+  internal::AtomicInt<intptr_t> ptr_;
+};
+
+/// Atomic enum. Operations have the same semantics as AtomicInt.
+template<typename T>
+class AtomicEnum {
+  static_assert(std::is_enum<T>::value, "Type must be enum");
+  static_assert(sizeof(typename std::underlying_type<T>::type) <= sizeof(int32_t),
+      "Underlying enum type must fit into 4 bytes");
+
+ public:
+  /// Atomic load with "acquire" memory-ordering semantic.
+  ALWAYS_INLINE T Load() const { return static_cast<T>(enum_.Load()); }
+
+  /// Atomic store with "release" memory-ordering semantic.
+  ALWAYS_INLINE void Store(T val) { enum_.Store(val); }
+
+ private:
+  internal::AtomicInt<int32_t> enum_;
+};
+
 }
 
 #endif

@@ -204,6 +204,17 @@ describe t2;
 string,string,string
 ====
 ---- QUERY
+# set a comment using the 'ALTER COLUMN' syntax.
+alter table t2 alter column a set comment 'alter comment';
+describe t2;
+---- RESULTS
+'a','int','alter comment'
+'b','struct<\n  f1:array<int>,\n  f2:map<string,struct<\n    f1:bigint\n  >>\n>',''
+'c','varchar(20)',''
+---- TYPES
+string,string,string
+====
+---- QUERY
 create external table jointbl_test like functional.jointbl
 ---- RESULTS
 ====
@@ -760,14 +771,15 @@ invalidate metadata $DATABASE2.mv2
 ---- RESULTS
 ====
 ---- QUERY
-show tables in $DATABASE like '%mv%'
+show tables in $DATABASE like '*mv*'
 ---- RESULTS
 ---- TYPES
 STRING
 ====
 ---- QUERY
-show tables in $DATABASE2 like '%mv%'
+show tables in $DATABASE2 like '*mv*'
 ---- RESULTS
+'mv2'
 ---- TYPES
 STRING
 ====
@@ -791,7 +803,61 @@ drop table $DATABASE2.mv2
 ---- RESULTS
 ====
 ---- QUERY
-show tables in $DATABASE2 like '%mv%'
+show tables in $DATABASE2 like '*mv*'
+---- RESULTS
+---- TYPES
+STRING
+====
+---- QUERY
+# Tests that renaming a partitioned table with column stats across databases
+# succeeds and preserves table and column stats, and allows the renamed table
+# to be dropped (IMPALA-2810).
+create table $DATABASE.mv (x int) partitioned by (y string);
+insert into $DATABASE.mv partition(y='a') values(1);
+insert into $DATABASE.mv partition(y='b') values(2);
+insert into $DATABASE.mv partition(y=NULL) values(NULL);
+compute stats $DATABASE.mv;
+alter table $DATABASE.mv rename to $DATABASE2.mv2;
+invalidate metadata $DATABASE2.mv2
+---- RESULTS
+====
+---- QUERY
+show tables in $DATABASE like '*mv*'
+---- RESULTS
+---- TYPES
+STRING
+====
+---- QUERY
+show tables in $DATABASE2 like '*mv*'
+---- RESULTS
+'mv2'
+---- TYPES
+STRING
+====
+---- QUERY
+show table stats $DATABASE2.mv2
+---- RESULTS: VERIFY_IS_EQUAL_SORTED
+'NULL',1,1,'3B','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'a',1,1,'2B','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'b',1,1,'2B','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'Total',3,3,'7B','0B','','','',''
+---- TYPES
+STRING, BIGINT, BIGINT, STRING, STRING, STRING, STRING, STRING, STRING
+====
+---- QUERY
+show column stats $DATABASE2.mv2
+---- RESULTS: VERIFY_IS_EQUAL_SORTED
+'x','INT',2,-1,4,4
+'y','STRING',3,1,-1,-1
+---- TYPES
+STRING, STRING, BIGINT, BIGINT, BIGINT, DOUBLE
+====
+---- QUERY
+drop table $DATABASE2.mv2
+---- RESULTS
+====
+---- QUERY
+show tables in $DATABASE2 like '*mv*'
 ---- RESULTS
 ---- TYPES
 STRING
@@ -1054,4 +1120,309 @@ select x, a from i1670A_alter_1 order by x, a;
 3,1
 ---- TYPES
 INT, INT
+====
+---- QUERY
+create table insert_data (i int, d double, f float, b boolean);
+insert into insert_data values (1, 2, 3, false), (4, 5, 6, true);
+====
+---- QUERY
+create table insert_sorted (i int, d double, f float, b boolean);
+====
+---- QUERY
+# Test setting the sort.columns property
+alter table insert_sorted sort by(i, d);
+describe formatted insert_sorted;
+---- RESULTS: VERIFY_IS_SUBSET
+'','sort.columns        ','i,d                 '
+---- TYPES
+STRING,STRING,STRING
+====
+---- QUERY
+# Test inserting after alter table
+insert into table insert_sorted select i, d, f, b from insert_data;
+---- RUNTIME_PROFILE
+row_regex: .*order by: i ASC NULLS LAST, d ASC NULLS LAST
+====
+---- QUERY
+# Test selection after alter table
+select count(*) from insert_sorted;
+---- RESULTS
+2
+====
+---- QUERY
+# Test altering the sort.columns property
+alter table insert_sorted sort by(b, d, f);
+describe formatted insert_sorted;
+---- RESULTS: VERIFY_IS_SUBSET
+'','sort.columns        ','b,d,f               '
+---- TYPES
+STRING,STRING,STRING
+====
+---- QUERY
+# Test inserting after alter table
+insert into table insert_sorted select i, d, f, b from insert_data;
+---- RUNTIME_PROFILE
+row_regex: .*order by: b ASC NULLS LAST, d ASC NULLS LAST, f ASC NULLS LAST
+====
+---- QUERY
+# Test selection after alter table
+select count(*) from insert_sorted;
+---- RESULTS
+4
+====
+---- QUERY
+# Test renaming a column in the sort by list.
+alter table insert_sorted change d e double;
+describe formatted insert_sorted;
+---- RESULTS: VERIFY_IS_SUBSET
+'','sort.columns        ','b,e,f               '
+---- TYPES
+STRING,STRING,STRING
+====
+---- QUERY
+# Test inserting after alter table
+insert into table insert_sorted select i, d, f, b from insert_data;
+---- RUNTIME_PROFILE
+row_regex: .*order by: b ASC NULLS LAST, d ASC NULLS LAST, f ASC NULLS LAST
+====
+---- QUERY
+# Test selection after alter table
+select count(*) from insert_sorted;
+---- RESULTS
+6
+====
+---- QUERY
+# Test replacing the column list, including a column in the sort by list.
+alter table insert_sorted replace columns (i bigint, e decimal(12,2), f boolean);
+describe formatted insert_sorted;
+---- RESULTS: VERIFY_IS_SUBSET
+'','sort.columns        ','e,f                 '
+---- TYPES
+STRING,STRING,STRING
+====
+---- QUERY
+# Test inserting after alter table
+insert into table insert_sorted select i, cast(d as decimal(12,2)), b from insert_data;
+---- RUNTIME_PROFILE
+row_regex: .*order by: CAST\(d AS DECIMAL\(12,2\)\) ASC NULLS LAST, b ASC NULLS LAST
+====
+---- QUERY
+# Test selection after alter table
+select count(*) from insert_sorted;
+---- RESULTS
+8
+====
+---- QUERY
+# Test dropping a column in the sort by list
+alter table insert_sorted drop column f;
+describe formatted insert_sorted;
+---- RESULTS: VERIFY_IS_SUBSET
+'','sort.columns        ','e                   '
+---- TYPES
+STRING,STRING,STRING
+====
+---- QUERY
+# Test that a dropped column cannot be added as a sort column
+alter table insert_sorted sort by(f);
+---- CATCH
+AnalysisException: Could not find SORT BY column 'f' in table.
+====
+---- QUERY
+# Test that erroneous query didn't change sort columns
+describe formatted insert_sorted;
+---- RESULTS: VERIFY_IS_SUBSET
+'','sort.columns        ','e                   '
+---- TYPES
+STRING,STRING,STRING
+====
+---- QUERY
+# Test inserting after alter table
+insert into table insert_sorted select i, cast(d as decimal(12,2)) from insert_data;
+---- RUNTIME_PROFILE
+row_regex: .*order by: CAST\(d AS DECIMAL\(12,2\)\) ASC NULLS LAST
+====
+---- QUERY
+# Test selection after alter table
+select count(*) from insert_sorted;
+---- RESULTS
+10
+====
+---- QUERY
+# Test removing the sort.columns property
+alter table insert_sorted sort by();
+describe formatted insert_sorted;
+---- RESULTS: VERIFY_IS_SUBSET
+'','sort.columns        ','                    '
+---- TYPES
+STRING,STRING,STRING
+====
+---- QUERY
+# Test inserting after alter table
+insert into table insert_sorted select i, cast(d as decimal(12,2)) from insert_data;
+---- RUNTIME_PROFILE
+aggregation(SUM, InitialRunsCreated): 0
+====
+---- QUERY
+# Test selection after alter table
+select count(*) from insert_sorted;
+---- RESULTS
+12
+====
+---- QUERY
+create table insert_sorted_partitioned (i int, d double, f float, b boolean) partitioned by (p int) sort by (i);
+====
+---- QUERY
+# Test removing all sort columns.
+alter table insert_sorted_partitioned sort by();
+describe formatted insert_sorted_partitioned;
+---- RESULTS: VERIFY_IS_SUBSET
+'','sort.columns        ','                    '
+---- TYPES
+STRING,STRING,STRING
+====
+---- QUERY
+# Test inserting after alter table
+insert into table insert_sorted_partitioned partition (p=1) select i, d, f, b from insert_data;
+---- RUNTIME_PROFILE
+aggregation(SUM, InitialRunsCreated): 0
+====
+---- QUERY
+# Test selection after alter table
+select count(*) from insert_sorted_partitioned;
+---- RESULTS
+2
+====
+---- QUERY
+# Re-add a sort column.
+alter table insert_sorted_partitioned sort by(i);
+describe formatted insert_sorted_partitioned;
+---- RESULTS: VERIFY_IS_SUBSET
+'','sort.columns        ','i                   '
+---- TYPES
+STRING,STRING,STRING
+====
+---- QUERY
+# Test inserting after alter table
+insert into table insert_sorted_partitioned partition (p=1) select i, d, f, b from insert_data;
+---- RUNTIME_PROFILE
+row_regex: .*order by: i ASC NULLS LAST
+====
+---- QUERY
+# Test selection after alter table
+select count(*) from insert_sorted_partitioned;
+---- RESULTS
+4
+====
+---- QUERY
+# Test dropping the sort column
+alter table insert_sorted_partitioned drop column i;
+describe formatted insert_sorted_partitioned;
+---- RESULTS: VERIFY_IS_SUBSET
+'','sort.columns        ','                    '
+---- TYPES
+STRING,STRING,STRING
+====
+---- QUERY
+# Test inserting after alter table
+insert into table insert_sorted_partitioned partition (p=1) select d, f, b from insert_data;
+---- RUNTIME_PROFILE
+aggregation(SUM, InitialRunsCreated): 0
+====
+---- QUERY
+# Test selection after alter table
+select count(*) from insert_sorted_partitioned;
+---- RESULTS
+6
+====
+---- QUERY
+# IMPALA-4323: Test alter row format statement.  Ensure alter statement updates metadata.
+# Spaces after text will become field delimiters after the alter statement.
+# Tildes at the end of the line will become line delimiters after the second alter statement.
+create table del_table (c1 string, c2 string, c3 string)
+row format delimited fields terminated by '\002' lines terminated by '\001' stored as textfile;
+insert into del_table values ("the ", "quick ", "brown~"),
+("fox ","jumped ","over~");
+select * from del_table order by c3;
+---- RESULTS
+'the ','quick ','brown~'
+'fox ','jumped ','over~'
+---- TYPES
+STRING,STRING,STRING
+====
+---- QUERY
+# Test select after alter to ensure field delimiters change to spaces and
+# the line delimiters remain '\001'.
+alter table del_table set row format delimited fields terminated by ' ';
+select * from del_table order by c3;
+---- RESULTS
+'the','\x02quick','\x02brown~'
+'fox','\x02jumped','\x02over~'
+---- TYPES
+STRING,STRING,STRING
+====
+---- QUERY
+# Test select after alter to ensure line delimiters change.
+# We end up with an extra record because the new delimiter is
+# before the original delimiter which now becomes data.
+alter table del_table set row format delimited fields terminated by '\002'
+lines terminated by '~';
+select * from del_table order by c3;
+---- RESULTS
+'\x01','NULL',''
+'the ','quick ','brown'
+'\x01fox ','jumped ','over'
+---- TYPES
+STRING,STRING,STRING
+====
+---- QUERY
+# IMPALA-4323: Test alter row format statement with partitions.
+# Ensure alter statement updates metadata.
+create table del_table_part (c1 string, c2 string, c3 string) partitioned by (c0 int)
+row format delimited fields terminated by '\002' lines terminated by '\001' stored as textfile;
+insert into del_table_part partition (c0=0) values
+("the ", "quick ", "brown");
+insert into del_table_part partition (c0=1) values
+("fox ","jumped ","over");
+select * from del_table_part order by c0;
+---- RESULTS
+'the ','quick ','brown',0
+'fox ','jumped ','over',1
+---- TYPES
+STRING,STRING,STRING,INT
+====
+---- QUERY
+# Test select after alter to ensure only one partition changes.
+alter table del_table_part partition (c0=1) set row format delimited fields terminated by ' ';
+select * from del_table_part order by c0;
+---- RESULTS
+'the ','quick ','brown',0
+'fox','\x02jumped','\x02over',1
+---- TYPES
+STRING,STRING,STRING,INT
+====
+---- QUERY
+# Test select after alter table to ensure no partition changes.
+alter table del_table_part set row format delimited fields terminated by '_';
+select * from del_table_part order by c0;
+---- RESULTS
+'the ','quick ','brown',0
+'fox','\x02jumped','\x02over',1
+---- TYPES
+STRING,STRING,STRING,INT
+====
+---- QUERY
+# Ensure new partitions use table-level format
+# First we set a terminator, insert some data in a new partition that should use it
+# then change the terminator so the original will show in the results.
+alter table del_table_part set row format delimited fields terminated by '_';
+insert into del_table_part partition (c0=2) values
+('the','\002lazy','\002dog');
+alter table del_table_part partition (c0=2) set row format delimited fields terminated by '\002';
+select * from del_table_part order by c0;
+---- RESULTS
+'the ','quick ','brown',0
+'fox','\x02jumped','\x02over',1
+'the_','lazy_','dog',2
+---- TYPES
+STRING,STRING,STRING,INT
 ====

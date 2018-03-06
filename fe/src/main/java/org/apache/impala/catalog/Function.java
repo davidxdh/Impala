@@ -25,6 +25,7 @@ import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.InternalException;
 import org.apache.impala.service.FeSupport;
 import org.apache.impala.thrift.TAggregateFunction;
+import org.apache.impala.thrift.TCatalogObject;
 import org.apache.impala.thrift.TCatalogObjectType;
 import org.apache.impala.thrift.TColumnType;
 import org.apache.impala.thrift.TFunction;
@@ -48,7 +49,7 @@ import com.google.common.collect.Lists;
  * - Builtin functions, which are recreated after every restart of the
  *   catalog. (persisted, visible to Impala)
  */
-public class Function implements CatalogObject {
+public class Function extends CatalogObjectImpl {
   // Enum for how to compare function signatures.
   // For decimal types, the type in the function can be a wildcard, i.e. decimal(*,*).
   // The wildcard can *only* exist as function type, the caller will always be a
@@ -105,7 +106,6 @@ public class Function implements CatalogObject {
   // Set to true for functions that survive service restarts, including all builtins,
   // native and IR functions, but only Java functions created without a signature.
   private boolean isPersistent_;
-  private long catalogVersion_ =  Catalog.INITIAL_CATALOG_VERSION;
 
   public Function(FunctionName name, Type[] argTypes,
       Type retType, boolean varArgs) {
@@ -297,18 +297,23 @@ public class Function implements CatalogObject {
 
   @Override
   public TCatalogObjectType getCatalogObjectType() { return TCatalogObjectType.FUNCTION; }
-
-  @Override
-  public long getCatalogVersion() { return catalogVersion_; }
-
-  @Override
-  public void setCatalogVersion(long newVersion) { catalogVersion_ = newVersion; }
-
   @Override
   public String getName() { return getFunctionName().toString(); }
+  @Override
+  public String getUniqueName() {
+    return "FUNCTION:" + name_.toString() + "(" + signatureString() + ")";
+  }
 
   // Child classes must override this function.
   public String toSql(boolean ifNotExists) { return ""; }
+
+  public TCatalogObject toTCatalogObject () {
+    TCatalogObject result = new TCatalogObject();
+    result.setType(TCatalogObjectType.FUNCTION);
+    result.setFn(toThrift());
+    result.setCatalog_version(getCatalogVersion());
+    return result;
+  }
 
   public TFunction toThrift() {
     TFunction fn = new TFunction();
@@ -362,9 +367,6 @@ public class Function implements CatalogObject {
     }
     return function;
   }
-
-  @Override
-  public boolean isLoaded() { return true; }
 
   // Returns the resolved symbol in the binary. The BE will do a lookup of 'symbol'
   // in the binary and try to resolve unmangled names.
@@ -442,6 +444,8 @@ public class Function implements CatalogObject {
     case STRING:
     case VARCHAR:
     case CHAR:
+    case FIXED_UDA_INTERMEDIATE:
+      // These types are marshaled into a StringVal.
       return "StringVal";
     case TIMESTAMP:
       return "TimestampVal";

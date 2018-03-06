@@ -17,11 +17,12 @@
 
 package org.apache.impala.analysis;
 
-import java.io.StringReader;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import org.apache.impala.analysis.StmtMetadataLoader.StmtTableCache;
 import org.apache.impala.authorization.AuthorizationChecker;
 import org.apache.impala.authorization.AuthorizationConfig;
 import org.apache.impala.authorization.AuthorizeableColumn;
@@ -33,24 +34,21 @@ import org.apache.impala.catalog.Db;
 import org.apache.impala.catalog.ImpaladCatalog;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.AnalysisException;
+import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.InternalException;
 import org.apache.impala.common.Pair;
-import org.apache.impala.rewrite.BetweenToCompoundRule;
-import org.apache.impala.rewrite.ExprRewriteRule;
+import org.apache.impala.common.RuntimeEnv;
 import org.apache.impala.rewrite.ExprRewriter;
-import org.apache.impala.rewrite.ExtractCommonConjunctRule;
-import org.apache.impala.rewrite.FoldConstantsRule;
-import org.apache.impala.rewrite.NormalizeBinaryPredicatesRule;
-import org.apache.impala.rewrite.NormalizeExprsRule;
-import org.apache.impala.rewrite.SimplifyConditionalsRule;
 import org.apache.impala.thrift.TAccessEvent;
 import org.apache.impala.thrift.TLineageGraph;
 import org.apache.impala.thrift.TQueryCtx;
+import org.apache.impala.thrift.TQueryOptions;
 import org.apache.impala.util.EventSequence;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.google.common.base.Preconditions;
+import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 
@@ -59,56 +57,40 @@ import com.google.common.collect.Maps;
  */
 public class AnalysisContext {
   private final static Logger LOG = LoggerFactory.getLogger(AnalysisContext.class);
-  private final ImpaladCatalog catalog_;
   private final TQueryCtx queryCtx_;
   private final AuthorizationConfig authzConfig_;
-  private final ExprRewriter rewriter_;
+  private final EventSequence timeline_;
 
-  // Timeline of important events in the planning process, used for debugging
-  // and profiling
-  private final EventSequence timeline_ = new EventSequence("Planner Timeline");
-
-  // Set in analyze()
+  // Set in analyzeAndAuthorize().
+  private ImpaladCatalog catalog_;
   private AnalysisResult analysisResult_;
 
-  public AnalysisContext(ImpaladCatalog catalog, TQueryCtx queryCtx,
-      AuthorizationConfig authzConfig) {
-    catalog_ = catalog;
+  // Use Hive's scheme for auto-generating column labels. Only used for testing.
+  private boolean useHiveColLabels_;
+
+  public AnalysisContext(TQueryCtx queryCtx, AuthorizationConfig authzConfig,
+      EventSequence timeline) {
     queryCtx_ = queryCtx;
     authzConfig_ = authzConfig;
-    List<ExprRewriteRule> rules = Lists.newArrayList();
-    // BetweenPredicates must be rewritten to be executable. Other non-essential
-    // expr rewrites can be disabled via a query option. When rewrites are enabled
-    // BetweenPredicates should be rewritten first to help trigger other rules.
-    rules.add(BetweenToCompoundRule.INSTANCE);
-    // Binary predicates must be rewritten to a canonical form for both Kudu predicate
-    // pushdown and Parquet row group pruning based on min/max statistics.
-    rules.add(NormalizeBinaryPredicatesRule.INSTANCE);
-    if (queryCtx.getClient_request().getQuery_options().enable_expr_rewrites) {
-      rules.add(FoldConstantsRule.INSTANCE);
-      rules.add(NormalizeExprsRule.INSTANCE);
-      rules.add(ExtractCommonConjunctRule.INSTANCE);
-      // Relies on FoldConstantsRule and NormalizeExprsRule.
-      rules.add(SimplifyConditionalsRule.INSTANCE);
-    }
-    rewriter_ = new ExprRewriter(rules);
+    timeline_ = timeline;
   }
 
-  /**
-   * C'tor with a custom ExprRewriter for testing.
-   */
-  protected AnalysisContext(ImpaladCatalog catalog, TQueryCtx queryCtx,
-      AuthorizationConfig authzConfig, ExprRewriter rewriter) {
-    catalog_ = catalog;
-    queryCtx_ = queryCtx;
-    authzConfig_ = authzConfig;
-    rewriter_ = rewriter;
+  public ImpaladCatalog getCatalog() { return catalog_; }
+  public TQueryCtx getQueryCtx() { return queryCtx_; }
+  public TQueryOptions getQueryOptions() {
+    return queryCtx_.client_request.query_options;
+  }
+  public String getUser() { return queryCtx_.session.connected_user; }
+
+  public void setUseHiveColLabels(boolean b) {
+    Preconditions.checkState(RuntimeEnv.INSTANCE.isTestEnv());
+    useHiveColLabels_ = b;
   }
 
   static public class AnalysisResult {
     private StatementBase stmt_;
     private Analyzer analyzer_;
-    private EventSequence timeline_;
+    private boolean userHasProfileAccess_ = true;
 
     public boolean isAlterTableStmt() { return stmt_ instanceof AlterTableStmt; }
     public boolean isAlterViewStmt() { return stmt_ instanceof AlterViewStmt; }
@@ -195,6 +177,27 @@ public class AnalysisContext {
 
     public boolean isDmlStmt() {
       return isInsertStmt();
+    }
+
+    /**
+     * Returns true for statements that may produce several privilege requests of
+     * hierarchical nature, e.g., table/column.
+     */
+    public boolean isHierarchicalAuthStmt() {
+      return isQueryStmt() || isInsertStmt() || isUpdateStmt() || isDeleteStmt()
+          || isCreateTableAsSelectStmt() || isCreateViewStmt() || isAlterViewStmt();
+    }
+
+    /**
+     * Returns true for statements that may produce a single column-level privilege
+     * request without a request at the table level.
+     * Example: USE functional; ALTER TABLE allcomplextypes.int_array_col [...];
+     * The path 'allcomplextypes.int_array_col' table ref path resolves to
+     * a column, so a column-level privilege request is registered.
+     */
+    public boolean isSingleColumnPrivStmt() {
+      return isDescribeTableStmt() || isResetMetadataStmt() || isUseStmt()
+          || isShowTablesStmt() || isAlterTableStmt();
     }
 
     public AlterTableStmt getAlterTableStmt() {
@@ -348,7 +351,6 @@ public class AnalysisContext {
 
     public StatementBase getStmt() { return stmt_; }
     public Analyzer getAnalyzer() { return analyzer_; }
-    public EventSequence getTimeline() { return timeline_; }
     public Set<TAccessEvent> getAccessEvents() { return analyzer_.getAccessEvents(); }
     public boolean requiresSubqueryRewrite() {
       return analyzer_.containsSubquery() && !(stmt_ instanceof CreateViewStmt)
@@ -361,50 +363,74 @@ public class AnalysisContext {
     public TLineageGraph getThriftLineageGraph() {
       return analyzer_.getThriftSerializedLineageGraph();
     }
+    public void setUserHasProfileAccess(boolean value) { userHasProfileAccess_ = value; }
+    public boolean userHasProfileAccess() { return userHasProfileAccess_; }
+  }
+
+  public Analyzer createAnalyzer(StmtTableCache stmtTableCache) {
+    Analyzer result = new Analyzer(stmtTableCache, queryCtx_, authzConfig_);
+    result.setUseHiveColLabels(useHiveColLabels_);
+    return result;
   }
 
   /**
-   * Parse and analyze 'stmt'. If 'stmt' is a nested query (i.e. query that
-   * contains subqueries), it is also rewritten by performing subquery unnesting.
-   * The transformed stmt is then re-analyzed in a new analysis context.
-   *
-   * The result of analysis can be retrieved by calling
-   * getAnalysisResult().
-   *
-   * @throws AnalysisException
-   *           On any other error, including parsing errors. Also thrown when any
-   *           missing tables are detected as a result of running analysis.
+   * Analyzes and authorizes the given statement using the provided table cache and
+   * authorization checker.
+   * AuthorizationExceptions take precedence over AnalysisExceptions so as not to
+   * reveal the existence/absence of objects the user is not authorized to see.
    */
-  public void analyze(String stmt) throws AnalysisException {
-    Analyzer analyzer = new Analyzer(catalog_, queryCtx_, authzConfig_);
-    analyze(stmt, analyzer);
-  }
+  public AnalysisResult analyzeAndAuthorize(StatementBase stmt,
+      StmtTableCache stmtTableCache, AuthorizationChecker authzChecker)
+      throws ImpalaException {
+    // TODO: Clean up the creation/setting of the analysis result.
+    analysisResult_ = new AnalysisResult();
+    analysisResult_.stmt_ = stmt;
+    catalog_ = stmtTableCache.catalog;
 
-  /**
-   * Parse and analyze 'stmt' using a specified Analyzer.
-   */
-  public void analyze(String stmt, Analyzer analyzer) throws AnalysisException {
-    SqlScanner input = new SqlScanner(new StringReader(stmt));
-    SqlParser parser = new SqlParser(input);
+    // Analyze statement and record exception.
+    AnalysisException analysisException = null;
     try {
-      analysisResult_ = new AnalysisResult();
-      analysisResult_.analyzer_ = analyzer;
-      if (analysisResult_.analyzer_ == null) {
-        analysisResult_.analyzer_ = new Analyzer(catalog_, queryCtx_, authzConfig_);
-      }
-      analysisResult_.timeline_ = timeline_;
-      analysisResult_.stmt_ = (StatementBase) parser.parse().value;
-      if (analysisResult_.stmt_ == null) return;
+      analyze(stmtTableCache);
+    } catch (AnalysisException e) {
+      analysisException = e;
+    }
 
+    // Authorize statement and record exception. Authorization relies on information
+    // collected during analysis.
+    AuthorizationException authException = null;
+    try {
+      authorize(authzChecker);
+    } catch (AuthorizationException e) {
+      authException = e;
+    }
+
+    // AuthorizationExceptions take precedence over AnalysisExceptions so as not
+    // to reveal the existence/absence of objects the user is not authorized to see.
+    if (authException != null) throw authException;
+    if (analysisException != null) throw analysisException;
+    return analysisResult_;
+  }
+
+  /**
+   * Analyzes the statement set in 'analysisResult_' with a new Analyzer based on the
+   * given loaded tables. Performs expr and subquery rewrites which require re-analyzing
+   * the transformed statement.
+   */
+  private void analyze(StmtTableCache stmtTableCache) throws AnalysisException {
+    Preconditions.checkNotNull(analysisResult_);
+    Preconditions.checkNotNull(analysisResult_.stmt_);
+    try {
+      analysisResult_.analyzer_ = createAnalyzer(stmtTableCache);
       analysisResult_.stmt_.analyze(analysisResult_.analyzer_);
       boolean isExplain = analysisResult_.isExplainStmt();
 
       // Apply expr and subquery rewrites.
       boolean reAnalyze = false;
+      ExprRewriter rewriter = analysisResult_.analyzer_.getExprRewriter();
       if (analysisResult_.requiresExprRewrite()) {
-        rewriter_.reset();
-        analysisResult_.stmt_.rewriteExprs(rewriter_);
-        reAnalyze = rewriter_.changed();
+        rewriter.reset();
+        analysisResult_.stmt_.rewriteExprs(rewriter);
+        reAnalyze = rewriter.changed();
       }
       if (analysisResult_.requiresSubqueryRewrite()) {
         StmtRewriter.rewrite(analysisResult_);
@@ -413,7 +439,8 @@ public class AnalysisContext {
       if (reAnalyze) {
         // The rewrites should have no user-visible effect. Remember the original result
         // types and column labels to restore them after the rewritten stmt has been
-        // reset() and re-analyzed.
+        // reset() and re-analyzed. For a CTAS statement, the types represent column types
+        // of the table that will be created, including the partition columns, if any.
         List<Type> origResultTypes = Lists.newArrayList();
         for (Expr e: analysisResult_.stmt_.getResultExprs()) {
           origResultTypes.add(e.getType());
@@ -422,7 +449,7 @@ public class AnalysisContext {
             Lists.newArrayList(analysisResult_.stmt_.getColLabels());
 
         // Re-analyze the stmt with a new analyzer.
-        analysisResult_.analyzer_ = new Analyzer(catalog_, queryCtx_, authzConfig_);
+        analysisResult_.analyzer_ = createAnalyzer(stmtTableCache);
         analysisResult_.stmt_.reset();
         analysisResult_.stmt_.analyze(analysisResult_.analyzer_);
 
@@ -438,8 +465,6 @@ public class AnalysisContext {
     } catch (AnalysisException e) {
       // Don't wrap AnalysisExceptions in another AnalysisException
       throw e;
-    } catch (Exception e) {
-      throw new AnalysisException(parser.getErrorMsg(stmt), e);
     }
   }
 
@@ -448,19 +473,20 @@ public class AnalysisContext {
    * analyze() must have already been called. Throws an AuthorizationException if the
    * user doesn't have sufficient privileges to run this statement.
    */
-  public void authorize(AuthorizationChecker authzChecker)
+  private void authorize(AuthorizationChecker authzChecker)
       throws AuthorizationException, InternalException {
     Preconditions.checkNotNull(analysisResult_);
     Analyzer analyzer = getAnalyzer();
-    // Process statements for which column-level privilege requests may be registered
-    // except for DESCRIBE TABLE or REFRESH/INVALIDATE statements
-    if (analysisResult_.isQueryStmt() || analysisResult_.isInsertStmt() ||
-        analysisResult_.isUpdateStmt() || analysisResult_.isDeleteStmt() ||
-        analysisResult_.isCreateTableAsSelectStmt() ||
-        analysisResult_.isCreateViewStmt() || analysisResult_.isAlterViewStmt()) {
+    // Authorize statements that may produce several hierarchical privilege requests.
+    // Such a statement always has a corresponding table-level privilege request if it
+    // has column-level privilege request. The hierarchical nature requires special
+    // logic to process correctly and efficiently.
+    if (analysisResult_.isHierarchicalAuthStmt()) {
       // Map of table name to a list of privilege requests associated with that table.
-      // These include both table-level and column-level privilege requests.
-      Map<String, List<PrivilegeRequest>> tablePrivReqs = Maps.newHashMap();
+      // These include both table-level and column-level privilege requests. We use a
+      // LinkedHashMap to preserve the order in which requests are inserted.
+      LinkedHashMap<String, List<PrivilegeRequest>> tablePrivReqs =
+          Maps.newLinkedHashMap();
       // Privilege requests that are not column or table-level.
       List<PrivilegeRequest> otherPrivReqs = Lists.newArrayList();
       // Group the registered privilege requests based on the table they reference.
@@ -498,16 +524,23 @@ public class AnalysisContext {
       for (PrivilegeRequest privReq: analyzer.getPrivilegeReqs()) {
         Preconditions.checkState(
             !(privReq.getAuthorizeable() instanceof AuthorizeableColumn) ||
-            analysisResult_.isDescribeTableStmt() ||
-            analysisResult_.isResetMetadataStmt());
+            analysisResult_.isSingleColumnPrivStmt());
         authorizePrivilegeRequest(authzChecker, privReq);
       }
     }
 
-    // Check any masked requests.
+    // Check all masked requests. If a masked request has an associated error message,
+    // an AuthorizationException is thrown if authorization fails. Masked requests with no
+    // error message are used to check if the user can access the runtime profile.
+    // These checks don't result in an AuthorizationException but set the
+    // 'user_has_profile_access' flag in queryCtx_.
     for (Pair<PrivilegeRequest, String> maskedReq: analyzer.getMaskedPrivilegeReqs()) {
       if (!authzChecker.hasAccess(analyzer.getUser(), maskedReq.first)) {
-        throw new AuthorizationException(maskedReq.second);
+        analysisResult_.setUserHasProfileAccess(false);
+        if (!Strings.isNullOrEmpty(maskedReq.second)) {
+          throw new AuthorizationException(maskedReq.second);
+        }
+        break;
       }
     }
   }
@@ -599,7 +632,6 @@ public class AnalysisContext {
     return false;
   }
 
-  public AnalysisResult getAnalysisResult() { return analysisResult_; }
-  public Analyzer getAnalyzer() { return getAnalysisResult().getAnalyzer(); }
+  public Analyzer getAnalyzer() { return analysisResult_.getAnalyzer(); }
   public EventSequence getTimeline() { return timeline_; }
 }

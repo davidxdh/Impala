@@ -22,19 +22,30 @@ import java.io.IOException;
 import java.lang.reflect.Field;
 import java.net.URISyntaxException;
 
-import org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.AllocationFileLoaderService;
 import org.junit.After;
+import org.junit.AfterClass;
 import org.junit.Assert;
+import org.junit.BeforeClass;
+import org.junit.Ignore;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
+import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.HADOOP_SECURITY_AUTH_TO_LOCAL;
+
+import org.apache.hadoop.conf.Configuration;
+
+import org.apache.impala.yarn.server.resourcemanager.scheduler.fair.AllocationFileLoaderService;
+
+import org.apache.impala.authorization.User;
 import org.apache.impala.common.ByteUnits;
 import org.apache.impala.common.InternalException;
+import org.apache.impala.common.RuntimeEnv;
 import org.apache.impala.thrift.TErrorCode;
 import org.apache.impala.thrift.TPoolConfig;
 import org.apache.impala.thrift.TResolveRequestPoolParams;
 import org.apache.impala.thrift.TResolveRequestPoolResult;
+import org.apache.impala.yarn.server.resourcemanager.scheduler.fair.QueuePlacementPolicy;
 import com.google.common.collect.Iterables;
 import com.google.common.io.Files;
 
@@ -106,6 +117,23 @@ public class TestRequestPoolService {
       poolService_.llamaConfWatcher_.setCheckIntervalMs(CHECK_INTERVAL_MS);
     }
     poolService_.start();
+    // Make sure that the Hadoop configuration from classpath is used for the underlying
+    // QueuePlacementPolicy.
+    QueuePlacementPolicy policy = poolService_.getAllocationConfig().getPlacementPolicy();
+    Configuration conf = policy.getConf();
+    Assert.assertTrue(conf.getBoolean("impala.core-site.overridden", false));
+  }
+
+  @BeforeClass
+  public static void setUpClass() throws Exception {
+    RuntimeEnv.INSTANCE.setTestEnv(true);
+    User.setRulesForTesting(
+        new Configuration().get(HADOOP_SECURITY_AUTH_TO_LOCAL, "DEFAULT"));
+  }
+
+  @AfterClass
+  public static void cleanUpClass() {
+    RuntimeEnv.INSTANCE.reset();
   }
 
   @After
@@ -186,7 +214,7 @@ public class TestRequestPoolService {
     checkPoolConfigResult("root", -1, 200, -1);
   }
 
-  @Test
+  @Ignore("IMPALA-4868") @Test
   public void testUpdatingConfigs() throws Exception {
     // Tests updating the config files and then checking the pool resolution, ACLs, and
     // pool limit configs. This tests all three together rather than separating into
@@ -204,7 +232,7 @@ public class TestRequestPoolService {
     // the system is busy this may take even longer, so we need to try a few times.
     Thread.sleep(CHECK_INTERVAL_MS + AllocationFileLoaderService.ALLOC_RELOAD_WAIT_MS);
 
-    int numAttempts = 10;
+    int numAttempts = 20;
     while (true) {
       try {
         checkModifiedConfigResults();
@@ -268,7 +296,7 @@ public class TestRequestPoolService {
     // the backend, but it should be observed coming from the test file here.
     checkPoolConfigResult("root.queueA", 1, 30, 100000 * ByteUnits.MEGABYTE,
         50L, "mem_limit=128m,query_timeout_s=5,not_a_valid_option=foo.bar");
-    checkPoolConfigResult("root.queueB", 5, 10, -1, 60000L, "");
+    checkPoolConfigResult("root.queueB", 5, 10, -1, 600000L, "");
     checkPoolConfigResult("root.queueC", 10, 30, 128 * ByteUnits.MEGABYTE,
         30000L, "mem_limit=2048m,query_timeout_s=60");
   }

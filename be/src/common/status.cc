@@ -17,12 +17,18 @@
 
 #include <boost/algorithm/string/join.hpp>
 
+#include <ostream>
+
 #include "common/status.h"
 #include "util/debug-util.h"
 
 #include "common/names.h"
+#include "gen-cpp/common.pb.h"
+#include "gen-cpp/ErrorCodes_types.h"
 
 namespace impala {
+
+const char* Status::LLVM_CLASS_NAME = "class.impala::Status";
 
 // NOTE: this is statically initialized and we must be very careful what
 // functions these constructors call.  In particular, we cannot call
@@ -34,7 +40,12 @@ const Status Status::DEPRECATED_RPC(ErrorMsg::Init(TErrorCode::NOT_IMPLEMENTED_E
     "Deprecated RPC; please update your client"));
 
 Status Status::MemLimitExceeded() {
-  return Status(TErrorCode::MEM_LIMIT_EXCEEDED, "Memory limit exceeded");
+  return Status(ErrorMsg(TErrorCode::MEM_LIMIT_EXCEEDED, "Memory limit exceeded"), true);
+}
+
+Status Status::MemLimitExceeded(const std::string& details) {
+  return Status(ErrorMsg(TErrorCode::MEM_LIMIT_EXCEEDED,
+      Substitute("Memory limit exceeded: $0", details)), true);
 }
 
 Status::Status(TErrorCode::type code)
@@ -131,17 +142,17 @@ Status::Status(const string& error_msg, bool silent)
 Status::Status(const ErrorMsg& message)
   : msg_(new ErrorMsg(message)) { }
 
-Status::Status(const TStatus& status)
-  : msg_(status.status_code == TErrorCode::OK
-      ? NULL : new ErrorMsg(status.status_code, status.error_msgs)) { }
+Status::Status(const TStatus& status) {
+  FromThrift(status);
+}
+
+Status::Status(const StatusPB& status) {
+  FromProto(status);
+}
 
 Status& Status::operator=(const TStatus& status) {
   delete msg_;
-  if (status.status_code == TErrorCode::OK) {
-    msg_ = NULL;
-  } else {
-    msg_ = new ErrorMsg(status.status_code, status.error_msgs);
-  }
+  FromThrift(status);
   return *this;
 }
 
@@ -197,13 +208,56 @@ const string Status::GetDetail() const {
 
 void Status::ToThrift(TStatus* status) const {
   status->error_msgs.clear();
-  if (msg_ == NULL) {
+  if (msg_ == nullptr) {
     status->status_code = TErrorCode::OK;
   } else {
     status->status_code = msg_->error();
     status->error_msgs.push_back(msg_->msg());
     for (const string& s: msg_->details()) status->error_msgs.push_back(s);
     status->__isset.error_msgs = true;
+  }
+}
+
+void Status::ToProto(StatusPB* status) const {
+  status->Clear();
+  if (msg_ == nullptr) {
+    status->set_status_code(TErrorCode::OK);
+  } else {
+    status->set_status_code(msg_->error());
+    status->add_error_msgs(msg_->msg());
+    for (const string& s : msg_->details()) status->add_error_msgs(s);
+  }
+}
+
+void Status::FromThrift(const TStatus& status) {
+  if (status.status_code == TErrorCode::OK) {
+    msg_ = NULL;
+  } else {
+    msg_ = new ErrorMsg();
+    msg_->SetErrorCode(status.status_code);
+    if (status.error_msgs.size() > 0) {
+      // The first message is the actual error message. (See Status::ToThrift()).
+      msg_->SetErrorMsg(status.error_msgs.front());
+      // The following messages are details.
+      std::for_each(status.error_msgs.begin() + 1, status.error_msgs.end(),
+          [&](string const& detail) { msg_->AddDetail(detail); });
+    }
+  }
+}
+
+void Status::FromProto(const StatusPB& status) {
+  if (status.status_code() == TErrorCode::OK) {
+    msg_ = nullptr;
+  } else {
+    msg_ = new ErrorMsg();
+    msg_->SetErrorCode(static_cast<TErrorCode::type>(status.status_code()));
+    if (status.error_msgs().size() > 0) {
+      // The first message is the actual error message. (See Status::ToThrift()).
+      msg_->SetErrorMsg(status.error_msgs().Get(0));
+      // The following messages are details.
+      std::for_each(status.error_msgs().begin() + 1, status.error_msgs().end(),
+          [&](string const& detail) { msg_->AddDetail(detail); });
+    }
   }
 }
 
@@ -214,6 +268,12 @@ void Status::FreeMessage() noexcept {
 void Status::CopyMessageFrom(const Status& status) noexcept {
   delete msg_;
   msg_ = status.msg_ == NULL ? NULL : new ErrorMsg(*status.msg_);
+}
+
+ostream& operator<<(ostream& os, const Status& status) {
+  os << _TErrorCode_VALUES_TO_NAMES.at(status.code());
+  if (!status.ok()) os << ": " << status.GetDetail();
+  return os;
 }
 
 }

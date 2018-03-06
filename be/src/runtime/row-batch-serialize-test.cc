@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <lz4.h>
+
 #include "common/init.h"
 #include "testutil/gtest-util.h"
 #include "runtime/collection-value.h"
@@ -60,15 +62,16 @@ class RowBatchSerializeTest : public testing::Test {
   }
 
   // Serializes and deserializes 'batch', then checks that the deserialized batch is valid
-  // and has the same contents as 'batch'.
-  void TestRowBatch(const RowDescriptor& row_desc, RowBatch* batch, bool print_batches,
-      bool full_dedup = false) {
+  // and has the same contents as 'batch'. If serialization returns an error (e.g. if the
+  // row batch is too large to serialize), this will return that error.
+  Status TestRowBatchInternal(const RowDescriptor& row_desc, RowBatch* batch,
+      bool print_batches, bool full_dedup = false) {
     if (print_batches) cout << PrintBatch(batch) << endl;
 
     TRowBatch trow_batch;
-    EXPECT_OK(batch->Serialize(&trow_batch, full_dedup));
+    RETURN_IF_ERROR(batch->Serialize(&trow_batch, full_dedup));
 
-    RowBatch deserialized_batch(row_desc, trow_batch, tracker_.get());
+    RowBatch deserialized_batch(&row_desc, trow_batch, tracker_.get());
     if (print_batches) cout << PrintBatch(&deserialized_batch) << endl;
 
     EXPECT_EQ(batch->num_rows(), deserialized_batch.num_rows());
@@ -83,6 +86,83 @@ class RowBatchSerializeTest : public testing::Test {
         TestTuplesEqual(*tuple_desc, tuple, deserialized_tuple);
       }
     }
+    return Status::OK();
+  }
+
+  // Serializes and deserializes 'batch', then checks that the deserialized batch is valid
+  // and has the same contents as 'batch'. This requires that serialization succeed.
+  void TestRowBatch(const RowDescriptor& row_desc, RowBatch* batch, bool print_batches,
+      bool full_dedup = false) {
+    EXPECT_OK(TestRowBatchInternal(row_desc, batch, print_batches, full_dedup));
+  }
+
+  // Construct a RowBatch with the specified size by creating a single row with
+  // multiple strings, then test whether this RowBatch can be serialized and
+  // deserialized successfully. If there is an error during serialization,
+  // return that error.
+  Status TestRowBatchLimits(int64_t row_batch_size) {
+    // tuple: (int, string, string, string)
+    // This uses three strings so that this test can reach INT_MAX+1 without any
+    // single string exceeding the 1GB limit on string length (see string-value.h).
+    DescriptorTblBuilder builder(fe_.get(), &pool_);
+    builder.DeclareTuple() << TYPE_INT << TYPE_STRING << TYPE_STRING << TYPE_STRING;
+    DescriptorTbl* desc_tbl = builder.Build();
+
+    // Create row descriptor
+    vector<bool> nullable_tuples(1, false);
+    vector<TTupleId> tuple_id(1, (TTupleId) 0);
+    RowDescriptor row_desc(*desc_tbl, tuple_id, nullable_tuples);
+    EXPECT_EQ(row_desc.tuple_descriptors().size(), 1);
+
+    // Create base row
+    RowBatch* batch = pool_.Add(new RowBatch(&row_desc, 1, tracker_.get()));
+    int len = row_desc.GetRowSize();
+    uint8_t* tuple_mem = batch->tuple_data_pool()->Allocate(len);
+    memset(tuple_mem, 0, len);
+
+    // Create one row
+    TupleRow* row = batch->GetRow(batch->AddRow());
+
+    // There is only one TupleDescriptor
+    TupleDescriptor* tuple_desc = row_desc.tuple_descriptors()[0];
+    Tuple* tuple = reinterpret_cast<Tuple*>(tuple_mem);
+
+    // Write slot 0 (Random Integer)
+    SlotDescriptor* int_desc = tuple_desc->slots()[0];
+    WriteValue(tuple, *int_desc, batch->tuple_data_pool());
+
+    // The RowBatch has consumed 'len' bytes so far. Need to add row_batch_size - len
+    // bytes of string data. Split this equally among the three strings with any
+    // remainder going to the first string.
+    int64_t size_remaining = row_batch_size - len;
+    int64_t string1_size = (size_remaining / 3) + (size_remaining % 3);
+    int64_t string2_size = (size_remaining / 3);
+    int64_t string3_size = string2_size;
+
+    // Write string #1
+    SlotDescriptor* string1_desc = tuple_desc->slots()[1];
+    string string1(string1_size, 'a');
+    StringValue sv1(string1);
+    RawValue::Write(&sv1, tuple, string1_desc, batch->tuple_data_pool());
+
+    // Write string #2
+    SlotDescriptor* string2_desc = tuple_desc->slots()[2];
+    string string2(string2_size, 'a');
+    StringValue sv2(string2);
+    RawValue::Write(&sv2, tuple, string2_desc, batch->tuple_data_pool());
+
+    // Write string #3
+    SlotDescriptor* string3_desc = tuple_desc->slots()[3];
+    string string3(string3_size, 'a');
+    StringValue sv3(string3);
+    RawValue::Write(&sv3, tuple, string3_desc, batch->tuple_data_pool());
+
+    // Done with this row
+    row->SetTuple(0, tuple);
+    batch->CommitLastRow();
+
+    // See if this RowBatch can be serialized and deserialized
+    return TestRowBatchInternal(row_desc, batch, false);
   }
 
   // Recursively checks that 'deserialized_tuple' is valid and has the same contents as
@@ -198,7 +278,7 @@ class RowBatchSerializeTest : public testing::Test {
 
   // Creates a row batch with randomized values.
   RowBatch* CreateRowBatch(const RowDescriptor& row_desc) {
-    RowBatch* batch = pool_.Add(new RowBatch(row_desc, NUM_ROWS, tracker_.get()));
+    RowBatch* batch = pool_.Add(new RowBatch(&row_desc, NUM_ROWS, tracker_.get()));
     int len = row_desc.GetRowSize() * NUM_ROWS;
     uint8_t* tuple_mem = batch->tuple_data_pool()->Allocate(len);
     memset(tuple_mem, 0, len);
@@ -259,7 +339,7 @@ class RowBatchSerializeTest : public testing::Test {
   // order provided, starting at the beginning once all are used.
   void AddTuplesToRowBatch(int num_rows, const vector<vector<Tuple*>>& tuples,
       const vector<int>& repeats, RowBatch* batch) {
-    int tuples_per_row = batch->row_desc().tuple_descriptors().size();
+    int tuples_per_row = batch->row_desc()->tuple_descriptors().size();
     ASSERT_EQ(tuples_per_row, tuples.size());
     ASSERT_EQ(tuples_per_row, repeats.size());
     vector<int> next_tuple(tuples_per_row, 0);
@@ -326,6 +406,33 @@ TEST_F(RowBatchSerializeTest, String) {
 
   RowBatch* batch = CreateRowBatch(row_desc);
   TestRowBatch(row_desc, batch, true);
+}
+
+TEST_F(RowBatchSerializeTest, RowBatchLZ4Success) {
+  // Inputs up to LZ4_MAX_INPUT_SIZE (0x7E000000) should work
+  Status status = TestRowBatchLimits(LZ4_MAX_INPUT_SIZE);
+  cout << status.GetDetail() << endl;
+  EXPECT_OK(status);
+}
+
+TEST_F(RowBatchSerializeTest, RowBatchLZ4TooLarge) {
+  // Inputs with size LZ4_MAX_INPUT_SIZE + 1 through INT_MAX should get an error from LZ4
+  Status status;
+  status = TestRowBatchLimits(LZ4_MAX_INPUT_SIZE + 1);
+  cout << status.GetDetail() << endl;
+  EXPECT_EQ(status.code(), TErrorCode::LZ4_COMPRESSION_INPUT_TOO_LARGE);
+
+  status = TestRowBatchLimits(INT_MAX);
+  cout << status.GetDetail() << endl;
+  EXPECT_EQ(status.code(), TErrorCode::LZ4_COMPRESSION_INPUT_TOO_LARGE);
+}
+
+TEST_F(RowBatchSerializeTest, RowBatchTooLarge) {
+  // RowBatches with size > INT_MAX cannot be serialized
+  Status status;
+  status = TestRowBatchLimits(static_cast<int64_t>(INT_MAX) + 1);
+  cout << status.GetDetail() << endl;
+  EXPECT_EQ(status.code(), TErrorCode::ROW_BATCH_TOO_LARGE);
 }
 
 TEST_F(RowBatchSerializeTest, BasicArray) {
@@ -447,10 +554,10 @@ void RowBatchSerializeTest::TestDupCorrectness(bool full_dedup) {
   repeats.push_back(1);
   // All string dups are consecutive
   repeats.push_back(num_rows / distinct_string_tuples + 1);
-  RowBatch* batch = pool_.Add(new RowBatch(row_desc, num_rows, tracker_.get()));
+  RowBatch* batch = pool_.Add(new RowBatch(&row_desc, num_rows, tracker_.get()));
   vector<vector<Tuple*>> distinct_tuples(2);
   CreateTuples(*row_desc.tuple_descriptors()[0], batch->tuple_data_pool(),
-      distinct_int_tuples, 0, 10, &distinct_tuples[0]);
+      distinct_int_tuples, 0, 10, distinct_tuples.data());
   CreateTuples(*row_desc.tuple_descriptors()[1], batch->tuple_data_pool(),
       distinct_string_tuples, 0, 10, &distinct_tuples[1]);
   AddTuplesToRowBatch(num_rows, distinct_tuples, repeats, batch);
@@ -481,7 +588,7 @@ void RowBatchSerializeTest::TestDupRemoval(bool full_dedup) {
   int num_distinct_tuples = 100;
   // All dups are consecutive
   int repeats = num_rows / num_distinct_tuples;
-  RowBatch* batch = pool_.Add(new RowBatch(row_desc, num_rows, tracker_.get()));
+  RowBatch* batch = pool_.Add(new RowBatch(&row_desc, num_rows, tracker_.get()));
   vector<Tuple*> tuples;
   CreateTuples(tuple_desc, batch->tuple_data_pool(), num_distinct_tuples, 0, 10, &tuples);
   AddTuplesToRowBatch(num_rows, tuples, repeats, batch);
@@ -517,7 +624,7 @@ void RowBatchSerializeTest::TestConsecutiveNulls(bool full_dedup) {
   int num_rows = 100;
   int num_distinct_tuples = 20;
   int repeats = 5;
-  RowBatch* batch = pool_.Add(new RowBatch(row_desc, num_rows, tracker_.get()));
+  RowBatch* batch = pool_.Add(new RowBatch(&row_desc, num_rows, tracker_.get()));
   vector<Tuple*> tuples;
   CreateTuples(*row_desc.tuple_descriptors()[0], batch->tuple_data_pool(),
       num_distinct_tuples, 50, 10, &tuples);
@@ -587,7 +694,7 @@ TEST_F(RowBatchSerializeTest, DedupPathologicalFull) {
   vector<vector<Tuple*>> tuples(num_tuples);
   vector<int> repeats(num_tuples, 1); // Don't repeat tuples adjacently
   int64_t total_byte_size = 0;
-  RowBatch* batch = pool_.Add(new RowBatch(row_desc, num_rows, tracker_.get()));
+  RowBatch* batch = pool_.Add(new RowBatch(&row_desc, num_rows, tracker_.get()));
   // First two tuples are integers because it doesn't matter for this test.
   for (int tuple_idx = 0; tuple_idx < num_int_tuples; ++tuple_idx) {
     TupleDescriptor* tuple_desc = row_desc.tuple_descriptors()[tuple_idx];
@@ -630,7 +737,7 @@ TEST_F(RowBatchSerializeTest, DedupPathologicalFull) {
   // Serialized data should only have one copy of each tuple.
   EXPECT_EQ(total_byte_size, trow_batch.uncompressed_size);
   LOG(INFO) << "Deserializing row batch";
-  RowBatch deserialized_batch(row_desc, trow_batch, tracker_.get());
+  RowBatch deserialized_batch(&row_desc, trow_batch, tracker_.get());
   LOG(INFO) << "Verifying row batch";
   // Need to do special verification: comparing all duplicate strings is too slow.
   EXPECT_EQ(batch->num_rows(), deserialized_batch.num_rows());

@@ -17,10 +17,6 @@
 
 package org.apache.impala.catalog;
 
-import com.google.common.base.Joiner;
-import com.google.common.base.Preconditions;
-import com.google.common.collect.Lists;
-
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
@@ -32,9 +28,13 @@ import org.apache.impala.catalog.MetaStoreClientPool.MetaStoreClient;
 import org.apache.impala.thrift.TCatalogObject;
 import org.apache.impala.thrift.TFunction;
 import org.apache.impala.thrift.TPartitionKeyValue;
+import org.apache.impala.thrift.TTable;
 import org.apache.impala.thrift.TTableName;
 import org.apache.impala.util.PatternMatcher;
-import org.apache.log4j.Logger;
+
+import com.google.common.base.Joiner;
+import com.google.common.base.Preconditions;
+import com.google.common.collect.Lists;
 
 /**
  * Thread safe interface for reading and updating metadata stored in the Hive MetaStore.
@@ -87,7 +87,7 @@ public abstract class Catalog {
 
   public Catalog() {
     dataSources_ = new CatalogObjectCache<DataSource>();
-    builtinsDb_ = new BuiltinsDb(BUILTINS_DB, this);
+    builtinsDb_ = new BuiltinsDb(BUILTINS_DB);
     addDb(builtinsDb_);
   }
 
@@ -141,11 +141,22 @@ public abstract class Catalog {
   }
 
   /**
-   * Returns the Table object for the given dbName/tableName. This will trigger a
-   * metadata load if the table metadata is not yet cached.
+   * Returns the Table object for the given dbName/tableName or null if the database or
+   * table does not exist.
    */
-  public Table getTable(String dbName, String tableName) throws
-      CatalogException {
+  public Table getTableNoThrow(String dbName, String tableName) {
+    Db db = getDb(dbName);
+    if (db == null) return null;
+    return db.getTable(tableName);
+  }
+
+  /**
+   * Returns the Table object for the given dbName/tableName. Throws if the database
+   * does not exists. Returns null if the table does not exist.
+   * TODO: Clean up the inconsistent error behavior (throwing vs. returning null).
+   */
+  public Table getTable(String dbName, String tableName)
+      throws DatabaseNotFoundException {
     Db db = getDb(dbName);
     if (db == null) {
       throw new DatabaseNotFoundException("Database '" + dbName + "' not found");
@@ -161,7 +172,11 @@ public abstract class Catalog {
     // Remove the old table name from the cache and add the new table.
     Db db = getDb(tableName.getDb_name());
     if (db == null) return null;
-    return db.removeTable(tableName.getTable_name());
+    Table tbl = db.removeTable(tableName.getTable_name());
+    if (tbl != null && !tbl.isStoredInImpaladCatalogCache()) {
+      CatalogUsageMonitor.INSTANCE.removeTable(tbl);
+    }
+    return tbl;
   }
 
   /**
@@ -449,9 +464,14 @@ public abstract class Catalog {
           throw new CatalogException("Table not found: " +
               objectDesc.getTable().getTbl_name());
         }
-        result.setType(table.getCatalogObjectType());
-        result.setCatalog_version(table.getCatalogVersion());
-        result.setTable(table.toThrift());
+        table.getLock().lock();
+        try {
+          result.setType(table.getCatalogObjectType());
+          result.setCatalog_version(table.getCatalogVersion());
+          result.setTable(table.toThrift());
+        } finally {
+          table.getLock().unlock();
+        }
         break;
       }
       case FUNCTION: {
@@ -524,5 +544,48 @@ public abstract class Catalog {
 
   public static boolean isDefaultDb(String dbName) {
     return DEFAULT_DB.equals(dbName.toLowerCase());
+  }
+
+  /**
+   * Returns a unique string key of a catalog object.
+   */
+  public static String toCatalogObjectKey(TCatalogObject catalogObject) {
+    Preconditions.checkNotNull(catalogObject);
+    switch (catalogObject.getType()) {
+      case DATABASE:
+        return "DATABASE:" + catalogObject.getDb().getDb_name().toLowerCase();
+      case TABLE:
+      case VIEW:
+        TTable tbl = catalogObject.getTable();
+        return "TABLE:" + tbl.getDb_name().toLowerCase() + "." +
+            tbl.getTbl_name().toLowerCase();
+      case FUNCTION:
+        return "FUNCTION:" + catalogObject.getFn().getName() + "(" +
+            catalogObject.getFn().getSignature() + ")";
+      case ROLE:
+        return "ROLE:" + catalogObject.getRole().getRole_name().toLowerCase();
+      case PRIVILEGE:
+        return "PRIVILEGE:" +
+            catalogObject.getPrivilege().getPrivilege_name().toLowerCase() + "." +
+            Integer.toString(catalogObject.getPrivilege().getRole_id());
+      case HDFS_CACHE_POOL:
+        return "HDFS_CACHE_POOL:" +
+            catalogObject.getCache_pool().getPool_name().toLowerCase();
+      case DATA_SOURCE:
+        return "DATA_SOURCE:" + catalogObject.getData_source().getName().toLowerCase();
+      case CATALOG:
+        return "CATALOG:" + catalogObject.getCatalog().catalog_service_id;
+      default:
+        throw new IllegalStateException(
+            "Unsupported catalog object type: " + catalogObject.getType());
+    }
+  }
+
+  /**
+   * Returns true if the two objects have the same object type and key (generated using
+   * toCatalogObjectKey()).
+   */
+  public static boolean keyEquals(TCatalogObject first, TCatalogObject second) {
+    return toCatalogObjectKey(first).equals(toCatalogObjectKey(second));
   }
 }

@@ -29,6 +29,7 @@
 #include "gen-cpp/Types_types.h"
 #include "catalog/catalog.h"
 #include "statestore/statestore-subscriber.h"
+#include "util/condition-variable.h"
 #include "util/metrics.h"
 #include "rapidjson/rapidjson.h"
 
@@ -36,7 +37,6 @@ namespace impala {
 
 class StatestoreSubscriber;
 class Catalog;
-class TGetAllCatalogObjectsResponse;
 
 /// The Impala CatalogServer manages the caching and persistence of cluster-wide metadata.
 /// The CatalogServer aggregates the metadata from the Hive Metastore, the NameNode,
@@ -74,6 +74,11 @@ class CatalogServer {
   }
   Catalog* catalog() const { return catalog_.get(); }
 
+  /// Add a topic item to pending_topic_updates_. Caller must hold catalog_lock_.
+  /// The return value is true if the operation succeeds and false otherwise.
+  bool AddPendingTopicItem(std::string key, const uint8_t* item_data, uint32_t size,
+      bool deleted);
+
  private:
   /// Thrift API implementation which proxies requests onto this CatalogService.
   boost::shared_ptr<CatalogServiceIf> thrift_iface_;
@@ -86,13 +91,7 @@ class CatalogServer {
   StatsMetric<double>* topic_processing_time_metric_;
 
   /// Thread that polls the catalog for any updates.
-  boost::scoped_ptr<Thread> catalog_update_gathering_thread_;
-
-  /// Tracks the set of catalog objects that exist via their topic entry key.
-  /// During each IMPALA_CATALOG_TOPIC heartbeat, stores the set of known catalog objects
-  /// that exist by their topic entry key. Used to track objects that have been removed
-  /// since the last heartbeat.
-  boost::unordered_set<std::string> catalog_topic_entry_keys_;
+  std::unique_ptr<Thread> catalog_update_gathering_thread_;
 
   /// Protects catalog_update_cv_, pending_topic_updates_,
   /// catalog_objects_to/from_version_, and last_sent_catalog_version.
@@ -102,7 +101,7 @@ class CatalogServer {
   /// fetch its next set of updates from the JniCatalog. At the end of each statestore
   /// heartbeat, this CV is signaled and the catalog_update_gathering_thread_ starts
   /// querying the JniCatalog for catalog objects. Protected by the catalog_lock_.
-  boost::condition_variable catalog_update_cv_;
+  ConditionVariable catalog_update_cv_;
 
   /// The latest available set of catalog topic updates (additions/modifications, and
   /// deletions). Set by the catalog_update_gathering_thread_ and protected by
@@ -135,14 +134,10 @@ class CatalogServer {
   /// finds all catalog objects that have a catalog version greater than the last update
   /// sent by calling into the JniCatalog. The topic is updated with any catalog objects
   /// that are new or have been modified since the last heartbeat (by comparing the
-  /// catalog version of the object with last_sent_catalog_version_). Also determines any
-  /// deletions of catalog objects by looking at the
-  /// difference of the last set of topic entry keys that were sent and the current set
-  /// of topic entry keys. At the end of execution it notifies the
-  /// catalog_update_gathering_thread_ to fetch the next set of updates from the
-  /// JniCatalog.
-  /// All updates are added to the subscriber_topic_updates list and sent back to the
-  /// Statestore.
+  /// catalog version of the object with last_sent_catalog_version_). At the end of
+  /// execution it notifies the catalog_update_gathering_thread_ to fetch the next set of
+  /// updates from the JniCatalog. All updates are added to the subscriber_topic_updates
+  /// list and sent back to the Statestore.
   void UpdateCatalogTopicCallback(
       const StatestoreSubscriber::TopicDeltaMap& incoming_topic_deltas,
       std::vector<TTopicDelta>* subscriber_topic_updates);
@@ -152,21 +147,6 @@ class CatalogServer {
   /// each object. The results are stored in the shared catalog_objects_ data structure.
   /// Also, explicitly releases free memory back to the OS after each complete iteration.
   [[noreturn]] void GatherCatalogUpdatesThread();
-
-  /// This function determines what items have been added/removed from the catalog
-  /// since the last heartbeat and builds the next topic update to send. To do this, it
-  /// enumerates the given catalog objects returned looking for the objects that have a
-  /// catalog version that is > the catalog version sent with the last heartbeat. To
-  /// determine items that have been deleted, it saves the set of topic entry keys sent
-  /// with the last update and looks at the difference between it and the current set of
-  /// topic entry keys.
-  /// The key for each entry is a string composed of:
-  /// "TCatalogObjectType:<unique object name>". So for table foo.bar, the key would be
-  /// "TABLE:foo.bar". Encoding the object type information in the key ensures the keys
-  /// are unique, as well as helps to determine what object type was removed in a state
-  /// store delta update (since the state store only sends key names for deleted items).
-  /// Must hold catalog_lock_ when calling this function.
-  void BuildTopicUpdates(const std::vector<TCatalogObject>& catalog_objects);
 
   /// Example output:
   /// "databases": [
@@ -195,6 +175,35 @@ class CatalogServer {
   /// For example, to dump table "bar" in database "foo":
   /// <host>:25020/catalog_objects?object_type=TABLE&object_name=foo.bar
   void CatalogObjectsUrlCallback(const Webserver::ArgumentMap& args,
+      rapidjson::Document* document);
+
+  /// Retrieves from the FE information about the current catalog usage and populates
+  /// the /catalog debug webpage. The catalog usage includes information about the TOP-N
+  /// frequently used (in terms of number of metadata operations) tables as well as the
+  /// TOP-N tables with the highest memory requirements.
+  ///
+  /// Example output:
+  /// "large_tables": [
+  ///     {
+  ///       "name": "functional.alltypesagg",
+  ///       "mem_estimate": 212434233
+  ///     }
+  ///  ]
+  ///  "frequent_tables": [
+  ///      {
+  ///        "name": "functional.alltypestiny",
+  ///        "frequency": 10
+  ///      }
+  ///  ]
+  void GetCatalogUsage(rapidjson::Document* document);
+
+  /// Debug webpage handler that is used to dump all the registered metrics of a
+  /// table. The caller specifies the "name" parameter which is the fully
+  /// qualified table name and this function retrieves all the metrics of that
+  /// table. For example, to get the table metrics of table "bar" in database
+  /// "foo":
+  /// <host>:25020/table_metrics?name=foo.bar
+  void TableMetricsUrlCallback(const Webserver::ArgumentMap& args,
       rapidjson::Document* document);
 };
 

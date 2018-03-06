@@ -17,33 +17,36 @@
 
 #include "exprs/aggregate-functions.h"
 
-#include <math.h>
 #include <algorithm>
 #include <map>
 #include <sstream>
 #include <utility>
+#include <cmath>
 
 #include <boost/random/ranlux.hpp>
 #include <boost/random/uniform_int.hpp>
 
 #include "codegen/impala-ir.h"
 #include "common/logging.h"
+#include "exprs/anyval-util.h"
+#include "exprs/hll-bias.h"
 #include "runtime/decimal-value.inline.h"
 #include "runtime/runtime-state.h"
 #include "runtime/string-value.inline.h"
 #include "runtime/timestamp-value.h"
-#include "exprs/anyval-util.h"
-#include "exprs/expr.h"
-#include "exprs/hll-bias.h"
+#include "runtime/timestamp-value.inline.h"
+#include "util/mpfit-util.h"
 
 #include "common/names.h"
 
 using boost::uniform_int;
 using boost::ranlux64_3;
-using std::push_heap;
-using std::pop_heap;
-using std::map;
 using std::make_pair;
+using std::map;
+using std::min_element;
+using std::nth_element;
+using std::pop_heap;
+using std::push_heap;
 
 namespace {
 // Threshold for each precision where it's better to use linear counting instead
@@ -122,9 +125,6 @@ int64_t HllEstimateBias(int64_t estimate) {
 
 }
 
-// TODO: this file should be cross compiled and then all of the builtin
-// aggregate functions will have a codegen enabled path. Then we can remove
-// the custom code in aggregation node.
 namespace impala {
 
 // This function initializes StringVal 'dst' with a newly allocated buffer of
@@ -271,7 +271,11 @@ struct AvgState {
 };
 
 void AggregateFunctions::AvgInit(FunctionContext* ctx, StringVal* dst) {
-  AllocBuffer(ctx, dst, sizeof(AvgState));
+  // avg() uses a preallocated FIXED_UDA_INTERMEDIATE intermediate value.
+  DCHECK_EQ(dst->len, sizeof(AvgState));
+  AvgState* avg = reinterpret_cast<AvgState*>(dst->ptr);
+  avg->sum = 0.0;
+  avg->count = 0;
 }
 
 template <typename T>
@@ -316,7 +320,6 @@ DoubleVal AggregateFunctions::AvgGetValue(FunctionContext* ctx, const StringVal&
 DoubleVal AggregateFunctions::AvgFinalize(FunctionContext* ctx, const StringVal& src) {
   if (UNLIKELY(src.is_null)) return DoubleVal::null();
   DoubleVal result = AvgGetValue(ctx, src);
-  ctx->Free(src.ptr);
   return result;
 }
 
@@ -326,7 +329,7 @@ void AggregateFunctions::TimestampAvgUpdate(FunctionContext* ctx,
   DCHECK(dst->ptr != NULL);
   DCHECK_EQ(sizeof(AvgState), dst->len);
   AvgState* avg = reinterpret_cast<AvgState*>(dst->ptr);
-  TimestampValue tm_src = TimestampValue::FromTimestampVal(src);
+  const TimestampValue& tm_src = TimestampValue::FromTimestampVal(src);
   double val;
   if (tm_src.ToSubsecondUnixTime(&val)) {
     avg->sum += val;
@@ -340,7 +343,7 @@ void AggregateFunctions::TimestampAvgRemove(FunctionContext* ctx,
   DCHECK(dst->ptr != NULL);
   DCHECK_EQ(sizeof(AvgState), dst->len);
   AvgState* avg = reinterpret_cast<AvgState*>(dst->ptr);
-  TimestampValue tm_src = TimestampValue::FromTimestampVal(src);
+  const TimestampValue& tm_src = TimestampValue::FromTimestampVal(src);
   double val;
   if (tm_src.ToSubsecondUnixTime(&val)) {
     avg->sum -= val;
@@ -353,7 +356,8 @@ TimestampVal AggregateFunctions::TimestampAvgGetValue(FunctionContext* ctx,
     const StringVal& src) {
   AvgState* val_struct = reinterpret_cast<AvgState*>(src.ptr);
   if (val_struct->count == 0) return TimestampVal::null();
-  TimestampValue tv(val_struct->sum / val_struct->count);
+  const TimestampValue& tv = TimestampValue::FromSubsecondUnixTime(
+      val_struct->sum / val_struct->count);
   if (tv.HasDate()) {
     TimestampVal result;
     tv.ToTimestampVal(&result);
@@ -367,17 +371,24 @@ TimestampVal AggregateFunctions::TimestampAvgFinalize(FunctionContext* ctx,
     const StringVal& src) {
   if (UNLIKELY(src.is_null)) return TimestampVal::null();
   TimestampVal result = TimestampAvgGetValue(ctx, src);
-  ctx->Free(src.ptr);
   return result;
 }
 
-struct DecimalAvgState {
-  DecimalVal sum; // only using val16
+// We saw some failures on the release build because GCC was emitting an instruction
+// to operate on the int128_t that assumed the pointer was aligned (typically it isn't).
+// We mark the struct with a "packed" attribute, so that the compiler does not expect it
+// to be aligned. This should not have a negative performance impact on modern CPUs.
+struct __attribute__ ((__packed__)) DecimalAvgState {
+  __int128_t sum_val16; // Always uses max precision decimal.
   int64_t count;
 };
 
 void AggregateFunctions::DecimalAvgInit(FunctionContext* ctx, StringVal* dst) {
-  AllocBuffer(ctx, dst, sizeof(DecimalAvgState));
+  // avg() uses a preallocated FIXED_UDA_INTERMEDIATE intermediate value.
+  DCHECK_EQ(dst->len, sizeof(DecimalAvgState));
+  DecimalAvgState* avg = reinterpret_cast<DecimalAvgState*>(dst->ptr);
+  avg->sum_val16 = 0;
+  avg->count = 0;
 }
 
 void AggregateFunctions::DecimalAvgUpdate(FunctionContext* ctx, const DecimalVal& src,
@@ -397,19 +408,34 @@ IR_ALWAYS_INLINE void AggregateFunctions::DecimalAvgAddOrRemove(FunctionContext*
   DCHECK(dst->ptr != NULL);
   DCHECK_EQ(sizeof(DecimalAvgState), dst->len);
   DecimalAvgState* avg = reinterpret_cast<DecimalAvgState*>(dst->ptr);
+  bool decimal_v2 = ctx->impl()->GetConstFnAttr(FunctionContextImpl::DECIMAL_V2);
 
   // Since the src and dst are guaranteed to be the same scale, we can just
   // do a simple add.
   int m = remove ? -1 : 1;
   switch (ctx->impl()->GetConstFnAttr(FunctionContextImpl::ARG_TYPE_SIZE, 0)) {
     case 4:
-      avg->sum.val16 += m * src.val4;
+      avg->sum_val16 += m * src.val4;
+      if (UNLIKELY(decimal_v2 &&
+          abs(avg->sum_val16) > DecimalUtil::MAX_UNSCALED_DECIMAL16)) {
+        ctx->SetError("Avg computation overflowed");
+      }
       break;
     case 8:
-      avg->sum.val16 += m * src.val8;
+      avg->sum_val16 += m * src.val8;
+      if (UNLIKELY(decimal_v2 &&
+          abs(avg->sum_val16) > DecimalUtil::MAX_UNSCALED_DECIMAL16)) {
+        ctx->SetError("Avg computation overflowed");
+      }
       break;
     case 16:
-      avg->sum.val16 += m * src.val16;
+      if (UNLIKELY(decimal_v2 && (avg->sum_val16 >= 0) == (src.val16 >= 0) &&
+          abs(avg->sum_val16) > DecimalUtil::MAX_UNSCALED_DECIMAL16 - abs(src.val16))) {
+        // We can't check for overflow after performing the addition like in the other
+        // cases because the result may not fit into int128.
+        ctx->SetError("Avg computation overflowed");
+      }
+      avg->sum_val16 += m * src.val16;
       break;
     default:
       DCHECK(false) << "Invalid byte size";
@@ -429,7 +455,12 @@ void AggregateFunctions::DecimalAvgMerge(FunctionContext* ctx,
   DCHECK(dst->ptr != NULL);
   DCHECK_EQ(sizeof(DecimalAvgState), dst->len);
   DecimalAvgState* dst_struct = reinterpret_cast<DecimalAvgState*>(dst->ptr);
-  dst_struct->sum.val16 += src_struct->sum.val16;
+  bool decimal_v2 = ctx->impl()->GetConstFnAttr(FunctionContextImpl::DECIMAL_V2);
+  bool overflow = decimal_v2 &&
+      abs(dst_struct->sum_val16) >
+      DecimalUtil::MAX_UNSCALED_DECIMAL16 - abs(src_struct->sum_val16);
+  if (UNLIKELY(overflow)) ctx->SetError("Avg computation overflowed");
+  dst_struct->sum_val16 += src_struct->sum_val16;
   dst_struct->count += src_struct->count;
 }
 
@@ -437,7 +468,7 @@ DecimalVal AggregateFunctions::DecimalAvgGetValue(FunctionContext* ctx,
     const StringVal& src) {
   DecimalAvgState* val_struct = reinterpret_cast<DecimalAvgState*>(src.ptr);
   if (val_struct->count == 0) return DecimalVal::null();
-  Decimal16Value sum(val_struct->sum.val16);
+  Decimal16Value sum(val_struct->sum_val16);
   Decimal16Value count(val_struct->count);
 
   int output_precision =
@@ -447,12 +478,16 @@ DecimalVal AggregateFunctions::DecimalAvgGetValue(FunctionContext* ctx,
   int sum_scale = ctx->impl()->GetConstFnAttr(FunctionContextImpl::ARG_TYPE_SCALE, 0);
   bool is_nan = false;
   bool overflow = false;
-  bool round = ctx->impl()->GetConstFnAttr(FunctionContextImpl::DECIMAL_V2);
+  bool decimal_v2 = ctx->impl()->GetConstFnAttr(FunctionContextImpl::DECIMAL_V2);
   Decimal16Value result = sum.Divide<int128_t>(sum_scale, count, 0 /* count's scale */,
-      output_precision, output_scale, round, &is_nan, &overflow);
+      output_precision, output_scale, decimal_v2, &is_nan, &overflow);
   if (UNLIKELY(is_nan)) return DecimalVal::null();
   if (UNLIKELY(overflow)) {
-    ctx->AddWarning("Avg computation overflowed, returning NULL");
+    if (decimal_v2) {
+      ctx->SetError("Avg computation overflowed");
+    } else {
+      ctx->AddWarning("Avg computation overflowed, returning NULL");
+    }
     return DecimalVal::null();
   }
   return DecimalVal(result.value());
@@ -462,7 +497,6 @@ DecimalVal AggregateFunctions::DecimalAvgFinalize(FunctionContext* ctx,
     const StringVal& src) {
   if (UNLIKELY(src.is_null)) return DecimalVal::null();
   DecimalVal result = DecimalAvgGetValue(ctx, src);
-  ctx->Free(src.ptr);
   return result;
 }
 
@@ -512,14 +546,29 @@ IR_ALWAYS_INLINE void AggregateFunctions::SumDecimalAddOrSubtract(FunctionContex
   if (src.is_null) return;
   if (dst->is_null) InitZero<DecimalVal>(ctx, dst);
   int precision = ctx->impl()->GetConstFnAttr(FunctionContextImpl::ARG_TYPE_PRECISION, 0);
+  bool decimal_v2 = ctx->impl()->GetConstFnAttr(FunctionContextImpl::DECIMAL_V2);
   // Since the src and dst are guaranteed to be the same scale, we can just
   // do a simple add.
   int m = subtract ? -1 : 1;
   if (precision <= 9) {
     dst->val16 += m * src.val4;
+    if (UNLIKELY(decimal_v2 &&
+        abs(dst->val16) > DecimalUtil::MAX_UNSCALED_DECIMAL16)) {
+      ctx->SetError("Sum computation overflowed");
+    }
   } else if (precision <= 19) {
     dst->val16 += m * src.val8;
+    if (UNLIKELY(decimal_v2 &&
+        abs(dst->val16) > DecimalUtil::MAX_UNSCALED_DECIMAL16)) {
+      ctx->SetError("Sum computation overflowed");
+    }
   } else {
+    if (UNLIKELY(decimal_v2 && (dst->val16 >= 0) == (src.val16 >= 0) &&
+        abs(dst->val16) > DecimalUtil::MAX_UNSCALED_DECIMAL16 - abs(src.val16))) {
+      // We can't check for overflow after performing the addition like in the other
+      // cases because the result may not fit into int128.
+      ctx->SetError("Sum computation overflowed");
+    }
     dst->val16 += m * src.val16;
   }
 }
@@ -528,6 +577,10 @@ void AggregateFunctions::SumDecimalMerge(FunctionContext* ctx,
     const DecimalVal& src, DecimalVal* dst) {
   if (src.is_null) return;
   if (dst->is_null) InitZero<DecimalVal>(ctx, dst);
+  bool decimal_v2 = ctx->impl()->GetConstFnAttr(FunctionContextImpl::DECIMAL_V2);
+  bool overflow = decimal_v2 &&
+      abs(dst->val16) > DecimalUtil::MAX_UNSCALED_DECIMAL16 - abs(src.val16);
+  if (UNLIKELY(overflow)) ctx->SetError("Sum computation overflowed");
   dst->val16 += src.val16;
 }
 
@@ -547,6 +600,33 @@ void AggregateFunctions::InitNullString(FunctionContext* c, StringVal* dst) {
   dst->is_null = true;
   dst->ptr = NULL;
   dst->len = 0;
+}
+
+// For DoubleVal and FloatVal, we have to handle NaN specially.  If 'val' != 'val', then
+// 'val' must be NaN, and if any of the values that are inserted are NaN, then we return
+// NaN. So, if 'src.val != src.val', set 'dst' to it.
+template <>
+void AggregateFunctions::Min(FunctionContext*, const FloatVal& src, FloatVal* dst) {
+  if (src.is_null) return;
+  if (dst->is_null || src.val < dst->val || src.val != src.val) *dst = src;
+}
+
+template <>
+void AggregateFunctions::Max(FunctionContext*, const FloatVal& src, FloatVal* dst) {
+  if (src.is_null) return;
+  if (dst->is_null || src.val > dst->val || src.val != src.val) *dst = src;
+}
+
+template <>
+void AggregateFunctions::Min(FunctionContext*, const DoubleVal& src, DoubleVal* dst) {
+  if (src.is_null) return;
+  if (dst->is_null || src.val < dst->val || src.val != src.val) *dst = src;
+}
+
+template <>
+void AggregateFunctions::Max(FunctionContext*, const DoubleVal& src, DoubleVal* dst) {
+  if (src.is_null) return;
+  if (dst->is_null || src.val > dst->val || src.val != src.val) *dst = src;
 }
 
 template<>
@@ -734,26 +814,28 @@ const static int PC_BITMAP_LENGTH = 32; // the length of each bit map
 const static float PC_THETA = 0.77351f; // the magic number to compute the final result
 const static float PC_K = -1.75f; // the magic correction for low cardinalities
 
+// Size of the distinct estimate bit map - Probabilistic Counting Algorithms for Data
+// Base Applications (Flajolet and Martin)
+//
+// The bitmap is a 64bit(1st index) x 32bit(2nd index) matrix.
+// So, the string length of 256 byte is enough.
+// The layout is:
+//   row  1: 8bit 8bit 8bit 8bit
+//   row  2: 8bit 8bit 8bit 8bit
+//   ...     ..
+//   ...     ..
+//   row 64: 8bit 8bit 8bit 8bit
+//
+// Using 32bit length, we can count up to 10^8. This will not be enough for Fact table
+// primary key, but once we approach the limit, we could interpret the result as
+// "every row is distinct".
+const static int PC_INTERMEDIATE_BYTES = NUM_PC_BITMAPS * PC_BITMAP_LENGTH / 8;
+
 void AggregateFunctions::PcInit(FunctionContext* c, StringVal* dst) {
-  // Initialize the distinct estimate bit map - Probabilistic Counting Algorithms for Data
-  // Base Applications (Flajolet and Martin)
-  //
-  // The bitmap is a 64bit(1st index) x 32bit(2nd index) matrix.
-  // So, the string length of 256 byte is enough.
-  // The layout is:
-  //   row  1: 8bit 8bit 8bit 8bit
-  //   row  2: 8bit 8bit 8bit 8bit
-  //   ...     ..
-  //   ...     ..
-  //   row 64: 8bit 8bit 8bit 8bit
-  //
-  // Using 32bit length, we can count up to 10^8. This will not be enough for Fact table
-  // primary key, but once we approach the limit, we could interpret the result as
-  // "every row is distinct".
-  //
-  // We use "string" type for DISTINCT_PC function so that we can use the string
-  // slot to hold the bitmaps.
-  AllocBuffer(c, dst, NUM_PC_BITMAPS * PC_BITMAP_LENGTH / 8);
+  // The distinctpc*() functions use a preallocated FIXED_UDA_INTERMEDIATE intermediate
+  // value.
+  DCHECK_EQ(dst->len, PC_INTERMEDIATE_BYTES);
+  memset(dst->ptr, 0, PC_INTERMEDIATE_BYTES);
 }
 
 static inline void SetDistinctEstimateBit(uint8_t* bitmap,
@@ -773,6 +855,7 @@ static inline bool GetDistinctEstimateBit(uint8_t* bitmap,
 
 template<typename T>
 void AggregateFunctions::PcUpdate(FunctionContext* c, const T& input, StringVal* dst) {
+  DCHECK_EQ(dst->len, PC_INTERMEDIATE_BYTES);
   if (input.is_null) return;
   // Core of the algorithm. This is a direct translation of the code in the paper.
   // Please see the paper for details. For simple averaging, we need to compute hash
@@ -788,6 +871,7 @@ void AggregateFunctions::PcUpdate(FunctionContext* c, const T& input, StringVal*
 
 template<typename T>
 void AggregateFunctions::PcsaUpdate(FunctionContext* c, const T& input, StringVal* dst) {
+  DCHECK_EQ(dst->len, PC_INTERMEDIATE_BYTES);
   if (input.is_null) return;
 
   // Core of the algorithm. This is a direct translation of the code in the paper.
@@ -823,12 +907,13 @@ void AggregateFunctions::PcMerge(FunctionContext* c,
     const StringVal& src, StringVal* dst) {
   DCHECK(!src.is_null);
   DCHECK(!dst->is_null);
-  DCHECK_EQ(src.len, NUM_PC_BITMAPS * PC_BITMAP_LENGTH / 8);
+  DCHECK_EQ(src.len, PC_INTERMEDIATE_BYTES);
+  DCHECK_EQ(dst->len, PC_INTERMEDIATE_BYTES);
 
   // Merge the bits
   // I think _mm_or_ps can do it, but perf doesn't really matter here. We call this only
   // once group per node.
-  for (int i = 0; i < NUM_PC_BITMAPS * PC_BITMAP_LENGTH / 8; ++i) {
+  for (int i = 0; i < PC_INTERMEDIATE_BYTES; ++i) {
     *(dst->ptr + i) |= *(src.ptr + i);
   }
 
@@ -838,9 +923,9 @@ void AggregateFunctions::PcMerge(FunctionContext* c,
            << DistinctEstimateBitMapToString(dst->ptr);
 }
 
-static double DistinceEstimateFinalize(const StringVal& src) {
+static double DistinctEstimateFinalize(const StringVal& src) {
   DCHECK(!src.is_null);
-  DCHECK_EQ(src.len, NUM_PC_BITMAPS * PC_BITMAP_LENGTH / 8);
+  DCHECK_EQ(src.len, PC_INTERMEDIATE_BYTES);
   VLOG_ROW << "FinalizeEstimateSlot Bit map:\n"
            << DistinctEstimateBitMapToString(src.ptr);
 
@@ -848,7 +933,7 @@ static double DistinceEstimateFinalize(const StringVal& src) {
   // distinct rows. We're overwriting the result in the same string buffer we've
   // allocated.
   bool is_empty = true;
-  for (int i = 0; i < NUM_PC_BITMAPS * PC_BITMAP_LENGTH / 8; ++i) {
+  for (int i = 0; i < PC_INTERMEDIATE_BYTES; ++i) {
     if (src.ptr[i] != 0) {
       is_empty = false;
       break;
@@ -885,16 +970,14 @@ static double DistinceEstimateFinalize(const StringVal& src) {
 
 BigIntVal AggregateFunctions::PcFinalize(FunctionContext* c, const StringVal& src) {
   if (UNLIKELY(src.is_null)) return BigIntVal::null();
-  double estimate = DistinceEstimateFinalize(src);
-  c->Free(src.ptr);
+  double estimate = DistinctEstimateFinalize(src);
   return static_cast<int64_t>(estimate);
 }
 
 BigIntVal AggregateFunctions::PcsaFinalize(FunctionContext* c, const StringVal& src) {
   if (UNLIKELY(src.is_null)) return BigIntVal::null();
   // When using stochastic averaging, the result has to be multiplied by NUM_PC_BITMAPS.
-  double estimate = DistinceEstimateFinalize(src) * NUM_PC_BITMAPS;
-  c->Free(src.ptr);
+  double estimate = DistinctEstimateFinalize(src) * NUM_PC_BITMAPS;
   return static_cast<int64_t>(estimate);
 }
 
@@ -902,8 +985,6 @@ BigIntVal AggregateFunctions::PcsaFinalize(FunctionContext* c, const StringVal& 
 // TODO: Expose as constant argument parameters to the UDA.
 const static int NUM_BUCKETS = 100;
 const static int NUM_SAMPLES_PER_BUCKET = 200;
-const static int NUM_SAMPLES = NUM_BUCKETS * NUM_SAMPLES_PER_BUCKET;
-const static int MAX_STRING_SAMPLE_LEN = 10;
 
 template <typename T>
 struct ReservoirSample {
@@ -918,6 +999,9 @@ struct ReservoirSample {
   // Gets a copy of the sample value that allocates memory from ctx, if necessary.
   T GetValue(FunctionContext* ctx) { return val; }
 };
+
+// Maximum length of a string sample.
+const static int MAX_STRING_SAMPLE_LEN = 10;
 
 // Template specialization for StringVal because we do not store the StringVal itself.
 // Instead, we keep fixed size arrays and truncate longer strings if necessary.
@@ -939,82 +1023,6 @@ struct ReservoirSample<StringVal> {
     return StringVal::CopyFrom(ctx, &val[0], len);
   }
 };
-
-template <typename T>
-struct ReservoirSampleState {
-  ReservoirSample<T> samples[NUM_SAMPLES];
-
-  // Number of collected samples.
-  int num_samples;
-
-  // Number of values over which the samples were collected.
-  int64_t source_size;
-
-  // Random number generator for generating 64-bit integers
-  // TODO: Replace with mt19937_64 when upgrading boost
-  ranlux64_3 rng;
-
-  int64_t GetNext64(int64_t max) {
-    uniform_int<int64_t> dist(0, max);
-    return dist(rng);
-  }
-};
-
-template <typename T>
-void AggregateFunctions::ReservoirSampleInit(FunctionContext* ctx, StringVal* dst) {
-  AllocBuffer(ctx, dst, sizeof(ReservoirSampleState<T>));
-  if (UNLIKELY(dst->is_null)) {
-    DCHECK(!ctx->impl()->state()->GetQueryStatus().ok());
-    return;
-  }
-  *reinterpret_cast<ReservoirSampleState<T>*>(dst->ptr) = ReservoirSampleState<T>();
-}
-
-template <typename T>
-void AggregateFunctions::ReservoirSampleUpdate(FunctionContext* ctx, const T& src,
-    StringVal* dst) {
-  if (src.is_null) return;
-  DCHECK(!dst->is_null);
-  DCHECK_EQ(dst->len, sizeof(ReservoirSampleState<T>));
-  ReservoirSampleState<T>* state = reinterpret_cast<ReservoirSampleState<T>*>(dst->ptr);
-
-  if (state->num_samples < NUM_SAMPLES) {
-    state->samples[state->num_samples++] = ReservoirSample<T>(src);
-  } else {
-    int64_t r = state->GetNext64(state->source_size);
-    if (r < NUM_SAMPLES) state->samples[r] = ReservoirSample<T>(src);
-  }
-  ++state->source_size;
-}
-
-template <typename T>
-StringVal AggregateFunctions::ReservoirSampleSerialize(FunctionContext* ctx,
-    const StringVal& src) {
-  if (UNLIKELY(src.is_null)) return src;
-  StringVal result = StringVal::CopyFrom(ctx, src.ptr, src.len);
-  ctx->Free(src.ptr);
-  if (UNLIKELY(result.is_null)) return result;
-
-  ReservoirSampleState<T>* state = reinterpret_cast<ReservoirSampleState<T>*>(result.ptr);
-  // Assign keys to the samples that haven't been set (i.e. if serializing after
-  // Update()). In weighted reservoir sampling the keys are typically assigned as the
-  // sources are being sampled, but this requires maintaining the samples in sorted order
-  // (by key) and it accomplishes the same thing at this point because all data points
-  // coming into Update() get the same weight. When the samples are later merged, they do
-  // have different weights (set here) that are proportional to the source_size, i.e.
-  // samples selected from a larger stream are more likely to end up in the final sample
-  // set. In order to avoid the extra overhead in Update(), we approximate the keys by
-  // picking random numbers in the range [(SOURCE_SIZE - SAMPLE_SIZE)/(SOURCE_SIZE), 1].
-  // This weights the keys by SOURCE_SIZE and implies that the samples picked had the
-  // highest keys, because values not sampled would have keys between 0 and
-  // (SOURCE_SIZE - SAMPLE_SIZE)/(SOURCE_SIZE).
-  for (int i = 0; i < state->num_samples; ++i) {
-    if (state->samples[i].key >= 0) continue;
-    int r = rand() % state->num_samples;
-    state->samples[i].key = ((double) state->source_size - r) / state->source_size;
-  }
-  return result;
-}
 
 template <typename T>
 bool SampleValLess(const ReservoirSample<T>& i, const ReservoirSample<T>& j) {
@@ -1050,38 +1058,283 @@ bool SampleKeyGreater(const ReservoirSample<T>& i, const ReservoirSample<T>& j) 
   return i.key > j.key;
 }
 
+// Keeps track of the current state of the reservoir sampling algorithm. The samples are
+// stored in a dynamically sized array. Initially, the the samples array is stored in a
+// separate memory allocation. This class is responsible for managing the memory of the
+// array and reallocating when the array is full. When this object is serialized into an
+// output buffer, the samples array is inlined into the output buffer as well.
+template <typename T>
+class ReservoirSampleState {
+ public:
+  ReservoirSampleState(FunctionContext* ctx)
+    : num_samples_(0),
+      capacity_(INIT_CAPACITY),
+      source_size_(0),
+      sample_array_inline_(false),
+      samples_(NULL) {
+    // Allocate some initial memory for the samples array.
+    size_t buffer_len = sizeof(ReservoirSample<T>) * capacity_;
+    uint8_t* ptr = ctx->Allocate(buffer_len);
+    if (ptr == NULL) {
+      DCHECK(!ctx->impl()->state()->GetQueryStatus().ok());
+      return;
+    }
+    samples_ = reinterpret_cast<ReservoirSample<T>*>(ptr);
+  }
+
+  // Returns a pointer to a ReservoirSample at idx.
+  ReservoirSample<T>* GetSample(int64_t idx) {
+    DCHECK(samples_ != NULL);
+    DCHECK_LT(idx, num_samples_);
+    DCHECK_LE(num_samples_, capacity_);
+    DCHECK_GE(idx, 0);
+    return &samples_[idx];
+  }
+
+  // Adds a sample and increments the source size. Doubles the capacity of the sample
+  // array if necessary. If max capacity is reached, randomly evicts a sample (as
+  // required by the algorithm). Returns false if the attempt to double the capacity
+  // fails, true otherwise.
+  bool AddSample(FunctionContext* ctx, const ReservoirSample<T>& s) {
+    DCHECK(samples_ != NULL);
+    DCHECK_LE(num_samples_, MAX_CAPACITY);
+    if (num_samples_ < MAX_CAPACITY) {
+      if (num_samples_ == capacity_) {
+        bool result = IncreaseCapacity(ctx, capacity_ * 2);
+        if (!result) return false;
+      }
+      DCHECK_LT(num_samples_, capacity_);
+      samples_[num_samples_++] = s;
+    } else {
+      DCHECK_EQ(num_samples_, MAX_CAPACITY);
+      DCHECK(!sample_array_inline_);
+      int64_t idx = GetNext64(source_size_);
+      if (idx < MAX_CAPACITY) samples_[idx] = s;
+    }
+    ++source_size_;
+    return true;
+  }
+
+  // Same as above.
+  bool AddSample(FunctionContext* ctx, const T& s) {
+    return AddSample(ctx, ReservoirSample<T>(s));
+  }
+
+  // Returns a buffer with a serialized ReservoirSampleState and the array of samples it
+  // contains. The samples array must not be inlined; i.e. it must be in a separate memory
+  // allocation. Returns a buffer containing this object and inlined samples array. The
+  // memory containing this object and the samples array is freed. The serialized object
+  // in the output buffer requires a call to Deserialize() before use.
+  StringVal Serialize(FunctionContext* ctx) {
+    DCHECK(samples_ != NULL);
+    DCHECK(!sample_array_inline_);
+    // Assign keys to the samples that haven't been set (i.e. if serializing after
+    // Update()). In weighted reservoir sampling the keys are typically assigned as the
+    // sources are being sampled, but this requires maintaining the samples in sorted
+    // order (by key) and it accomplishes the same thing at this point because all data
+    // points coming into Update() get the same weight. When the samples are later merged,
+    // they do have different weights (set here) that are proportional to the source_size,
+    // i.e. samples selected from a larger stream are more likely to end up in the final
+    // sample set. In order to avoid the extra overhead in Update(), we approximate the
+    // keys by picking random numbers in the range
+    // [(SOURCE_SIZE - SAMPLE_SIZE)/(SOURCE_SIZE), 1]. This weights the keys by
+    // SOURCE_SIZE and implies that the samples picked had the highest keys, because
+    // values not sampled would have keys between 0 and
+    // (SOURCE_SIZE - SAMPLE_SIZE)/(SOURCE_SIZE).
+    for (int i = 0; i < num_samples_; ++i) {
+      if (samples_[i].key >= 0) continue;
+      int r = rand() % num_samples_;
+      samples_[i].key = ((double) source_size_ - r) / source_size_;
+    }
+    capacity_ = num_samples_;
+    sample_array_inline_ = true;
+
+    size_t buffer_len = sizeof(ReservoirSampleState<T>) +
+        sizeof(ReservoirSample<T>) * num_samples_;
+    StringVal dst(ctx, buffer_len);
+    if (LIKELY(!dst.is_null)) {
+      memcpy(dst.ptr, reinterpret_cast<uint8_t*>(this), sizeof(ReservoirSampleState<T>));
+      memcpy(dst.ptr + sizeof(ReservoirSampleState<T>),
+          reinterpret_cast<uint8_t*>(samples_),
+          sizeof(ReservoirSample<T>) * num_samples_);
+    }
+    ctx->Free(reinterpret_cast<uint8_t*>(samples_));
+    ctx->Free(reinterpret_cast<uint8_t*>(this));
+    return dst;
+  }
+
+  // Updates the pointer to the samples array. Must be called before using this object in
+  // Merge().
+  void Deserialize() {
+    DCHECK(sample_array_inline_);
+    samples_ = reinterpret_cast<ReservoirSample<T>*>(this + 1);
+  }
+
+  // Merges the samples in "other_state" into the current state by following the
+  // reservoir sampling algorithm. If necessary, increases the capacity to fit the
+  // samples from "other_state". In the case of failure to increase the size of the
+  // array, returns.
+  void Merge(FunctionContext* ctx, ReservoirSampleState<T>* other_state) {
+    DCHECK(samples_ != NULL);
+    DCHECK_GT(capacity_, 0);
+    other_state->Deserialize();
+    int src_idx = 0;
+    // We can increase the capacity significantly here and skip several doublings because
+    // we know the number of elements in the other state up front.
+    if (capacity_ < MAX_CAPACITY) {
+      int necessary_capacity = num_samples_ + other_state->num_samples();
+      if (capacity_ < necessary_capacity) {
+        bool result = IncreaseCapacity(ctx, necessary_capacity);
+        if (!result) return;
+      }
+    }
+
+    // First, fill up the dst samples if they don't already exist. The samples are now
+    // ordered as a min-heap on the key.
+    while (num_samples_ < MAX_CAPACITY && src_idx < other_state->num_samples()) {
+      DCHECK_GE(other_state->GetSample(src_idx)->key, 0);
+      bool result = AddSample(ctx, *other_state->GetSample(src_idx++));
+      if (!result) return;
+      push_heap(&samples_[0], &samples_[num_samples_], SampleKeyGreater<T>);
+    }
+
+    // Then for every sample from source, take the sample if the key is greater than
+    // the minimum key in the min-heap.
+    while (src_idx < other_state->num_samples()) {
+      DCHECK_GE(other_state->GetSample(src_idx)->key, 0);
+      if (other_state->GetSample(src_idx)->key > samples_[0].key) {
+        pop_heap(&samples_[0], &samples_[num_samples_], SampleKeyGreater<T>);
+        samples_[MAX_CAPACITY - 1] = *other_state->GetSample(src_idx);
+        push_heap(&samples_[0], &samples_[num_samples_], SampleKeyGreater<T>);
+      }
+      ++src_idx;
+    }
+
+    source_size_ += other_state->source_size();
+  }
+
+  // Returns the median element.
+  T GetMedian(FunctionContext* ctx) {
+    if (num_samples_ == 0) return T::null();
+    ReservoirSample<T>* mid_point = GetSample(num_samples_ / 2);
+    nth_element(&samples_[0], mid_point, &samples_[num_samples_], SampleValLess<T>);
+    return mid_point->GetValue(ctx);
+  }
+
+  // Sorts the samples.
+  void SortSamples() {
+    sort(&samples_[0], &samples_[num_samples_], SampleValLess<T>);
+  }
+
+  // Deletes this object by freeing the memory that contains the array of samples (if not
+  // inlined) and itself.
+  void Delete(FunctionContext* ctx) {
+    if (!sample_array_inline_) ctx->Free(reinterpret_cast<uint8_t*>(samples_));
+    ctx->Free(reinterpret_cast<uint8_t*>(this));
+  }
+
+  int num_samples() { return num_samples_; }
+  int64_t source_size() { return source_size_; }
+
+ private:
+  // The initial capacity of the samples array.
+  const static int INIT_CAPACITY = 16;
+
+  // Maximum capacity of the samples array.
+  const static int MAX_CAPACITY = NUM_BUCKETS * NUM_SAMPLES_PER_BUCKET;
+
+  // Number of collected samples.
+  int num_samples_;
+
+  // Size of the "samples_" array.
+  int capacity_;
+
+  // Number of values over which the samples were collected.
+  int64_t source_size_;
+
+  // Random number generator for generating 64-bit integers
+  // TODO: Replace with mt19937_64 when upgrading boost
+  ranlux64_3 rng_;
+
+  // True if the array of samples is in the same memory allocation as this object. If
+  // false, this object is responsible for freeing the memory.
+  bool sample_array_inline_;
+
+  // Points to the array of ReservoirSamples. The array may be located inline (right after
+  // this object), or in a separate memory allocation.
+  ReservoirSample<T>* samples_;
+
+  // Increases the capacity of the "samples_" array to "new_capacity" rounded up to a
+  // power of two by reallocating. Should only be called if the samples array is not
+  // inline. Returns false if the operation fails.
+  bool IncreaseCapacity(FunctionContext* ctx, int new_capacity) {
+    DCHECK(samples_ != NULL);
+    DCHECK(!sample_array_inline_);
+    DCHECK_LT(capacity_, MAX_CAPACITY);
+    DCHECK_GT(new_capacity, capacity_);
+    new_capacity = BitUtil::RoundUpToPowerOfTwo(new_capacity);
+    if (new_capacity > MAX_CAPACITY) new_capacity = MAX_CAPACITY;
+    size_t buffer_len = sizeof(ReservoirSample<T>) * new_capacity;
+    uint8_t* ptr = ctx->Reallocate(reinterpret_cast<uint8_t*>(samples_), buffer_len);
+    if (ptr == NULL) {
+      DCHECK(!ctx->impl()->state()->GetQueryStatus().ok());
+      return false;
+    }
+    samples_ = reinterpret_cast<ReservoirSample<T>*>(ptr);
+    capacity_ = new_capacity;
+    return true;
+  }
+
+  // Returns a random integer in the range [0, max].
+  int64_t GetNext64(int64_t max) {
+    uniform_int<int64_t> dist(0, max);
+    return dist(rng_);
+  }
+};
+
+template <typename T>
+void AggregateFunctions::ReservoirSampleInit(FunctionContext* ctx, StringVal* dst) {
+  AllocBuffer(ctx, dst, sizeof(ReservoirSampleState<T>));
+  if (UNLIKELY(dst->is_null)) {
+    DCHECK(!ctx->impl()->state()->GetQueryStatus().ok());
+    return;
+  }
+  ReservoirSampleState<T>* dst_state =
+      reinterpret_cast<ReservoirSampleState<T>*>(dst->ptr);
+  *dst_state = ReservoirSampleState<T>(ctx);
+}
+
+template <typename T>
+void AggregateFunctions::ReservoirSampleUpdate(FunctionContext* ctx, const T& src,
+    StringVal* dst) {
+  if (src.is_null) return;
+  DCHECK(!dst->is_null);
+  ReservoirSampleState<T>* dst_state =
+      reinterpret_cast<ReservoirSampleState<T>*>(dst->ptr);
+  dst_state->AddSample(ctx, src);
+}
+
+template <typename T>
+StringVal AggregateFunctions::ReservoirSampleSerialize(FunctionContext* ctx,
+    const StringVal& src) {
+  if (UNLIKELY(src.is_null)) return src;
+  ReservoirSampleState<T>* src_state =
+      reinterpret_cast<ReservoirSampleState<T>*>(src.ptr);
+  StringVal result = src_state->Serialize(ctx);
+  return result;
+}
+
 template <typename T>
 void AggregateFunctions::ReservoirSampleMerge(FunctionContext* ctx,
-    const StringVal& src_val, StringVal* dst_val) {
-  if (src_val.is_null) return;
-  DCHECK(!dst_val->is_null);
-  DCHECK(!src_val.is_null);
-  DCHECK_EQ(src_val.len, sizeof(ReservoirSampleState<T>));
-  DCHECK_EQ(dst_val->len, sizeof(ReservoirSampleState<T>));
-  ReservoirSampleState<T>* src = reinterpret_cast<ReservoirSampleState<T>*>(src_val.ptr);
-  ReservoirSampleState<T>* dst = reinterpret_cast<ReservoirSampleState<T>*>(dst_val->ptr);
-
-  int src_idx = 0;
-  int src_max = src->num_samples;
-  // First, fill up the dst samples if they don't already exist. The samples are now
-  // ordered as a min-heap on the key.
-  while (dst->num_samples < NUM_SAMPLES && src_idx < src_max) {
-    DCHECK_GE(src->samples[src_idx].key, 0);
-    dst->samples[dst->num_samples++] = src->samples[src_idx++];
-    push_heap(dst->samples, dst->samples + dst->num_samples, SampleKeyGreater<T>);
-  }
-  // Then for every sample from source, take the sample if the key is greater than
-  // the minimum key in the min-heap.
-  while (src_idx < src_max) {
-    DCHECK_GE(src->samples[src_idx].key, 0);
-    if (src->samples[src_idx].key > dst->samples[0].key) {
-      pop_heap(dst->samples, dst->samples + NUM_SAMPLES, SampleKeyGreater<T>);
-      dst->samples[NUM_SAMPLES - 1] = src->samples[src_idx];
-      push_heap(dst->samples, dst->samples + NUM_SAMPLES, SampleKeyGreater<T>);
-    }
-    ++src_idx;
-  }
-  dst->source_size += src->source_size;
+    const StringVal& src, StringVal* dst) {
+  if (src.is_null) return;
+  DCHECK(!dst->is_null);
+  DCHECK(!src.is_null);
+  ReservoirSampleState<T>* src_state =
+      reinterpret_cast<ReservoirSampleState<T>*>(src.ptr);
+  ReservoirSampleState<T>* dst_state =
+      reinterpret_cast<ReservoirSampleState<T>*>(dst->ptr);
+  dst_state->Merge(ctx, src_state);
 }
 
 template <typename T>
@@ -1107,74 +1360,66 @@ void PrintSample(const ReservoirSample<DecimalVal>& v, ostream* os) {
 
 template <>
 void PrintSample(const ReservoirSample<TimestampVal>& v, ostream* os) {
-  *os << TimestampValue::FromTimestampVal(v.val).DebugString();
+  *os << TimestampValue::FromTimestampVal(v.val).ToString();
 }
 
 template <typename T>
 StringVal AggregateFunctions::ReservoirSampleFinalize(FunctionContext* ctx,
-    const StringVal& src_val) {
-  if (UNLIKELY(src_val.is_null)) return src_val;
-  DCHECK_EQ(src_val.len, sizeof(ReservoirSampleState<T>));
-  ReservoirSampleState<T>* src = reinterpret_cast<ReservoirSampleState<T>*>(src_val.ptr);
+    const StringVal& src) {
+  if (UNLIKELY(src.is_null)) return src;
+  ReservoirSampleState<T>* src_state =
+      reinterpret_cast<ReservoirSampleState<T>*>(src.ptr);
 
   stringstream out;
-  for (int i = 0; i < src->num_samples; ++i) {
-    PrintSample<T>(src->samples[i], &out);
-    if (i < (src->num_samples - 1)) out << ", ";
+  for (int i = 0; i < src_state->num_samples(); ++i) {
+    PrintSample<T>(*src_state->GetSample(i), &out);
+    if (i < (src_state->num_samples() - 1)) out << ", ";
   }
   const string& out_str = out.str();
-  StringVal result_str(ctx, out_str.size());
-  if (LIKELY(!result_str.is_null)) {
-    memcpy(result_str.ptr, out_str.c_str(), result_str.len);
-  }
-  ctx->Free(src_val.ptr);
+  StringVal result_str = StringVal::CopyFrom(ctx,
+      reinterpret_cast<const uint8_t*>(out_str.c_str()), out_str.size());
+  src_state->Delete(ctx);
   return result_str;
 }
 
 template <typename T>
 StringVal AggregateFunctions::HistogramFinalize(FunctionContext* ctx,
-    const StringVal& src_val) {
-  if (UNLIKELY(src_val.is_null)) return src_val;
-  DCHECK_EQ(src_val.len, sizeof(ReservoirSampleState<T>));
+    const StringVal& src) {
+  if (UNLIKELY(src.is_null)) return src;
 
-  ReservoirSampleState<T>* src = reinterpret_cast<ReservoirSampleState<T>*>(src_val.ptr);
-  sort(src->samples, src->samples + src->num_samples, SampleValLess<T>);
+  ReservoirSampleState<T>* src_state =
+      reinterpret_cast<ReservoirSampleState<T>*>(src.ptr);
+  src_state->SortSamples();
 
   stringstream out;
-  int num_buckets = min(src->num_samples, NUM_BUCKETS);
-  int samples_per_bucket = max(src->num_samples / NUM_BUCKETS, 1);
+  int num_buckets = min(src_state->num_samples(), NUM_BUCKETS);
+  int samples_per_bucket = max(src_state->num_samples() / NUM_BUCKETS, 1);
   for (int bucket_idx = 0; bucket_idx < num_buckets; ++bucket_idx) {
     int sample_idx = (bucket_idx + 1) * samples_per_bucket - 1;
-    PrintSample<T>(src->samples[sample_idx], &out);
+    PrintSample<T>(*(src_state->GetSample(sample_idx)), &out);
     if (bucket_idx < (num_buckets - 1)) out << ", ";
   }
   const string& out_str = out.str();
   StringVal result_str = StringVal::CopyFrom(ctx,
       reinterpret_cast<const uint8_t*>(out_str.c_str()), out_str.size());
-  ctx->Free(src_val.ptr);
+  src_state->Delete(ctx);
   return result_str;
 }
 
 template <typename T>
-T AggregateFunctions::AppxMedianFinalize(FunctionContext* ctx,
-    const StringVal& src_val) {
-  if (UNLIKELY(src_val.is_null)) return T::null();
-  DCHECK_EQ(src_val.len, sizeof(ReservoirSampleState<T>));
-
-  ReservoirSampleState<T>* src = reinterpret_cast<ReservoirSampleState<T>*>(src_val.ptr);
-  if (src->num_samples == 0) {
-    ctx->Free(src_val.ptr);
-    return T::null();
-  }
-  sort(src->samples, src->samples + src->num_samples, SampleValLess<T>);
-
-  T result = src->samples[src->num_samples / 2].GetValue(ctx);
-  ctx->Free(src_val.ptr);
+T AggregateFunctions::AppxMedianFinalize(FunctionContext* ctx, const StringVal& src) {
+  if (UNLIKELY(src.is_null)) return T::null();
+  ReservoirSampleState<T>* src_state =
+      reinterpret_cast<ReservoirSampleState<T>*>(src.ptr);
+  T result = src_state->GetMedian(ctx);
+  src_state->Delete(ctx);
   return result;
 }
 
 void AggregateFunctions::HllInit(FunctionContext* ctx, StringVal* dst) {
-  AllocBuffer(ctx, dst, HLL_LEN);
+  // The HLL functions use a preallocated FIXED_UDA_INTERMEDIATE intermediate value.
+  DCHECK_EQ(dst->len, HLL_LEN);
+  memset(dst->ptr, 0, HLL_LEN);
 }
 
 template <typename T>
@@ -1222,10 +1467,8 @@ void AggregateFunctions::HllMerge(
   }
 }
 
-uint64_t AggregateFunctions::HllFinalEstimate(const uint8_t* buckets,
-    int32_t num_buckets) {
+uint64_t AggregateFunctions::HllFinalEstimate(const uint8_t* buckets) {
   DCHECK(buckets != NULL);
-  DCHECK_EQ(num_buckets, HLL_LEN);
 
   // Empirical constants for the algorithm.
   float alpha = 0;
@@ -1241,9 +1484,8 @@ uint64_t AggregateFunctions::HllFinalEstimate(const uint8_t* buckets,
 
   float harmonic_mean = 0;
   int num_zero_registers = 0;
-  // TODO: Consider improving this loop (e.g. replacing 'if' with arithmetic op).
-  for (int i = 0; i < num_buckets; ++i) {
-    harmonic_mean += powf(2.0f, -buckets[i]);
+  for (int i = 0; i < HLL_LEN; ++i) {
+    harmonic_mean += ldexp(1.0f, -buckets[i]);
     if (buckets[i] == 0) ++num_zero_registers;
   }
   harmonic_mean = 1.0f / harmonic_mean;
@@ -1264,9 +1506,188 @@ uint64_t AggregateFunctions::HllFinalEstimate(const uint8_t* buckets,
 
 BigIntVal AggregateFunctions::HllFinalize(FunctionContext* ctx, const StringVal& src) {
   if (UNLIKELY(src.is_null)) return BigIntVal::null();
-  uint64_t estimate = HllFinalEstimate(src.ptr, src.len);
-  ctx->Free(src.ptr);
+  uint64_t estimate = HllFinalEstimate(src.ptr);
   return estimate;
+}
+
+/// Intermediate aggregation state for the SampledNdv() function.
+/// Stores NUM_HLL_BUCKETS of the form <row_count, hll_state>.
+/// The 'row_count' keeps track of how many input rows were aggregated into that
+/// bucket, and the 'hll_state' is an intermediate aggregation state of HyperLogLog.
+/// See the header comments on the SampledNdv() function for more details.
+class SampledNdvState {
+ public:
+  /// Empirically determined number of HLL buckets. Power of two for fast modulo.
+  static const uint32_t NUM_HLL_BUCKETS = 32;
+
+  /// A bucket contains an update count and an HLL intermediate state.
+  static constexpr int64_t BUCKET_SIZE = sizeof(int64_t) + AggregateFunctions::HLL_LEN;
+
+  /// Sampling percent which was given as the second argument to SampledNdv().
+  /// Stored here to avoid existing issues with passing constant arguments to all
+  /// aggregation phases and because we convert the sampling percent argument from
+  /// decimal to double. See IMPALA-6179.
+  double sample_perc;
+
+  /// Counts the number of Update() calls. Used for determining which bucket to update.
+  int64_t total_row_count;
+
+  /// Array of buckets.
+  struct {
+    int64_t row_count;
+    uint8_t hll[AggregateFunctions::HLL_LEN];
+  } buckets[NUM_HLL_BUCKETS];
+};
+
+void AggregateFunctions::SampledNdvInit(FunctionContext* ctx, StringVal* dst) {
+  // Uses a preallocated FIXED_UDA_INTERMEDIATE intermediate value.
+  DCHECK_EQ(dst->len, sizeof(SampledNdvState));
+  memset(dst->ptr, 0, sizeof(SampledNdvState));
+
+  DoubleVal* sample_perc = reinterpret_cast<DoubleVal*>(ctx->GetConstantArg(1));
+  if (sample_perc == nullptr) return;
+  // Guaranteed by the FE.
+  DCHECK(!sample_perc->is_null);
+  DCHECK_GE(sample_perc->val, 0.0);
+  DCHECK_LE(sample_perc->val, 1.0);
+  SampledNdvState* state = reinterpret_cast<SampledNdvState*>(dst->ptr);
+  state->sample_perc = sample_perc->val;
+}
+
+/// Incorporate the 'src' into one of the intermediate HLLs, which will be used by
+/// Finalize() to generate a set of the (x,y) data points.
+template <typename T>
+void AggregateFunctions::SampledNdvUpdate(FunctionContext* ctx, const T& src,
+    const DoubleVal& sample_perc, StringVal* dst) {
+  SampledNdvState* state = reinterpret_cast<SampledNdvState*>(dst->ptr);
+  int64_t bucket_idx = state->total_row_count % SampledNdvState::NUM_HLL_BUCKETS;
+  StringVal hll_dst = StringVal(state->buckets[bucket_idx].hll, HLL_LEN);
+  HllUpdate(ctx, src, &hll_dst);
+  ++state->buckets[bucket_idx].row_count;
+  ++state->total_row_count;
+}
+
+void AggregateFunctions::SampledNdvMerge(FunctionContext* ctx, const StringVal& src,
+    StringVal* dst) {
+  SampledNdvState* src_state = reinterpret_cast<SampledNdvState*>(src.ptr);
+  SampledNdvState* dst_state = reinterpret_cast<SampledNdvState*>(dst->ptr);
+  for (int i = 0; i < SampledNdvState::NUM_HLL_BUCKETS; ++i) {
+    StringVal src_hll = StringVal(src_state->buckets[i].hll, HLL_LEN);
+    StringVal dst_hll = StringVal(dst_state->buckets[i].hll, HLL_LEN);
+    HllMerge(ctx, src_hll, &dst_hll);
+    dst_state->buckets[i].row_count += src_state->buckets[i].row_count;
+  }
+  // Total count. Not really needed after Update() but kept for sanity checking.
+  dst_state->total_row_count += src_state->total_row_count;
+  // Propagate sampling percent to Finalize().
+  dst_state->sample_perc = src_state->sample_perc;
+}
+
+BigIntVal AggregateFunctions::SampledNdvFinalize(FunctionContext* ctx,
+    const StringVal& src) {
+  SampledNdvState* state = reinterpret_cast<SampledNdvState*>(src.ptr);
+
+  // Generate 'num_points' data points with x=row_count and y=ndv_estimate. These points
+  // are used to fit a function for the NDV growth and estimate the real NDV.
+  constexpr int num_points =
+      SampledNdvState::NUM_HLL_BUCKETS * SampledNdvState::NUM_HLL_BUCKETS;
+  int64_t counts[num_points] = { 0 };
+  int64_t ndvs[num_points] = { 0 };
+
+  int64_t min_ndv = numeric_limits<int64_t>::max();
+  int64_t min_count = numeric_limits<int64_t>::max();
+  // We have a fixed number of HLL intermediates to generate data points. Any unique
+  // subset of intermediates can be combined to create a new data point. It was
+  // empirically determined that 'num_data' points is typically sufficient and there are
+  // diminishing returns from generating additional data points.
+  // The generation method below was chosen for its simplicity. It successively merges
+  // buckets in a rolling window of size NUM_HLL_BUCKETS. Repeating the last data point
+  // where all buckets are merged biases the curve fitting to hit that data point which
+  // makes sense because that's likely the most accurate one. The number of data points
+  // are sufficient for reasonable accuracy.
+  int pidx = 0;
+  for (int i = 0; i < SampledNdvState::NUM_HLL_BUCKETS; ++i) {
+    uint8_t merged_hll_data[HLL_LEN];
+    memset(merged_hll_data, 0, HLL_LEN);
+    StringVal merged_hll(merged_hll_data, HLL_LEN);
+    int64_t merged_count = 0;
+    for (int j = 0; j < SampledNdvState::NUM_HLL_BUCKETS; ++j) {
+      int bucket_idx = (i + j) % SampledNdvState::NUM_HLL_BUCKETS;
+      merged_count += state->buckets[bucket_idx].row_count;
+      counts[pidx] = merged_count;
+      StringVal hll = StringVal(state->buckets[bucket_idx].hll, HLL_LEN);
+      HllMerge(ctx, hll, &merged_hll);
+      ndvs[pidx] = HllFinalEstimate(merged_hll.ptr);
+      ++pidx;
+    }
+    min_count = std::min(min_count, state->buckets[i].row_count);
+    min_ndv = std::min(min_ndv, ndvs[i * SampledNdvState::NUM_HLL_BUCKETS]);
+  }
+  // Based on the point-generation method above the last elements represent the data
+  // point where all buckets are merged.
+  int64_t max_count = counts[num_points - 1];
+  int64_t max_ndv = ndvs[num_points - 1];
+
+  // Scale all values to [0,1] since some objective functions require it (e.g., Sigmoid).
+  double count_scale = max_count - min_count;
+  double ndv_scale = max_ndv - min_ndv;
+  if (count_scale == 0) count_scale = 1.0;
+  if (ndv_scale == 0) ndv_scale = 1.0;
+  double scaled_counts[num_points];
+  double scaled_ndvs[num_points];
+  for (int i = 0; i < num_points; ++i) {
+    scaled_counts[i] = counts[i] / count_scale;
+    scaled_ndvs[i] = ndvs[i] / ndv_scale;
+  }
+
+  // List of objective functions. Curve fitting will select the best values for the
+  // parameters a, b, c, d.
+  vector<ObjectiveFunction> ndv_fns;
+  // Linear function: f(x) = a + b * x
+  ndv_fns.push_back(ObjectiveFunction("LIN", 2,
+      [](double x, const double* params) -> double {
+        return params[0] + params[1] * x;
+      }
+  ));
+  // Logarithmic function: f(x) = a + b * log(x)
+  ndv_fns.push_back(ObjectiveFunction("LOG", 2,
+      [](double x, const double* params) -> double {
+        return params[0] + params[1] * log(x);
+      }
+  ));
+  // Power function: f(x) = a + b * pow(x, c)
+  ndv_fns.push_back(ObjectiveFunction("POW", 3,
+      [](double x, const double* params) -> double {
+        return params[0] + params[1] * pow(x, params[2]);
+      }
+  ));
+  // Sigmoid function: f(x) = a + b * (c / (c + pow(d, -x)))
+  ndv_fns.push_back(ObjectiveFunction("SIG", 4,
+      [](double x, const double* params) -> double {
+        return params[0] + params[1] * (params[2] / (params[2] + pow(params[3], -x)));
+      }
+  ));
+
+  // Perform least mean squares fitting on all objective functions.
+  vector<ObjectiveFunction> valid_ndv_fns;
+  for (ObjectiveFunction& f: ndv_fns) {
+    if(f.LmsFit(scaled_counts, scaled_ndvs, num_points)) {
+      valid_ndv_fns.push_back(std::move(f));
+    }
+  }
+
+  // Select the best-fit function for estimating the NDV.
+  auto best_fit_fn = min_element(valid_ndv_fns.begin(), valid_ndv_fns.end(),
+      [](const ObjectiveFunction& a, const ObjectiveFunction& b) -> bool {
+        return a.GetError() < b.GetError();
+      }
+  );
+
+  // Compute the extrapolated NDV based on the extrapolated row count.
+  double extrap_count = max_count / state->sample_perc;
+  double scaled_extrap_count = extrap_count / count_scale;
+  double scaled_extrap_ndv = best_fit_fn->GetY(scaled_extrap_count);
+  return round(scaled_extrap_ndv * ndv_scale);
 }
 
 // An implementation of a simple single pass variance algorithm. A standard UDA must
@@ -1288,7 +1709,8 @@ static double ComputeKnuthVariance(const KnuthVarianceState& state, bool pop) {
 }
 
 void AggregateFunctions::KnuthVarInit(FunctionContext* ctx, StringVal* dst) {
-  dst->is_null = false;
+  // The Knuth variance functions use a preallocated FIXED_UDA_INTERMEDIATE intermediate
+  // value.
   DCHECK_EQ(dst->len, sizeof(KnuthVarianceState));
   memset(dst->ptr, 0, dst->len);
 }
@@ -1370,11 +1792,8 @@ struct RankState {
 };
 
 void AggregateFunctions::RankInit(FunctionContext* ctx, StringVal* dst) {
-  AllocBuffer(ctx, dst, sizeof(RankState));
-  if (UNLIKELY(dst->is_null)) {
-    DCHECK(!ctx->impl()->state()->GetQueryStatus().ok());
-    return;
-  }
+  // The rank functions use a preallocated FIXED_UDA_INTERMEDIATE intermediate value.
+  DCHECK_EQ(dst->len, sizeof(RankState));
   *reinterpret_cast<RankState*>(dst->ptr) = RankState();
 }
 
@@ -1422,7 +1841,6 @@ BigIntVal AggregateFunctions::RankFinalize(FunctionContext* ctx,
   DCHECK_EQ(src_val.len, sizeof(RankState));
   RankState* state = reinterpret_cast<RankState*>(src_val.ptr);
   int64_t result = state->rank;
-  ctx->Free(src_val.ptr);
   return BigIntVal(result);
 }
 
@@ -1931,6 +2349,27 @@ template void AggregateFunctions::HllUpdate(
     FunctionContext*, const TimestampVal&, StringVal*);
 template void AggregateFunctions::HllUpdate(
     FunctionContext*, const DecimalVal&, StringVal*);
+
+template void AggregateFunctions::SampledNdvUpdate(
+    FunctionContext*, const BooleanVal&, const DoubleVal&, StringVal*);
+template void AggregateFunctions::SampledNdvUpdate(
+    FunctionContext*, const TinyIntVal&, const DoubleVal&, StringVal*);
+template void AggregateFunctions::SampledNdvUpdate(
+    FunctionContext*, const SmallIntVal&, const DoubleVal&, StringVal*);
+template void AggregateFunctions::SampledNdvUpdate(
+    FunctionContext*, const IntVal&, const DoubleVal&, StringVal*);
+template void AggregateFunctions::SampledNdvUpdate(
+    FunctionContext*, const BigIntVal&, const DoubleVal&, StringVal*);
+template void AggregateFunctions::SampledNdvUpdate(
+    FunctionContext*, const FloatVal&, const DoubleVal&, StringVal*);
+template void AggregateFunctions::SampledNdvUpdate(
+    FunctionContext*, const DoubleVal&, const DoubleVal&, StringVal*);
+template void AggregateFunctions::SampledNdvUpdate(
+    FunctionContext*, const StringVal&, const DoubleVal&, StringVal*);
+template void AggregateFunctions::SampledNdvUpdate(
+    FunctionContext*, const TimestampVal&, const DoubleVal&, StringVal*);
+template void AggregateFunctions::SampledNdvUpdate(
+    FunctionContext*, const DecimalVal&, const DoubleVal&, StringVal*);
 
 template void AggregateFunctions::KnuthVarUpdate(
     FunctionContext*, const TinyIntVal&, StringVal*);

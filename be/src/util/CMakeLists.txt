@@ -17,6 +17,7 @@
 
 set(SQUEASEL_SRC_DIR "${CMAKE_SOURCE_DIR}/be/src/thirdparty/squeasel")
 set(MUSTACHE_SRC_DIR "${CMAKE_SOURCE_DIR}/be/src/thirdparty/mustache")
+set(MPFIT_SRC_DIR "${CMAKE_SOURCE_DIR}/be/src/thirdparty/mpfit")
 
 # where to put generated libraries
 set(LIBRARY_OUTPUT_PATH "${BUILD_OUTPUT_ROOT_DIRECTORY}/util")
@@ -32,8 +33,10 @@ add_library(Util
   bitmap.cc
   bit-util.cc
   bloom-filter.cc
+  bloom-filter-ir.cc
   coding-util.cc
   codec.cc
+  common-metrics.cc
   compress.cc
   cpu-info.cc
   decimal-util.cc
@@ -53,7 +56,10 @@ add_library(Util
   mem-info.cc
   memory-metrics.cc
   metrics.cc
+  min-max-filter.cc
+  min-max-filter-ir.cc
   minidump.cc
+  mpfit-util.cc
   network-util.cc
   openssl-util.cc
   os-info.cc
@@ -69,6 +75,7 @@ add_library(Util
   redactor.cc
   runtime-profile.cc
   simple-logger.cc
+  string-parser.cc
   symbols-util.cc
   static-asserts.cc
   summary-util.cc
@@ -81,8 +88,9 @@ add_library(Util
   ${SQUEASEL_SRC_DIR}/squeasel.c
   webserver.cc
   ${MUSTACHE_SRC_DIR}/mustache.cc
+  ${MPFIT_SRC_DIR}/mpfit.c
 )
-add_dependencies(Util thrift-deps gen_ir_descriptions)
+add_dependencies(Util gen-deps gen_ir_descriptions)
 
 # Squeasel requires C99 compatibility to build.
 SET_SOURCE_FILES_PROPERTIES(${SQUEASEL_SRC_DIR}/squeasel.c
@@ -117,6 +125,7 @@ ADD_BE_TEST(internal-queue-test)
 ADD_BE_TEST(logging-support-test)
 ADD_BE_TEST(lru-cache-test)
 ADD_BE_TEST(metrics-test)
+ADD_BE_TEST(min-max-filter-test)
 ADD_BE_TEST(openssl-util-test)
 ADD_BE_TEST(parse-util-test)
 #ADD_BE_TEST(perf-counters-test)
@@ -131,5 +140,6 @@ ADD_BE_TEST(runtime-profile-test)
 ADD_BE_TEST(string-parser-test)
 ADD_BE_TEST(symbols-util-test)
 ADD_BE_TEST(thread-pool-test)
+ADD_BE_TEST(time-test)
 ADD_BE_TEST(uid-util-test)
 ADD_BE_TEST(webserver-test)

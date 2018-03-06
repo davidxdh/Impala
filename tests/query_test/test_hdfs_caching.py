@@ -22,15 +22,17 @@ import re
 import time
 from subprocess import check_call
 
+from tests.common.environ import specific_build_type_timeout
 from tests.common.impala_cluster import ImpalaCluster
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import SkipIfS3, SkipIfIsilon, SkipIfLocal
+from tests.common.skip import SkipIfS3, SkipIfADLS, SkipIfIsilon, SkipIfLocal
 from tests.common.test_dimensions import create_single_exec_option_dimension
 from tests.util.filesystem_utils import get_fs_path
 from tests.util.shell_util import exec_process
 
 # End to end test that hdfs caching is working.
 @SkipIfS3.caching # S3: missing coverage: verify SET CACHED gives error
+@SkipIfADLS.caching
 @SkipIfIsilon.caching
 @SkipIfLocal.caching
 class TestHdfsCaching(ImpalaTestSuite):
@@ -106,6 +108,7 @@ class TestHdfsCaching(ImpalaTestSuite):
 # run as a part of exhaustive tests which require the workload to be 'functional-query'.
 # TODO: Move this to TestHdfsCaching once we make exhaustive tests run for other workloads
 @SkipIfS3.caching
+@SkipIfADLS.caching
 @SkipIfIsilon.caching
 @SkipIfLocal.caching
 class TestHdfsCachingFallbackPath(ImpalaTestSuite):
@@ -114,6 +117,7 @@ class TestHdfsCachingFallbackPath(ImpalaTestSuite):
     return 'functional-query'
 
   @SkipIfS3.hdfs_encryption
+  @SkipIfADLS.hdfs_encryption
   @SkipIfIsilon.hdfs_encryption
   @SkipIfLocal.hdfs_encryption
   def test_hdfs_caching_fallback_path(self, vector, unique_database, testid_checksum):
@@ -164,6 +168,7 @@ class TestHdfsCachingFallbackPath(ImpalaTestSuite):
 
 
 @SkipIfS3.caching
+@SkipIfADLS.caching
 @SkipIfIsilon.caching
 @SkipIfLocal.caching
 class TestHdfsCachingDdl(ImpalaTestSuite):
@@ -189,7 +194,6 @@ class TestHdfsCachingDdl(ImpalaTestSuite):
 
   @pytest.mark.execute_serially
   def test_caching_ddl(self, vector):
-
     # Get the number of cache requests before starting the test
     num_entries_pre = get_num_cache_requests()
     self.run_test_case('QueryTest/hdfs-caching', vector)
@@ -204,7 +208,7 @@ class TestHdfsCachingDdl(ImpalaTestSuite):
     self.client.execute("drop table cachedb.cached_tbl_local")
 
     # Dropping the tables should cleanup cache entries leaving us with the same
-    # total number of entries
+    # total number of entries.
     assert num_entries_pre == get_num_cache_requests()
 
   @pytest.mark.execute_serially
@@ -300,7 +304,25 @@ def change_cache_directive_repl_for_path(path, repl):
       "Error modifying cache directive for path %s (%s, %s)" % (path, stdout, stderr)
 
 def get_num_cache_requests():
-  """Returns the number of outstanding cache requests"""
-  rc, stdout, stderr = exec_process("hdfs cacheadmin -listDirectives -stats")
-  assert rc == 0, 'Error executing hdfs cacheadmin: %s %s' % (stdout, stderr)
-  return len(stdout.split('\n'))
+  """Returns the number of outstanding cache requests. Due to race conditions in the
+    way cache requests are added/dropped/reported (see IMPALA-3040), this function tries
+    to return a stable result by making several attempts to stabilize it within a
+    reasonable timeout."""
+  def get_num_cache_requests_util():
+    rc, stdout, stderr = exec_process("hdfs cacheadmin -listDirectives -stats")
+    assert rc == 0, 'Error executing hdfs cacheadmin: %s %s' % (stdout, stderr)
+    return len(stdout.split('\n'))
+
+  # IMPALA-3040: This can take time, especially under slow builds like ASAN.
+  wait_time_in_sec = specific_build_type_timeout(5, slow_build_timeout=20)
+  num_stabilization_attempts = 0
+  max_num_stabilization_attempts = 10
+  new_requests = None
+  num_requests = None
+  while num_stabilization_attempts < max_num_stabilization_attempts:
+    new_requests = get_num_cache_requests_util()
+    if new_requests == num_requests: break
+    num_requests = new_requests
+    num_stabilization_attempts = num_stabilization_attempts + 1
+    time.sleep(wait_time_in_sec)
+  return num_requests

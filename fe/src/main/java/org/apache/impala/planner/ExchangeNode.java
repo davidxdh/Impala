@@ -17,9 +17,6 @@
 
 package org.apache.impala.planner;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import org.apache.impala.analysis.Analyzer;
 import org.apache.impala.analysis.Expr;
 import org.apache.impala.analysis.SortInfo;
@@ -29,6 +26,7 @@ import org.apache.impala.thrift.TExchangeNode;
 import org.apache.impala.thrift.TExplainLevel;
 import org.apache.impala.thrift.TPlanNode;
 import org.apache.impala.thrift.TPlanNodeType;
+import org.apache.impala.thrift.TQueryOptions;
 import org.apache.impala.thrift.TSortInfo;
 import com.google.common.base.Preconditions;
 
@@ -92,7 +90,7 @@ public class ExchangeNode extends PlanNode {
         cardinality_ = -1;
         break;
       }
-      cardinality_ = addCardinalities(cardinality_, child.getCardinality());
+      cardinality_ = checkedAdd(cardinality_, child.getCardinality());
     }
 
     if (hasLimit()) {
@@ -181,6 +179,19 @@ public class ExchangeNode extends PlanNode {
   public static double getAvgSerializedRowSize(PlanNode exchInput) {
     return exchInput.getAvgRowSize() +
         (exchInput.getTupleIds().size() * PER_TUPLE_SERIALIZATION_OVERHEAD);
+  }
+
+  @Override
+  public void computeNodeResourceProfile(TQueryOptions queryOptions) {
+    // TODO: add an estimate
+    nodeResourceProfile_ =  ResourceProfile.noReservation(0);
+  }
+
+  @Override
+  public ExecPhaseResourceProfiles computeTreeResourceProfiles(
+      TQueryOptions queryOptions) {
+    // Don't include resources of child in different plan fragment.
+    return new ExecPhaseResourceProfiles(nodeResourceProfile_, nodeResourceProfile_);
   }
 
   @Override

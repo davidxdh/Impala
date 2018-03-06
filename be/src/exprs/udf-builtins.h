@@ -20,9 +20,19 @@
 
 #include "udf/udf.h"
 
-using namespace impala_udf;
-
 namespace impala {
+
+using impala_udf::FunctionContext;
+using impala_udf::BooleanVal;
+using impala_udf::TinyIntVal;
+using impala_udf::SmallIntVal;
+using impala_udf::IntVal;
+using impala_udf::BigIntVal;
+using impala_udf::FloatVal;
+using impala_udf::DoubleVal;
+using impala_udf::TimestampVal;
+using impala_udf::StringVal;
+using impala_udf::DecimalVal;
 
 /// Builtins written against the UDF interface. The builtins in the other files
 /// should be replaced to the UDF interface as well.
@@ -59,22 +69,53 @@ class UdfBuiltins {
   ///    DAY, DY, D : Starting day of the week
   ///    HH, HH12, HH24 : Hour
   ///    MI : Minute
-  //
+  ///
   ///    Reference:
   ///    http://docs.oracle.com/cd/B19306_01/server.102/b14200/functions201.htm
   static TimestampVal Trunc(FunctionContext* context, const TimestampVal& date,
       const StringVal& unit_str);
+  /// Implementation of Trunc, not cross-compiled.
+  static TimestampVal TruncImpl(FunctionContext* context, const TimestampVal& date,
+      const StringVal& unit_str);
   static void TruncPrepare(FunctionContext* context,
       FunctionContext::FunctionStateScope scope);
-  static void TruncClose(FunctionContext* context,
-      FunctionContext::FunctionStateScope scope);
+  static void TruncClose(
+      FunctionContext* context, FunctionContext::FunctionStateScope scope);
+
+  /// Rounds (truncating down) a Timestamp to the specified unit.
+  ///    Units:
+  ///    MILLENNIUM: The millennium number.
+  ///    CENTURY: The century number.
+  ///    DECADE: The year field divided by 10.
+  ///    YEAR: The year field (1400 - 9999).
+  ///    MONTH: The number of the month within the year (1–12)
+  ///    WEEK: The number of the week of the year that the day is in.
+  ///    DAY: The day (of the month) field (1–31).
+  ///    HOUR: The hour field (0–23).
+  ///    MINUTE: The minutes field (0–59).
+  ///    SECOND: The seconds field (0–59).
+  ///    MILLISECONDS: The milliseconds fraction in the seconds.
+  ///    MICROSECONDS: The microseconds fraction in the seconds.
+
+  ///    Reference:
+  ///    https://my.vertica.com/docs/8.1.x/HTML/index.htm#Authoring/
+  ///       SQLReferenceManual/Functions/Date-Time/DATE_TRUNC.htm
+  static TimestampVal DateTrunc(
+      FunctionContext* context, const StringVal& unit_str, const TimestampVal& date);
+  /// Implementation of DateTrunc, not cross-compiled.
+  static TimestampVal DateTruncImpl(
+      FunctionContext* context, const TimestampVal& date, const StringVal& unit_str);
+  static void DateTruncPrepare(
+      FunctionContext* context, FunctionContext::FunctionStateScope scope);
+  static void DateTruncClose(
+      FunctionContext* context, FunctionContext::FunctionStateScope scope);
 
   /// Returns a single field from a timestamp
   ///    Fields:
   ///      YEAR, MONTH, DAY, HOUR, MINUTE, SECOND, MILLISECOND, EPOCH
   ///    Reference:
   ///    http://docs.oracle.com/cd/B19306_01/server.102/b14200/functions050.htm
-  //
+  ///
   /// This is used by the DATE_PART function.
   static IntVal Extract(FunctionContext* context, const StringVal& field_str,
       const TimestampVal& date);

@@ -31,6 +31,8 @@ add_library(Common
   init.cc
   logging.cc
   status.cc
+  kudu_version.cc
+  thread-debug-info.cc
   ${VERSION_CC_GEN_OUTPUT}
 )
 
@@ -40,11 +42,16 @@ add_custom_command(
   COMMENT "Generating the version.cc file"
   VERBATIM
 )
-add_dependencies(Common thrift-deps)
+add_dependencies(Common gen-deps)
 
 add_library(GlobalFlags
   global-flags.cc
 )
-add_dependencies(GlobalFlags thrift-deps)
+add_dependencies(GlobalFlags gen-deps)
 
 ADD_BE_TEST(atomic-test)
+ADD_BE_TEST(thread-debug-info-test)
+
+# Generate config.h from config.h.in, filling in variables from CMake
+CONFIGURE_FILE(${CMAKE_CURRENT_SOURCE_DIR}/config.h.in
+    ${CMAKE_CURRENT_BINARY_DIR}/config.h)

@@ -24,9 +24,18 @@
 #include "util/string-parser.h"
 #include "udf/udf.h"
 
-using namespace impala_udf;
-
 namespace impala {
+
+using impala_udf::FunctionContext;
+using impala_udf::TinyIntVal;
+using impala_udf::SmallIntVal;
+using impala_udf::IntVal;
+using impala_udf::BigIntVal;
+using impala_udf::FloatVal;
+using impala_udf::DoubleVal;
+using impala_udf::TimestampVal;
+using impala_udf::StringVal;
+using impala_udf::DecimalVal;
 
 class Expr;
 struct ExprValue;
@@ -39,9 +48,9 @@ class MathFunctions {
   static BigIntVal Abs(FunctionContext*, const BigIntVal&);
   static DoubleVal Abs(FunctionContext*, const DoubleVal&);
   static FloatVal Abs(FunctionContext*, const FloatVal&);
-  static IntVal Abs(FunctionContext*, const IntVal&);
-  static SmallIntVal Abs(FunctionContext*, const SmallIntVal&);
-  static TinyIntVal Abs(FunctionContext*, const TinyIntVal&);
+  static BigIntVal Abs(FunctionContext*, const IntVal&);
+  static IntVal Abs(FunctionContext*, const SmallIntVal&);
+  static SmallIntVal Abs(FunctionContext*, const TinyIntVal&);
   static DoubleVal Sin(FunctionContext*, const DoubleVal&);
   static DoubleVal Asin(FunctionContext*, const DoubleVal&);
   static DoubleVal Cos(FunctionContext*, const DoubleVal&);

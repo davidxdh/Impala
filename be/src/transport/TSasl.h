@@ -56,8 +56,14 @@ class SaslException : public TTransportException {
  * They are mostly wrappers for the cyrus-sasl library routines.
  */
 class TSasl {
-  public:
-   virtual ~TSasl() { sasl_dispose(&conn); }
+ public:
+  /* Setup the SASL negotiation state. */
+  virtual void setupSaslContext() = 0;
+
+  /* Reset the SASL negotiation state. */
+  virtual void resetSaslContext() = 0;
+
+  virtual ~TSasl() { disposeSaslContext(); }
 
   /*
    * Called once per application to free resources.`
@@ -107,10 +113,35 @@ class TSasl {
   std::string getUsername();
 
   protected:
+   /* Name of service */
+   std::string service;
+
+   /* FQDN of server in use or the server to connect to */
+   std::string serverFQDN;
+
    /* Authorization is complete. */
    bool authComplete;
+
+   /*
+    * Callbacks to provide to the Cyrus-SASL library. Not owned. The user of the class
+    * must ensure that the callbacks live as long as the TSasl instance in use.
+    */
+   sasl_callback_t* callbacks;
+
    /* Sasl Connection. */
    sasl_conn_t* conn;
+
+   TSasl(const std::string& service, const std::string& serverFQDN,
+        sasl_callback_t* callbacks);
+
+   /* Dispose of the SASL state. It is called once per connection as a part of teardown. */
+   void disposeSaslContext() {
+     if (conn != nullptr) {
+       sasl_dispose(&conn);
+       conn = NULL;
+     }
+   }
+
 };
 
 class SaslClientImplException : public SaslException {
@@ -144,6 +175,12 @@ class TSaslClient : public sasl::TSasl {
     /* Retrieves the negotiated property */
     std::string     getNegotiatedProperty(const std::string& propName);
 
+    /* Setup the SASL client negotiation state. */
+    virtual void setupSaslContext();
+
+    /* Reset the SASL client negotiation state. */
+    virtual void resetSaslContext();
+
     /* Determines whether this mechanism has an optional initial response. */
     virtual bool hasInitialResponse();
 
@@ -172,19 +209,33 @@ class TSaslServer : public sasl::TSasl {
               const std::string& userRealm, unsigned flags, sasl_callback_t* callbacks);
 
   /*
-   * This initializes the sasl server library and should be called onece per application
+   * This initializes the sasl server library and should be called onece per application.
+   * Note that the caller needs to ensure the life time of 'callbacks' and 'appname' is
+   * beyond that of this object.
    */
-  static void SaslInit(const sasl_callback_t* callbacks, const std::string& appname) {
-    int result = sasl_server_init(callbacks, appname.c_str());
+  static void SaslInit(const sasl_callback_t* callbacks, const char* appname) {
+    int result = sasl_server_init(callbacks, appname);
     if (result != SASL_OK) {
       throw SaslServerImplException(sasl_errstring(result, NULL, NULL));
     }
   }
 
+  /* Setup the SASL server negotiation state. */
+  virtual void setupSaslContext();
+
+  /* Reset the SASL server negotiation state. */
+  virtual void resetSaslContext();
+
   /* Evaluates the response data and generates a challenge. */
   virtual uint8_t* evaluateChallengeOrResponse(const uint8_t* challenge,
                                                const uint32_t len, uint32_t* resLen);
  private:
+  /* The domain of the user agent */
+  std::string userRealm;
+
+  /* Flags to pass down to the SASL library */
+  unsigned flags;
+
   /* true if sasl_server_start has been called. */
   bool serverStarted;
 };

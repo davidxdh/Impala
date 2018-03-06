@@ -34,12 +34,14 @@ import org.apache.impala.util.AvroSchemaConverter;
 import org.apache.impala.util.AvroSchemaParser;
 import org.apache.impala.util.AvroSchemaUtils;
 import org.apache.impala.util.KuduUtil;
+import org.apache.impala.util.MetaStoreUtil;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
 import com.google.common.primitives.Ints;
+import com.google.common.collect.Maps;
 
 /**
  * Represents a CREATE TABLE statement.
@@ -48,11 +50,16 @@ public class CreateTableStmt extends StatementBase {
 
   @VisibleForTesting
   final static String KUDU_STORAGE_HANDLER_ERROR_MESSAGE = "Kudu tables must be"
-      + " specified using 'STORED AS KUDU' without using the storage handler table"
-      + " property.";
+      + " specified using 'STORED AS KUDU'.";
+
+  /////////////////////////////////////////
+  // BEGIN: Members that need to be reset()
 
   // Table parameters specified in a CREATE TABLE statement
   private final TableDef tableDef_;
+
+  // END: Members that need to be reset()
+  /////////////////////////////////////////
 
   // Table owner. Set during analysis
   private String owner_;
@@ -71,6 +78,12 @@ public class CreateTableStmt extends StatementBase {
   }
 
   @Override
+  public void reset() {
+    super.reset();
+    tableDef_.reset();
+  }
+
+  @Override
   public CreateTableStmt clone() { return new CreateTableStmt(this); }
 
   public String getTbl() { return getTblName().getTbl(); }
@@ -81,7 +94,7 @@ public class CreateTableStmt extends StatementBase {
     getColumnDefs().clear();
     getColumnDefs().addAll(colDefs);
   }
-  private List<ColumnDef> getPrimaryKeyColumnDefs() {
+  public List<ColumnDef> getPrimaryKeyColumnDefs() {
     return tableDef_.getPrimaryKeyColumnDefs();
   }
   public boolean isExternal() { return tableDef_.isExternal(); }
@@ -91,6 +104,7 @@ public class CreateTableStmt extends StatementBase {
   public List<KuduPartitionParam> getKuduPartitionParams() {
     return tableDef_.getKuduPartitionParams();
   }
+  public List<String> getSortColumns() { return tableDef_.getSortColumns(); }
   public String getComment() { return tableDef_.getComment(); }
   Map<String, String> getTblProperties() { return tableDef_.getTblProperties(); }
   private HdfsCachingOp getCachingOp() { return tableDef_.getCachingOp(); }
@@ -98,6 +112,12 @@ public class CreateTableStmt extends StatementBase {
   Map<String, String> getSerdeProperties() { return tableDef_.getSerdeProperties(); }
   public THdfsFileFormat getFileFormat() { return tableDef_.getFileFormat(); }
   RowFormat getRowFormat() { return tableDef_.getRowFormat(); }
+  private String getGeneratedKuduTableName() {
+    return tableDef_.getGeneratedKuduTableName();
+  }
+  private void setGeneratedKuduTableName(String tableName) {
+    tableDef_.setGeneratedKuduTableName(tableName);
+  }
 
   // Only exposed for ToSqlUtils. Returns the list of primary keys declared by the user
   // at the table level. Note that primary keys may also be declared in column
@@ -144,7 +164,12 @@ public class CreateTableStmt extends StatementBase {
     if (getRowFormat() != null) params.setRow_format(getRowFormat().toThrift());
     params.setFile_format(getFileFormat());
     params.setIf_not_exists(getIfNotExists());
-    params.setTable_properties(getTblProperties());
+    params.setSort_columns(getSortColumns());
+    params.setTable_properties(Maps.newHashMap(getTblProperties()));
+    if (!getGeneratedKuduTableName().isEmpty()) {
+      params.getTable_properties().put(KuduTable.KEY_TABLE_NAME,
+          getGeneratedKuduTableName());
+    }
     params.setSerde_properties(getSerdeProperties());
     for (KuduPartitionParam d: getKuduPartitionParams()) {
       params.addToPartition_by(d.toThrift());
@@ -154,6 +179,11 @@ public class CreateTableStmt extends StatementBase {
     }
 
     return params;
+  }
+
+  @Override
+  public void collectTableRefs(List<TableRef> tblRefs) {
+    tblRefs.add(new TableRef(tableDef_.getTblName().toPath(), null));
   }
 
   @Override
@@ -209,8 +239,27 @@ public class CreateTableStmt extends StatementBase {
    * Kudu tables.
    */
   private void analyzeKuduTableProperties(Analyzer analyzer) throws AnalysisException {
-    if (getTblProperties().containsKey(KuduTable.KEY_STORAGE_HANDLER)) {
-      throw new AnalysisException(KUDU_STORAGE_HANDLER_ERROR_MESSAGE);
+    if (analyzer.getAuthzConfig().isEnabled()) {
+      // Today there is no comprehensive way of enforcing a Sentry authorization policy
+      // against tables stored in Kudu. This is why only users with ALL privileges on
+      // SERVER may create external Kudu tables or set the master addresses.
+      // See IMPALA-4000 for details.
+      boolean isExternal = tableDef_.isExternal() ||
+          MetaStoreUtil.findTblPropKeyCaseInsensitive(
+              getTblProperties(), "EXTERNAL") != null;
+      if (getTblProperties().containsKey(KuduTable.KEY_MASTER_HOSTS) || isExternal) {
+        String authzServer = analyzer.getAuthzConfig().getServerName();
+        Preconditions.checkNotNull(authzServer);
+        analyzer.registerPrivReq(new PrivilegeRequestBuilder().onServer(
+            authzServer).all().toRequest());
+      }
+    }
+
+    // Only the Kudu storage handler may be specified for Kudu tables.
+    String handler = getTblProperties().get(KuduTable.KEY_STORAGE_HANDLER);
+    if (handler != null && !handler.equals(KuduTable.KUDU_STORAGE_HANDLER)) {
+      throw new AnalysisException("Invalid storage handler specified for Kudu table: " +
+          handler);
     }
     getTblProperties().put(KuduTable.KEY_STORAGE_HANDLER, KuduTable.KUDU_STORAGE_HANDLER);
 
@@ -226,8 +275,7 @@ public class CreateTableStmt extends StatementBase {
     }
 
     // TODO: Find out what is creating a directory in HDFS and stop doing that. Kudu
-    //       tables shouldn't have HDFS dirs.
-    //       https://issues.cloudera.org/browse/IMPALA-3570
+    //       tables shouldn't have HDFS dirs: IMPALA-3570
     AnalysisUtils.throwIfNotNull(getCachingOp(),
         "A Kudu table cannot be cached in HDFS.");
     AnalysisUtils.throwIfNotNull(getLocation(), "LOCATION cannot be specified for a " +
@@ -241,15 +289,6 @@ public class CreateTableStmt extends StatementBase {
    */
   private void analyzeExternalKuduTableParams(Analyzer analyzer)
       throws AnalysisException {
-    if (analyzer.getAuthzConfig().isEnabled()) {
-      // Today there is no comprehensive way of enforcing a Sentry authorization policy
-      // against tables stored in Kudu. This is why only users with ALL privileges on
-      // SERVER may create external Kudu tables. See IMPALA-4000 for details.
-      String authzServer = analyzer.getAuthzConfig().getServerName();
-      Preconditions.checkNotNull(authzServer);
-      analyzer.registerPrivReq(new PrivilegeRequestBuilder().onServer(
-          authzServer).all().toRequest());
-    }
     AnalysisUtils.throwIfNull(getTblProperties().get(KuduTable.KEY_TABLE_NAME),
         String.format("Table property %s must be specified when creating " +
             "an external Kudu table.", KuduTable.KEY_TABLE_NAME));
@@ -271,12 +310,8 @@ public class CreateTableStmt extends StatementBase {
    * Analyzes and checks parameters specified for managed Kudu tables.
    */
   private void analyzeManagedKuduTableParams(Analyzer analyzer) throws AnalysisException {
-    // If no Kudu table name is specified in tblproperties, generate one using the
-    // current database as a prefix to avoid conflicts in Kudu.
-    if (!getTblProperties().containsKey(KuduTable.KEY_TABLE_NAME)) {
-      getTblProperties().put(KuduTable.KEY_TABLE_NAME,
-          KuduUtil.getDefaultCreateKuduTableName(getDb(), getTbl()));
-    }
+    analyzeManagedKuduTableName();
+
     // Check column types are valid Kudu types
     for (ColumnDef col: getColumnDefs()) {
       try {
@@ -308,9 +343,21 @@ public class CreateTableStmt extends StatementBase {
     if (!getKuduPartitionParams().isEmpty()) {
       analyzeKuduPartitionParams(analyzer);
     } else {
-      throw new AnalysisException("Table partitioning must be specified for " +
-          "managed Kudu tables.");
+      analyzer.addWarning(
+          "Unpartitioned Kudu tables are inefficient for large data sizes.");
     }
+  }
+
+  /**
+   * Generates a Kudu table name based on the target database and table and stores
+   * it in TableDef.generatedKuduTableName_. Throws if the Kudu table
+   * name was given manually via TBLPROPERTIES.
+   */
+  private void analyzeManagedKuduTableName() throws AnalysisException {
+    AnalysisUtils.throwIfNotNull(getTblProperties().get(KuduTable.KEY_TABLE_NAME),
+        String.format("Not allowed to set '%s' manually for managed Kudu tables .",
+            KuduTable.KEY_TABLE_NAME));
+    setGeneratedKuduTableName(KuduUtil.getDefaultCreateKuduTableName(getDb(), getTbl()));
   }
 
   /**

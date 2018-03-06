@@ -155,11 +155,11 @@ enum TImpalaQueryOptions {
   RM_INITIAL_MEM,
 
   // Time, in s, before a query will be timed out if it is inactive. May not exceed
-  // --idle_query_timeout if that flag > 0.
+  // --idle_query_timeout if that flag > 0. If 0, falls back to --idle_query_timeout.
   QUERY_TIMEOUT_S,
 
   // Test hook for spill to disk operators
-  MAX_BLOCK_MGR_MEMORY,
+  BUFFER_POOL_LIMIT,
 
   // Transforms all count(distinct) aggregations into NDV()
   APPX_COUNT_DISTINCT,
@@ -199,13 +199,13 @@ enum TImpalaQueryOptions {
   // two.
   RUNTIME_BLOOM_FILTER_SIZE,
 
-  // Time (in ms) to wait in scans for partition filters to arrive.
+  // Time (in ms) to wait in scans for runtime filters to arrive.
   RUNTIME_FILTER_WAIT_TIME_MS,
 
   // If true, disable application of runtime filters to individual rows.
   DISABLE_ROW_RUNTIME_FILTERING,
 
-  // Maximum number of runtime filters allowed per query.
+  // Maximum number of bloom runtime filters allowed per query.
   MAX_NUM_RUNTIME_FILTERS,
 
   // If true, use UTF-8 annotation for string columns. Note that char and varchar columns
@@ -225,12 +225,12 @@ enum TImpalaQueryOptions {
   // those queries, the coordinator deletes all files in the final location before copying
   // the files there.
   // TODO: Find a way to get this working for INSERT OVERWRITEs too.
-  S3_SKIP_INSERT_STAGING
+  S3_SKIP_INSERT_STAGING,
 
-  // Maximum runtime filter size, in bytes.
+  // Maximum runtime bloom filter size, in bytes.
   RUNTIME_FILTER_MAX_SIZE,
 
-  // Minimum runtime filter size, in bytes.
+  // Minimum runtime bloom filter size, in bytes.
   RUNTIME_FILTER_MIN_SIZE,
 
   // Prefetching behavior during hash tables' building and probing.
@@ -254,6 +254,53 @@ enum TImpalaQueryOptions {
 
   // Indicates whether to use dictionary filtering for Parquet files
   PARQUET_DICTIONARY_FILTERING,
+
+  // Policy for resolving nested array fields in Parquet files.
+  // An Impala array type can have several different representations in
+  // a Parquet schema (three, two, or one level). There is fundamental ambiguity
+  // between the two and three level encodings with index-based field resolution.
+  // The ambiguity can manually be resolved using this query option, or by using
+  // PARQUET_FALLBACK_SCHEMA_RESOLUTION=name.
+  // The value TWO_LEVEL_THEN_THREE_LEVEL was the default mode since Impala 2.3.
+  // It is preserved as the default for compatibility.
+  // TODO: Remove the TWO_LEVEL_THEN_THREE_LEVEL mode completely or at least make
+  // it non-default in a compatibility breaking release.
+  PARQUET_ARRAY_RESOLUTION,
+
+  // Indicates whether to read statistics from Parquet files and use them during query
+  // processing. This includes skipping data based on the statistics and computing query
+  // results like "select min()".
+  PARQUET_READ_STATISTICS,
+
+  // Join distribution mode that is used when the join inputs have an unknown
+  // cardinality, e.g., because of missing table statistics.
+  DEFAULT_JOIN_DISTRIBUTION_MODE,
+
+  // If the number of rows processed per node is below the threshold and disable_codegen
+  // is unset, codegen will be automatically be disabled by the planner.
+  DISABLE_CODEGEN_ROWS_THRESHOLD,
+
+  // The default spillable buffer size, in bytes.
+  DEFAULT_SPILLABLE_BUFFER_SIZE,
+
+  // The minimum spillable buffer size, in bytes.
+  MIN_SPILLABLE_BUFFER_SIZE,
+
+  // The maximum row size that memory is reserved for, in bytes.
+  MAX_ROW_SIZE,
+
+  // The time, in seconds, that a session may be idle for before it is closed (and all
+  // running queries cancelled) by Impala. If 0, idle sessions never expire.
+  IDLE_SESSION_TIMEOUT,
+
+  // Minimum number of bytes that will be scanned in COMPUTE STATS TABLESAMPLE,
+  // regardless of the user-supplied sampling percent.
+  COMPUTE_STATS_MIN_SAMPLE_SIZE,
+
+  // Time limit, in s, before a query will be timed out after it starts executing. Does
+  // not include time spent in planning, scheduling or admission control. A value of 0
+  // means no time limit.
+  EXEC_TIME_LIMIT_S,
 }
 
 // The summary of a DML statement.

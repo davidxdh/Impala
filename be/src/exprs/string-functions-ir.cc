@@ -21,12 +21,12 @@
 #include <stdint.h>
 #include <re2/re2.h>
 #include <re2/stringpiece.h>
-#include <bitset>
 
 #include <boost/static_assert.hpp>
 
 #include "exprs/anyval-util.h"
-#include "exprs/expr.h"
+#include "exprs/scalar-expr.h"
+#include "gutil/strings/charset.h"
 #include "runtime/string-value.inline.h"
 #include "runtime/tuple-row.h"
 #include "util/bit-util.h"
@@ -236,7 +236,8 @@ void StringFunctions::ReplaceClose(FunctionContext* context,
   if (scope != FunctionContext::FRAGMENT_LOCAL) return;
   ReplaceContext* rptr = reinterpret_cast<ReplaceContext*>
       (context->GetFunctionState(FunctionContext::FRAGMENT_LOCAL));
-  if (rptr != nullptr) context->Free(reinterpret_cast<uint8_t*>(rptr));
+  context->Free(reinterpret_cast<uint8_t*>(rptr));
+  context->SetFunctionState(scope, nullptr);
 }
 
 StringVal StringFunctions::Replace(FunctionContext* context, const StringVal& str,
@@ -293,7 +294,7 @@ StringVal StringFunctions::Replace(FunctionContext* context, const StringVal& st
   }
 
   StringVal result(context, buffer_space);
-  // If the result went over MAX_LENGTH, we can get a null result back
+  // result may be NULL if we went over MAX_LENGTH or the allocation failed.
   if (UNLIKELY(result.is_null)) return result;
 
   uint8_t* ptr = result.ptr;
@@ -332,23 +333,22 @@ StringVal StringFunctions::Replace(FunctionContext* context, const StringVal& st
       // Also no overflow: min_output <= MAX_LENGTH and delta <= MAX_LENGTH - 1
       const int64_t space_needed = min_output + delta;
       if (UNLIKELY(space_needed > buffer_space)) {
-        // Double at smaller sizes, but don't grow more than a megabyte a
-        // time at larger sizes.  Reasoning: let the allocator do its job
-        // and don't depend on policy here.
-        static_assert(StringVal::MAX_LENGTH % (1 << 20) == 0,
-            "Math requires StringVal::MAX_LENGTH to be a multiple of 1MB");
-        // Must compute next power of two using 64-bit math to avoid signed overflow
-        // The following DCHECK was supposed to be a static assertion, but C++11 is
-        // broken and doesn't declare std::min or std::max to be constexpr.  Fix this
-        // when eventually the minimum supported standard is raised to at least C++14
-        DCHECK_EQ(static_cast<int>(std::min<int64_t>(
-            BitUtil::RoundUpToPowerOfTwo(StringVal::MAX_LENGTH+1),
-            StringVal::MAX_LENGTH + (1 << 20))),
-            StringVal::MAX_LENGTH + (1 << 20));
-        buffer_space = static_cast<int>(std::min<int64_t>(
-            BitUtil::RoundUpToPowerOfTwo(space_needed),
-            space_needed + (1 << 20)));
-        if (UNLIKELY(!result.Resize(context, buffer_space))) return StringVal::null();
+        // Check to see if we can allocate a large enough buffer.
+        if (space_needed > StringVal::MAX_LENGTH) {
+          context->SetError(
+              "String length larger than allowed limit of 1 GB character data.");
+          return StringVal::null();
+        }
+        // Double the buffer size whenever it fills up to amortise cost of resizing.
+        // Must compute next power of two using 64-bit math to avoid signed overflow.
+        buffer_space = min<int>(StringVal::MAX_LENGTH,
+            static_cast<int>(BitUtil::RoundUpToPowerOfTwo(space_needed)));
+
+        // Give up if the allocation fails or we hit an error. This prevents us from
+        // continuing to blow past the mem limit.
+        if (UNLIKELY(!result.Resize(context, buffer_space) || context->has_error())) {
+          return StringVal::null();
+        }
         // Don't forget to move the pointer
         ptr = result.ptr + bytes_produced;
       }
@@ -400,41 +400,97 @@ StringVal StringFunctions::Translate(FunctionContext* context, const StringVal& 
   return result;
 }
 
-StringVal StringFunctions::Trim(FunctionContext* context, const StringVal& str) {
+void StringFunctions::TrimPrepare(
+    FunctionContext* context, FunctionContext::FunctionStateScope scope) {
+  if (scope != FunctionContext::THREAD_LOCAL) return;
+  // Create a bitset to hold the unique characters to trim.
+  bitset<256>* unique_chars = new bitset<256>();
+  context->SetFunctionState(scope, unique_chars);
+  // If the caller didn't specify the set of characters to trim, it means
+  // that we're only trimming whitespace. Return early in that case.
+  // There can be either 1 or 2 arguments.
+  DCHECK(context->GetNumArgs() == 1 || context->GetNumArgs() == 2);
+  if (context->GetNumArgs() == 1) {
+    unique_chars->set(static_cast<int>(' '), true);
+    return;
+  }
+  if (!context->IsArgConstant(1)) return;
+  DCHECK_EQ(context->GetArgType(1)->type, FunctionContext::TYPE_STRING);
+  StringVal* chars_to_trim = reinterpret_cast<StringVal*>(context->GetConstantArg(1));
+  if (chars_to_trim->is_null) return; // We shouldn't peek into Null StringVals
+  for (int32_t i = 0; i < chars_to_trim->len; ++i) {
+    unique_chars->set(static_cast<int>(chars_to_trim->ptr[i]), true);
+  }
+}
+
+void StringFunctions::TrimClose(
+    FunctionContext* context, FunctionContext::FunctionStateScope scope) {
+  if (scope != FunctionContext::THREAD_LOCAL) return;
+  bitset<256>* unique_chars = reinterpret_cast<bitset<256>*>(
+      context->GetFunctionState(scope));
+  delete unique_chars;
+  context->SetFunctionState(scope, nullptr);
+}
+
+template <StringFunctions::TrimPosition D, bool IS_IMPLICIT_WHITESPACE>
+StringVal StringFunctions::DoTrimString(FunctionContext* ctx,
+    const StringVal& str, const StringVal& chars_to_trim) {
   if (str.is_null) return StringVal::null();
+  bitset<256>* unique_chars = reinterpret_cast<bitset<256>*>(
+      ctx->GetFunctionState(FunctionContext::THREAD_LOCAL));
+  // When 'chars_to_trim' is unique for each element (e.g. when 'chars_to_trim'
+  // is each element of a table column), we need to prepare a bitset of unique
+  // characters here instead of using the bitset from function context.
+  if (!IS_IMPLICIT_WHITESPACE && !ctx->IsArgConstant(1)) {
+    if (chars_to_trim.is_null) return str;
+    unique_chars->reset();
+    for (int32_t i = 0; i < chars_to_trim.len; ++i) {
+      unique_chars->set(static_cast<int>(chars_to_trim.ptr[i]), true);
+    }
+  }
   // Find new starting position.
   int32_t begin = 0;
-  while (begin < str.len && str.ptr[begin] == ' ') {
-    ++begin;
+  int32_t end = str.len - 1;
+  if (D == LEADING || D == BOTH) {
+    while (begin < str.len &&
+        unique_chars->test(static_cast<int>(str.ptr[begin]))) {
+      ++begin;
+    }
   }
   // Find new ending position.
-  int32_t end = str.len - 1;
-  while (end > begin && str.ptr[end] == ' ') {
-    --end;
+  if (D == TRAILING || D == BOTH) {
+    while (end >= begin && unique_chars->test(static_cast<int>(str.ptr[end]))) {
+      --end;
+    }
   }
   return StringVal(str.ptr + begin, end - begin + 1);
 }
 
+StringVal StringFunctions::Trim(FunctionContext* context, const StringVal& str) {
+  return DoTrimString<BOTH, true>(context, str, StringVal(" "));
+}
+
 StringVal StringFunctions::Ltrim(FunctionContext* context, const StringVal& str) {
-  if (str.is_null) return StringVal::null();
-  // Find new starting position.
-  int32_t begin = 0;
-  while (begin < str.len && str.ptr[begin] == ' ') {
-    ++begin;
-  }
-  return StringVal(str.ptr + begin, str.len - begin);
+  return DoTrimString<LEADING, true>(context, str, StringVal(" "));
 }
 
 StringVal StringFunctions::Rtrim(FunctionContext* context, const StringVal& str) {
-  if (str.is_null) return StringVal::null();
-  if (str.len == 0) return str;
-  // Find new ending position.
-  int32_t end = str.len - 1;
-  while (end > 0 && str.ptr[end] == ' ') {
-    --end;
-  }
-  DCHECK_GE(end, 0);
-  return StringVal(str.ptr, (str.ptr[end] == ' ') ? end : end + 1);
+  return DoTrimString<TRAILING, true>(context, str, StringVal(" "));
+}
+
+StringVal StringFunctions::LTrimString(FunctionContext* ctx,
+    const StringVal& str, const StringVal& chars_to_trim) {
+  return DoTrimString<LEADING, false>(ctx, str, chars_to_trim);
+}
+
+StringVal StringFunctions::RTrimString(FunctionContext* ctx,
+    const StringVal& str, const StringVal& chars_to_trim) {
+  return DoTrimString<TRAILING, false>(ctx, str, chars_to_trim);
+}
+
+StringVal StringFunctions::BTrimString(FunctionContext* ctx,
+    const StringVal& str, const StringVal& chars_to_trim) {
+  return DoTrimString<BOTH, false>(ctx, str, chars_to_trim);
 }
 
 IntVal StringFunctions::Ascii(FunctionContext* context, const StringVal& str) {
@@ -612,6 +668,29 @@ void StringFunctions::RegexpClose(
   if (scope != FunctionContext::FRAGMENT_LOCAL) return;
   re2::RE2* re = reinterpret_cast<re2::RE2*>(context->GetFunctionState(scope));
   delete re;
+  context->SetFunctionState(scope, nullptr);
+}
+
+StringVal StringFunctions::RegexpEscape(FunctionContext* context, const StringVal& str) {
+  if (str.is_null) return StringVal::null();
+  if (str.len == 0) return str;
+
+  static const strings::CharSet REGEX_ESCAPE_CHARACTERS(".\\+*?[^]$(){}=!<>|:-");
+  const uint8_t* const start_ptr = str.ptr;
+  const uint8_t* const end_ptr = start_ptr + str.len;
+  StringVal result(context, str.len * 2);
+  if (UNLIKELY(result.is_null)) return StringVal::null();
+  uint8_t* dest_ptr = result.ptr;
+  for (const uint8_t* c = start_ptr; c < end_ptr; ++c) {
+    if (REGEX_ESCAPE_CHARACTERS.Test(*c)) {
+      *dest_ptr++ = '\\';
+    }
+    *dest_ptr++ = *c;
+  }
+  result.len = dest_ptr - result.ptr;
+  DCHECK_GE(result.len, str.len);
+
+  return result;
 }
 
 StringVal StringFunctions::RegexpExtract(FunctionContext* context, const StringVal& str,
@@ -640,7 +719,7 @@ StringVal StringFunctions::RegexpExtract(FunctionContext* context, const StringV
   // TODO: fix this
   vector<re2::StringPiece> matches(max_matches);
   bool success =
-      re->Match(str_sp, 0, str.len, re2::RE2::UNANCHORED, &matches[0], max_matches);
+      re->Match(str_sp, 0, str.len, re2::RE2::UNANCHORED, matches.data(), max_matches);
   if (!success) return StringVal();
   // matches[0] is the whole string, matches[1] the first group, etc.
   const re2::StringPiece& match = matches[index.val];
@@ -812,7 +891,7 @@ IntVal StringFunctions::FindInSet(FunctionContext* context, const StringVal& str
   do {
     end = start;
     // Position end.
-    while(str_set.ptr[end] != ',' && end < str_set.len) ++end;
+    while (end < str_set.len && str_set.ptr[end] != ',') ++end;
     StringValue token(reinterpret_cast<char*>(str_set.ptr) + start, end - start);
     if (str_sv.Eq(token)) return IntVal(token_index);
 
@@ -879,8 +958,8 @@ void StringFunctions::ParseUrlClose(
   if (scope != FunctionContext::FRAGMENT_LOCAL) return;
   UrlParser::UrlPart* url_part =
       reinterpret_cast<UrlParser::UrlPart*>(ctx->GetFunctionState(scope));
-  if (url_part == NULL) return;
   delete url_part;
+  ctx->SetFunctionState(scope, nullptr);
 }
 
 StringVal StringFunctions::ParseUrlKey(FunctionContext* ctx, const StringVal& url,
@@ -922,61 +1001,11 @@ StringVal StringFunctions::Chr(FunctionContext* ctx, const IntVal& val) {
   return AnyValUtil::FromBuffer(ctx, &c, 1);
 }
 
-void StringFunctions::BTrimPrepare(
-    FunctionContext* context, FunctionContext::FunctionStateScope scope) {
-  if (scope != FunctionContext::THREAD_LOCAL) return;
-  // Create a bitset to hold the unique characters to trim.
-  bitset<256>* unique_chars = new bitset<256>();
-  context->SetFunctionState(scope, unique_chars);
-  if (!context->IsArgConstant(1)) return;
-  DCHECK_EQ(context->GetArgType(1)->type, FunctionContext::TYPE_STRING);
-  StringVal* chars_to_trim = reinterpret_cast<StringVal*>(context->GetConstantArg(1));
-  for (int32_t i = 0; i < chars_to_trim->len; ++i) {
-    unique_chars->set(static_cast<int>(chars_to_trim->ptr[i]), true);
-  }
-}
-
-void StringFunctions::BTrimClose(
-    FunctionContext* context, FunctionContext::FunctionStateScope scope) {
-  if (scope != FunctionContext::THREAD_LOCAL) return;
-  bitset<256>* unique_chars = reinterpret_cast<bitset<256>*>(
-      context->GetFunctionState(scope));
-  if (unique_chars != NULL) delete unique_chars;
-}
-
-StringVal StringFunctions::BTrimString(FunctionContext* ctx,
-    const StringVal& str, const StringVal& chars_to_trim) {
-  if (str.is_null) return StringVal::null();
-  bitset<256>* unique_chars = reinterpret_cast<bitset<256>*>(
-      ctx->GetFunctionState(FunctionContext::THREAD_LOCAL));
-  // When 'chars_to_trim' is unique for each element (e.g. when 'chars_to_trim'
-  // is each element of a table column), we need to prepare a bitset of unique
-  // characters here instead of using the bitset from function context.
-  if (!ctx->IsArgConstant(1)) {
-    unique_chars->reset();
-    DCHECK(chars_to_trim.len != 0 || chars_to_trim.is_null);
-    for (int32_t i = 0; i < chars_to_trim.len; ++i) {
-      unique_chars->set(static_cast<int>(chars_to_trim.ptr[i]), true);
-    }
-  }
-  // Find new starting position.
-  int32_t begin = 0;
-  while (begin < str.len &&
-      unique_chars->test(static_cast<int>(str.ptr[begin]))) {
-    ++begin;
-  }
-  // Find new ending position.
-  int32_t end = str.len - 1;
-  while (end > begin && unique_chars->test(static_cast<int>(str.ptr[end]))) {
-    --end;
-  }
-  return StringVal(str.ptr + begin, end - begin + 1);
-}
-
 // Similar to strstr() except that the strings are not null-terminated
 static char* LocateSubstring(char* haystack, int hay_len, const char* needle, int needle_len) {
   DCHECK_GT(needle_len, 0);
-  DCHECK(haystack != NULL && needle != NULL);
+  DCHECK(needle != NULL);
+  DCHECK(hay_len == 0 || haystack != NULL);
   for (int i = 0; i < hay_len - needle_len + 1; ++i) {
     char* possible_needle = haystack + i;
     if (strncmp(possible_needle, needle, needle_len) == 0) return possible_needle;

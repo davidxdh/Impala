@@ -124,7 +124,7 @@ class JniLocalFrame {
   /// The number of local references created inside the frame might exceed max_local_ref,
   /// but there is no guarantee that memory will be available.
   /// Push should be called at most once.
-  Status push(JNIEnv* env, int max_local_ref=10);
+  Status push(JNIEnv* env, int max_local_ref = 10) WARN_UNUSED_RESULT;
 
  private:
   JNIEnv* env_;
@@ -141,6 +141,62 @@ struct JniMethodDescriptor {
   /// Handle to the method
   jmethodID* method_id;
 };
+
+/// Helper class for lifetime management of chars from JNI, releasing JNI chars when
+/// destructed
+class JniUtfCharGuard {
+ public:
+  /// Construct a JniUtfCharGuards holding nothing
+  JniUtfCharGuard() : utf_chars(nullptr) {}
+
+  /// Release the held char sequence if there is one.
+  ~JniUtfCharGuard() {
+    if (utf_chars != nullptr) env->ReleaseStringUTFChars(jstr, utf_chars);
+  }
+
+  /// Try to get chars from jstr. If error is returned, utf_chars and get() remain
+  /// to be nullptr, otherwise they point to a valid char sequence. The char sequence
+  /// lives as long as this guard. jstr should not be null.
+  static Status create(JNIEnv* env, jstring jstr, JniUtfCharGuard* out);
+
+  /// Get the char sequence. Returns nullptr if the guard does hold a char sequence.
+  const char* get() { return utf_chars; }
+ private:
+  JNIEnv* env;
+  jstring jstr;
+  const char* utf_chars;
+  DISALLOW_COPY_AND_ASSIGN(JniUtfCharGuard);
+};
+
+class JniScopedArrayCritical {
+ public:
+  /// Construct a JniScopedArrayCritical holding nothing.
+  JniScopedArrayCritical():  env_(nullptr), jarr_(nullptr), arr_(nullptr), size_(0) {}
+
+  /// Release the held byte[] contents if necessary.
+  ~JniScopedArrayCritical() {
+    if (env_ != nullptr && jarr_ != nullptr && arr_ != nullptr) {
+      env_->ReleasePrimitiveArrayCritical(jarr_, arr_, JNI_ABORT);
+    }
+  }
+
+  /// Try to get the contents of 'jarr' via JNIEnv::GetPrimitiveArrayCritical() and set
+  /// the results in 'out'. Returns true upon success and false otherwise. If false is
+  /// returned 'out' is not modified.
+  static bool Create(JNIEnv* env, jbyteArray jarr, JniScopedArrayCritical* out)
+      WARN_UNUSED_RESULT;
+
+  uint8_t* get() const { return arr_; }
+
+  int size() const { return size_; }
+ private:
+  JNIEnv* env_;
+  jbyteArray jarr_;
+  uint8_t* arr_;
+  int size_;
+  DISALLOW_COPY_AND_ASSIGN(JniScopedArrayCritical);
+};
+
 
 /// Utility class for JNI-related functionality.
 /// Init() should be called as soon as the native library is loaded.
@@ -161,24 +217,32 @@ class JniUtil {
   static void InitLibhdfs();
 
   /// Find JniUtil class, and get JniUtil.throwableToString method id
-  static Status Init();
+  static Status Init() WARN_UNUSED_RESULT;
 
   /// Returns true if the given class could be found on the CLASSPATH in env.
   /// Returns false otherwise, or if any other error occurred (e.g. a JNI exception).
   /// This function does not log any errors or exceptions.
   static bool ClassExists(JNIEnv* env, const char* class_str);
 
+  /// Return true if the given class has a non-static method with a specific name and
+  /// signature. Returns false otherwise, or if any other error occurred
+  /// (e.g. a JNI exception). This function does not log any errors or exceptions.
+  static bool MethodExists(JNIEnv* env, jclass class_ref,
+      const char* method_str, const char* method_signature);
+
   /// Returns a global JNI reference to the class specified by class_str into class_ref.
   /// The returned reference must eventually be freed by calling FreeGlobalRef() (or have
   /// the lifetime of the impalad process).
   /// Catches Java exceptions and converts their message into status.
-  static Status GetGlobalClassRef(JNIEnv* env, const char* class_str, jclass* class_ref);
+  static Status GetGlobalClassRef(
+      JNIEnv* env, const char* class_str, jclass* class_ref) WARN_UNUSED_RESULT;
 
   /// Creates a global reference from a local reference returned into global_ref.
   /// The returned reference must eventually be freed by calling FreeGlobalRef() (or have
   /// the lifetime of the impalad process).
   /// Catches Java exceptions and converts their message into status.
-  static Status LocalToGlobalRef(JNIEnv* env, jobject local_ref, jobject* global_ref);
+  static Status LocalToGlobalRef(JNIEnv* env, jobject local_ref,
+      jobject* global_ref) WARN_UNUSED_RESULT;
 
   /// Templated wrapper for jobject subclasses (e.g. jclass, jarray). This is necessary
   /// because according to
@@ -192,14 +256,10 @@ class JniUtil {
   /// to use a subclass like _jclass**. This is safe in this case because the returned
   /// subclass is known to be correct.
   template <typename jobject_subclass>
-  static Status LocalToGlobalRef(JNIEnv* env, jobject local_ref,
-      jobject_subclass* global_ref) {
+  static Status LocalToGlobalRef(
+      JNIEnv* env, jobject local_ref, jobject_subclass* global_ref) {
     return LocalToGlobalRef(env, local_ref, reinterpret_cast<jobject*>(global_ref));
   }
-
-  /// Deletes 'global_ref'. Catches Java exceptions and converts their message into
-  /// status.
-  static Status FreeGlobalRef(JNIEnv* env, jobject global_ref);
 
   static jmethodID throwable_to_string_id() { return throwable_to_string_id_; }
   static jmethodID throwable_to_stack_trace_id() { return throwable_to_stack_trace_id_; }
@@ -214,25 +274,31 @@ class JniUtil {
   /// log_stack determines if the stack trace is written to the log
   /// prefix, if non-empty will be prepended to the error message.
   static Status GetJniExceptionMsg(JNIEnv* env, bool log_stack = true,
-      const std::string& prefix = "");
+      const std::string& prefix = "") WARN_UNUSED_RESULT;
 
   /// Populates 'result' with a list of memory metrics from the Jvm. Returns Status::OK
   /// unless there is an exception.
   static Status GetJvmMetrics(const TGetJvmMetricsRequest& request,
-      TGetJvmMetricsResponse* result);
+      TGetJvmMetricsResponse* result) WARN_UNUSED_RESULT;
+
+  // Populates 'result' with information about live JVM threads. Returns
+  // Status::OK unless there is an exception.
+  static Status GetJvmThreadsInfo(const TGetJvmThreadsInfoRequest& request,
+      TGetJvmThreadsInfoResponse* result) WARN_UNUSED_RESULT;
 
   /// Loads a method whose signature is in the supplied descriptor. Returns Status::OK
   /// and sets descriptor->method_id to a JNI method handle if successful, otherwise an
   /// error status is returned.
   static Status LoadJniMethod(JNIEnv* jni_env, const jclass& jni_class,
-      JniMethodDescriptor* descriptor);
+      JniMethodDescriptor* descriptor) WARN_UNUSED_RESULT;
 
   /// Same as LoadJniMethod(...), except that this loads a static method.
   static Status LoadStaticJniMethod(JNIEnv* jni_env, const jclass& jni_class,
-      JniMethodDescriptor* descriptor);
+      JniMethodDescriptor* descriptor) WARN_UNUSED_RESULT;
 
   /// Utility methods to avoid repeating lots of the JNI call boilerplate.
-  static Status CallJniMethod(const jobject& obj, const jmethodID& method) {
+  static Status CallJniMethod(
+      const jobject& obj, const jmethodID& method) WARN_UNUSED_RESULT {
     JNIEnv* jni_env = getJNIEnv();
     JniLocalFrame jni_frame;
     RETURN_IF_ERROR(jni_frame.push(jni_env));
@@ -280,30 +346,6 @@ class JniUtil {
     return Status::OK();
   }
 
-  template <typename T, typename R>
-  static Status CallJniMethod(const jobject& obj, const jmethodID& method,
-      const vector<T>& args, R* response) {
-    JNIEnv* jni_env = getJNIEnv();
-    JniLocalFrame jni_frame;
-    RETURN_IF_ERROR(jni_frame.push(jni_env));
-    jclass jByteArray_class = jni_env->FindClass("[B");
-    jobjectArray array_of_jByteArray =
-        jni_env->NewObjectArray(args.size(), jByteArray_class, NULL);
-    RETURN_ERROR_IF_EXC(jni_env);
-    jbyteArray request_bytes;
-    for (int i = 0; i < args.size(); i++) {
-      RETURN_IF_ERROR(SerializeThriftMsg(jni_env, &args[i], &request_bytes));
-      jni_env->SetObjectArrayElement(array_of_jByteArray, i, request_bytes);
-      RETURN_ERROR_IF_EXC(jni_env);
-      jni_env->DeleteLocalRef(request_bytes);
-    }
-    jbyteArray result_bytes = static_cast<jbyteArray>(
-        jni_env->CallObjectMethod(obj, method, array_of_jByteArray));
-    RETURN_ERROR_IF_EXC(jni_env);
-    RETURN_IF_ERROR(DeserializeThriftMsg(jni_env, result_bytes, response));
-    return Status::OK();
-  }
-
   template <typename T>
   static Status CallJniMethod(const jobject& obj, const jmethodID& method,
       const T& arg, std::string* response) {
@@ -330,6 +372,7 @@ class JniUtil {
   static jmethodID throwable_to_string_id_;
   static jmethodID throwable_to_stack_trace_id_;
   static jmethodID get_jvm_metrics_id_;
+  static jmethodID get_jvm_threads_id_;
 };
 
 }

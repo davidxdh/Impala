@@ -18,11 +18,11 @@
 package org.apache.impala.service;
 
 import java.io.IOException;
+import java.io.StringReader;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
-import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Random;
@@ -35,11 +35,8 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
-import org.apache.hive.service.cli.thrift.TGetColumnsReq;
-import org.apache.hive.service.cli.thrift.TGetFunctionsReq;
-import org.apache.hive.service.cli.thrift.TGetSchemasReq;
-import org.apache.hive.service.cli.thrift.TGetTablesReq;
 import org.apache.impala.analysis.AnalysisContext;
+import org.apache.impala.analysis.AnalysisContext.AnalysisResult;
 import org.apache.impala.analysis.CreateDataSrcStmt;
 import org.apache.impala.analysis.CreateDropRoleStmt;
 import org.apache.impala.analysis.CreateUdaStmt;
@@ -58,15 +55,20 @@ import org.apache.impala.analysis.ResetMetadataStmt;
 import org.apache.impala.analysis.ShowFunctionsStmt;
 import org.apache.impala.analysis.ShowGrantRoleStmt;
 import org.apache.impala.analysis.ShowRolesStmt;
+import org.apache.impala.analysis.SqlParser;
+import org.apache.impala.analysis.SqlScanner;
+import org.apache.impala.analysis.StatementBase;
+import org.apache.impala.analysis.StmtMetadataLoader;
+import org.apache.impala.analysis.StmtMetadataLoader.StmtTableCache;
 import org.apache.impala.analysis.TableName;
 import org.apache.impala.analysis.TruncateStmt;
 import org.apache.impala.authorization.AuthorizationChecker;
 import org.apache.impala.authorization.AuthorizationConfig;
+import org.apache.impala.authorization.AuthorizeableTable;
 import org.apache.impala.authorization.ImpalaInternalAdminUser;
 import org.apache.impala.authorization.PrivilegeRequest;
 import org.apache.impala.authorization.PrivilegeRequestBuilder;
 import org.apache.impala.authorization.User;
-import org.apache.impala.catalog.AuthorizationException;
 import org.apache.impala.catalog.Catalog;
 import org.apache.impala.catalog.CatalogException;
 import org.apache.impala.catalog.Column;
@@ -86,6 +88,7 @@ import org.apache.impala.common.FileSystemUtil;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.InternalException;
 import org.apache.impala.common.NotImplementedException;
+import org.apache.impala.compat.MetastoreShim;
 import org.apache.impala.planner.HdfsScanNode;
 import org.apache.impala.planner.PlanFragment;
 import org.apache.impala.planner.Planner;
@@ -100,7 +103,6 @@ import org.apache.impala.thrift.TDdlExecRequest;
 import org.apache.impala.thrift.TDdlType;
 import org.apache.impala.thrift.TDescribeOutputStyle;
 import org.apache.impala.thrift.TDescribeResult;
-import org.apache.impala.thrift.TErrorCode;
 import org.apache.impala.thrift.TExecRequest;
 import org.apache.impala.thrift.TExplainResult;
 import org.apache.impala.thrift.TFinalizeParams;
@@ -122,7 +124,6 @@ import org.apache.impala.thrift.TResultSet;
 import org.apache.impala.thrift.TResultSetMetadata;
 import org.apache.impala.thrift.TShowFilesParams;
 import org.apache.impala.thrift.TShowStatsOp;
-import org.apache.impala.thrift.TStatus;
 import org.apache.impala.thrift.TStmtType;
 import org.apache.impala.thrift.TTableName;
 import org.apache.impala.thrift.TUpdateCatalogCacheRequest;
@@ -133,10 +134,10 @@ import org.apache.impala.util.MembershipSnapshot;
 import org.apache.impala.util.PatternMatcher;
 import org.apache.impala.util.TResultRowBuilder;
 import org.apache.impala.util.TSessionStateUtil;
+import org.apache.thrift.TException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Predicates;
 import com.google.common.collect.Lists;
@@ -150,16 +151,15 @@ import com.google.common.collect.Sets;
  */
 public class Frontend {
   private final static Logger LOG = LoggerFactory.getLogger(Frontend.class);
-  // Time to wait for missing tables to be loaded before timing out.
-  private final long MISSING_TBL_LOAD_WAIT_TIMEOUT_MS = 2 * 60 * 1000;
 
   // Max time to wait for a catalog update notification.
-  private final long MAX_CATALOG_UPDATE_WAIT_TIME_MS = 2 * 1000;
+  public static final long MAX_CATALOG_UPDATE_WAIT_TIME_MS = 2 * 1000;
 
   //TODO: Make the reload interval configurable.
   private static final int AUTHORIZATION_POLICY_RELOAD_INTERVAL_SECS = 5 * 60;
 
-  private ImpaladCatalog impaladCatalog_;
+  private final AtomicReference<ImpaladCatalog> impaladCatalog_ =
+      new AtomicReference<ImpaladCatalog>();
   private final AuthorizationConfig authzConfig_;
   private final AtomicReference<AuthorizationChecker> authzChecker_;
   private final ScheduledExecutorService policyReader_ =
@@ -176,10 +176,10 @@ public class Frontend {
    */
   public Frontend(AuthorizationConfig authorizationConfig, ImpaladCatalog catalog) {
     authzConfig_ = authorizationConfig;
-    impaladCatalog_ = catalog;
+    impaladCatalog_.set(catalog);
     defaultKuduMasterHosts_ = catalog.getDefaultKuduMasterHosts();
     authzChecker_ = new AtomicReference<AuthorizationChecker>(
-        new AuthorizationChecker(authzConfig_, impaladCatalog_.getAuthPolicy()));
+        new AuthorizationChecker(authzConfig_, impaladCatalog_.get().getAuthPolicy()));
     // If authorization is enabled, reload the policy on a regular basis.
     if (authzConfig_.isEnabled() && authzConfig_.isFileBasedPolicy()) {
       // Stagger the reads across nodes
@@ -214,27 +214,25 @@ public class Frontend {
     }
   }
 
-  public ImpaladCatalog getCatalog() { return impaladCatalog_; }
+  public ImpaladCatalog getCatalog() { return impaladCatalog_.get(); }
   public AuthorizationChecker getAuthzChecker() { return authzChecker_.get(); }
 
   public TUpdateCatalogCacheResponse updateCatalogCache(
-      TUpdateCatalogCacheRequest req) throws CatalogException {
-    ImpaladCatalog catalog = impaladCatalog_;
+      TUpdateCatalogCacheRequest req) throws CatalogException, TException {
+    if (req.is_delta) return impaladCatalog_.get().updateCatalog(req);
 
     // If this is not a delta, this update should replace the current
     // Catalog contents so create a new catalog and populate it.
-    if (!req.is_delta) catalog = new ImpaladCatalog(defaultKuduMasterHosts_);
+    ImpaladCatalog catalog = new ImpaladCatalog(defaultKuduMasterHosts_);
 
     TUpdateCatalogCacheResponse response = catalog.updateCatalog(req);
 
-    if (!req.is_delta) {
-      // This was not a delta update. Now that the catalog has been updated,
-      // replace the references to impaladCatalog_/authzChecker_ ensure
-      // clients continue don't see the catalog disappear.
-      impaladCatalog_ = catalog;
-      authzChecker_.set(new AuthorizationChecker(authzConfig_,
-          impaladCatalog_.getAuthPolicy()));
-    }
+    // Now that the catalog has been updated, replace the references to
+    // impaladCatalog_/authzChecker_. This ensures that clients don't see the catalog
+    // disappear. The catalog is guaranteed to be ready since updateCatalog() has a
+    // postcondition of isReady() == true.
+    impaladCatalog_.set(catalog);
+    authzChecker_.set(new AuthorizationChecker(authzConfig_, catalog.getAuthPolicy()));
     return response;
   }
 
@@ -249,7 +247,7 @@ public class Frontend {
    * Constructs a TCatalogOpRequest and attaches it, plus any metadata, to the
    * result argument.
    */
-  private void createCatalogOpRequest(AnalysisContext.AnalysisResult analysis,
+  private void createCatalogOpRequest(AnalysisResult analysis,
       TExecRequest result) throws InternalException {
     TCatalogOpRequest ddl = new TCatalogOpRequest();
     TResultSetMetadata metadata = new TResultSetMetadata();
@@ -523,13 +521,17 @@ public class Frontend {
     } else {
       throw new IllegalStateException("Unexpected CatalogOp statement type.");
     }
-
     result.setResult_set_metadata(metadata);
+    ddl.setSync_ddl(result.getQuery_options().isSync_ddl());
     result.setCatalog_op_request(ddl);
     if (ddl.getOp_type() == TCatalogOpType.DDL) {
       TCatalogServiceRequestHeader header = new TCatalogServiceRequestHeader();
       header.setRequesting_user(analysis.getAnalyzer().getUser().getName());
       ddl.getDdl_params().setHeader(header);
+      ddl.getDdl_params().setSync_ddl(ddl.isSync_ddl());
+    }
+    if (ddl.getOp_type() == TCatalogOpType.RESET_METADATA) {
+      ddl.getReset_metadata_params().setSync_ddl(ddl.isSync_ddl());
     }
   }
 
@@ -546,11 +548,12 @@ public class Frontend {
     // Get the destination for the load. If the load is targeting a partition,
     // this the partition location. Otherwise this is the table location.
     String destPathString = null;
+    ImpaladCatalog catalog = impaladCatalog_.get();
     if (request.isSetPartition_spec()) {
-      destPathString = impaladCatalog_.getHdfsPartition(tableName.getDb(),
+      destPathString = catalog.getHdfsPartition(tableName.getDb(),
           tableName.getTbl(), request.getPartition_spec()).getLocation();
     } else {
-      destPathString = impaladCatalog_.getTable(tableName.getDb(), tableName.getTbl())
+      destPathString = catalog.getTable(tableName.getDb(), tableName.getTbl())
           .getMetaStoreTable().getSd().getLocation();
     }
 
@@ -606,7 +609,7 @@ public class Frontend {
    */
   public List<String> getTableNames(String dbName, PatternMatcher matcher,
       User user) throws ImpalaException {
-    List<String> tblNames = impaladCatalog_.getTableNames(dbName, matcher);
+    List<String> tblNames = impaladCatalog_.get().getTableNames(dbName, matcher);
     if (authzConfig_.isEnabled()) {
       Iterator<String> iter = tblNames.iterator();
       while (iter.hasNext()) {
@@ -650,7 +653,7 @@ public class Frontend {
    */
   public List<Db> getDbs(PatternMatcher matcher, User user)
       throws InternalException {
-    List<Db> dbs = impaladCatalog_.getDbs(matcher);
+    List<Db> dbs = impaladCatalog_.get().getDbs(matcher);
     // If authorization is enabled, filter out the databases the user does not
     // have permissions on.
     if (authzConfig_.isEnabled()) {
@@ -673,7 +676,7 @@ public class Frontend {
       return true;
     }
     PrivilegeRequest request = new PrivilegeRequestBuilder()
-        .any().onAnyTable(db.getName()).toRequest();
+        .any().onAnyColumn(db.getName(), AuthorizeableTable.ANY_TABLE_NAME).toRequest();
     return authzChecker_.get().hasAccess(user, request);
   }
 
@@ -682,7 +685,7 @@ public class Frontend {
    * matches all data sources.
    */
   public List<DataSource> getDataSrcs(String pattern) {
-    return impaladCatalog_.getDataSources(
+    return impaladCatalog_.get().getDataSources(
         PatternMatcher.createHivePatternMatcher(pattern));
   }
 
@@ -691,7 +694,7 @@ public class Frontend {
    */
   public TResultSet getColumnStats(String dbName, String tableName)
       throws ImpalaException {
-    Table table = impaladCatalog_.getTable(dbName, tableName);
+    Table table = impaladCatalog_.get().getTable(dbName, tableName);
     TResultSet result = new TResultSet();
     TResultSetMetadata resultSchema = new TResultSetMetadata();
     result.setSchema(resultSchema);
@@ -719,7 +722,7 @@ public class Frontend {
    */
   public TResultSet getTableStats(String dbName, String tableName, TShowStatsOp op)
       throws ImpalaException {
-    Table table = impaladCatalog_.getTable(dbName, tableName);
+    Table table = impaladCatalog_.get().getTable(dbName, tableName);
     if (table instanceof HdfsTable) {
       return ((HdfsTable) table).getTableStats();
     } else if (table instanceof HBaseTable) {
@@ -745,7 +748,7 @@ public class Frontend {
   public List<Function> getFunctions(TFunctionCategory category,
       String dbName, String fnPattern, boolean exactMatch)
       throws DatabaseNotFoundException {
-    Db db = impaladCatalog_.getDb(dbName);
+    Db db = impaladCatalog_.get().getDb(dbName);
     if (db == null) {
       throw new DatabaseNotFoundException("Database '" + dbName + "' not found");
     }
@@ -773,7 +776,7 @@ public class Frontend {
    */
   public TDescribeResult describeDb(String dbName, TDescribeOutputStyle outputStyle)
       throws ImpalaException {
-    Db db = impaladCatalog_.getDb(dbName);
+    Db db = impaladCatalog_.get().getDb(dbName);
     return DescribeResultFactory.buildDescribeDbResult(db, outputStyle);
   }
 
@@ -784,7 +787,7 @@ public class Frontend {
    */
   public TDescribeResult describeTable(TTableName tableName,
       TDescribeOutputStyle outputStyle) throws ImpalaException {
-    Table table = impaladCatalog_.getTable(tableName.db_name, tableName.table_name);
+    Table table = impaladCatalog_.get().getTable(tableName.db_name, tableName.table_name);
     if (outputStyle == TDescribeOutputStyle.MINIMAL) {
       return DescribeResultFactory.buildDescribeMinimalResult(table);
     } else {
@@ -795,137 +798,25 @@ public class Frontend {
   }
 
   /**
-   * Given a set of table names, returns the set of table names that are missing
-   * metadata (are not yet loaded).
-   */
-  private Set<TableName> getMissingTbls(Set<TableName> tableNames) {
-    Set<TableName> missingTbls = new HashSet<TableName>();
-    for (TableName tblName: tableNames) {
-      Db db = getCatalog().getDb(tblName.getDb());
-      if (db == null) continue;
-      Table tbl = db.getTable(tblName.getTbl());
-      if (tbl == null) continue;
-      if (!tbl.isLoaded()) missingTbls.add(tblName);
-    }
-    return missingTbls;
-  }
-
-  /**
-   * Requests the catalog server load the given set of tables and waits until
-   * these tables show up in the local catalog, or the given timeout has been reached.
-   * The timeout is specified in milliseconds, with a value <= 0 indicating no timeout.
-   * The exact steps taken are:
-   * 1) Collect the tables that are missing (not yet loaded locally).
-   * 2) Make an RPC to the CatalogServer to prioritize the loading of these tables.
-   * 3) Wait until the local catalog contains all missing tables by (re)checking the
-   *    catalog each time a new catalog update is received.
+   * Waits indefinitely for the local catalog to be ready. The catalog is "ready" after
+   * the first catalog update with a version > INITIAL_CATALOG_VERSION is received from
+   * the statestore.
    *
-   * Returns true if all missing tables were received before timing out and false if
-   * the timeout was reached before all tables were received.
+   * @see ImpaladCatalog#isReady()
    */
-  private boolean requestTblLoadAndWait(Set<TableName> requestedTbls, long timeoutMs)
-      throws InternalException {
-    Set<TableName> missingTbls = getMissingTbls(requestedTbls);
-    // There are no missing tables, return and avoid making an RPC to the CatalogServer.
-    if (missingTbls.isEmpty()) return true;
-
-    // Call into the CatalogServer and request the required tables be loaded.
-    LOG.info(String.format("Requesting prioritized load of table(s): %s",
-        Joiner.on(", ").join(missingTbls)));
-    TStatus status = FeSupport.PrioritizeLoad(missingTbls);
-    if (status.getStatus_code() != TErrorCode.OK) {
-      throw new InternalException("Error requesting prioritized load: " +
-          Joiner.on("\n").join(status.getError_msgs()));
-    }
-
+  public void waitForCatalog() {
+    LOG.info("Waiting for first catalog update from the statestore.");
+    int numTries = 0;
     long startTimeMs = System.currentTimeMillis();
-    // Wait until all the required tables are loaded in the Impalad's catalog cache.
-    while (!missingTbls.isEmpty()) {
-      // Check if the timeout has been reached.
-      if (timeoutMs > 0 && System.currentTimeMillis() - startTimeMs > timeoutMs) {
-        return false;
+    while (true) {
+      if (getCatalog().isReady()) {
+        LOG.info("Local catalog initialized after: " +
+            (System.currentTimeMillis() - startTimeMs) + " ms.");
+        return;
       }
-
-      if (LOG.isTraceEnabled()) {
-        LOG.trace(String.format("Waiting for table(s) to complete loading: %s",
-            Joiner.on(", ").join(missingTbls)));
-      }
+      LOG.info("Waiting for local catalog to be initialized, attempt: " + numTries);
       getCatalog().waitForCatalogUpdate(MAX_CATALOG_UPDATE_WAIT_TIME_MS);
-      missingTbls = getMissingTbls(missingTbls);
-      // TODO: Check for query cancellation here.
-    }
-    return true;
-  }
-
-  /**
-   * Overload of requestTblLoadAndWait that uses the default timeout.
-   */
-  public boolean requestTblLoadAndWait(Set<TableName> requestedTbls)
-      throws InternalException {
-    return requestTblLoadAndWait(requestedTbls, MISSING_TBL_LOAD_WAIT_TIMEOUT_MS);
-  }
-
-  /**
-   * Analyzes the SQL statement included in queryCtx and returns the AnalysisResult.
-   * Authorizes all catalog object accesses and throws an AuthorizationException
-   * if the user does not have privileges to access one or more objects.
-   * If a statement fails analysis because table/view metadata was not loaded, an
-   * RPC to the CatalogServer will be executed to request loading the missing metadata
-   * and analysis will be restarted once the required tables have been loaded
-   * in the local Impalad Catalog or the MISSING_TBL_LOAD_WAIT_TIMEOUT_MS timeout
-   * is reached.
-   * The goal of this timeout is not to analysis, but to restart the analysis/missing
-   * table collection process. This helps ensure a statement never waits indefinitely
-   * for a table to be loaded in event the table metadata was invalidated.
-   * TODO: Also consider adding an overall timeout that fails analysis.
-   */
-  private AnalysisContext.AnalysisResult analyzeStmt(TQueryCtx queryCtx)
-      throws AnalysisException, InternalException, AuthorizationException {
-    if (!impaladCatalog_.isReady()) {
-      throw new AnalysisException("This Impala daemon is not ready to accept user " +
-          "requests. Status: Waiting for catalog update from the StateStore.");
-    }
-
-    AnalysisContext analysisCtx = new AnalysisContext(impaladCatalog_, queryCtx,
-        authzConfig_);
-    LOG.info("Compiling query: " + queryCtx.client_request.stmt);
-
-    // Run analysis in a loop until it any of the following events occur:
-    // 1) Analysis completes successfully.
-    // 2) Analysis fails with an AnalysisException AND there are no missing tables.
-    // 3) Analysis fails with an AuthorizationException.
-    try {
-      while (true) {
-        try {
-          analysisCtx.analyze(queryCtx.client_request.stmt);
-          Preconditions.checkState(analysisCtx.getAnalyzer().getMissingTbls().isEmpty());
-          return analysisCtx.getAnalysisResult();
-        } catch (AnalysisException e) {
-          Set<TableName> missingTbls = analysisCtx.getAnalyzer().getMissingTbls();
-          // Only re-throw the AnalysisException if there were no missing tables.
-          if (missingTbls.isEmpty()) throw e;
-
-          // Record that analysis needs table metadata
-          analysisCtx.getTimeline().markEvent("Metadata load started");
-
-          // Some tables/views were missing, request and wait for them to load.
-          if (!requestTblLoadAndWait(missingTbls, MISSING_TBL_LOAD_WAIT_TIMEOUT_MS)) {
-            if (LOG.isWarnEnabled()) {
-              LOG.warn(String.format("Missing tables were not received in %dms. Load " +
-                  "request will be retried.", MISSING_TBL_LOAD_WAIT_TIMEOUT_MS));
-            }
-            analysisCtx.getTimeline().markEvent("Metadata load timeout");
-          } else {
-            analysisCtx.getTimeline().markEvent("Metadata load finished");
-          }
-        }
-      }
-    } finally {
-      // Authorize all accesses.
-      // AuthorizationExceptions must take precedence over any AnalysisException
-      // that has been thrown, so perform the authorization first.
-      analysisCtx.authorize(getAuthzChecker());
-      LOG.info("Compiled query.");
+      ++numTries;
     }
   }
 
@@ -962,6 +853,9 @@ public class Frontend {
       }
     }
 
+    // Clear pre-existing lists to avoid adding duplicate entries in FE tests.
+    queryCtx.unsetTables_missing_stats();
+    queryCtx.unsetTables_with_corrupt_stats();
     for (TTableName tableName: tablesMissingStats) {
       queryCtx.addToTables_missing_stats(tableName);
     }
@@ -970,16 +864,6 @@ public class Frontend {
     }
     for (TTableName tableName: tablesWithMissingDiskIds) {
       queryCtx.addToTables_missing_diskids(tableName);
-    }
-
-    // Compute resource requirements after scan range locations because the cost
-    // estimates of scan nodes rely on them.
-    try {
-      planner.computeResourceReqs(fragments, true, queryExecRequest);
-    } catch (Exception e) {
-      // Turn exceptions into a warning to allow the query to execute.
-      LOG.error("Failed to compute resource requirements for query\n" +
-          queryCtx.client_request.getStmt(), e);
     }
 
     // The fragment at this point has all state set, serialize it to thrift.
@@ -997,7 +881,7 @@ public class Frontend {
   private TQueryExecRequest createExecRequest(
       Planner planner, StringBuilder explainString) throws ImpalaException {
     TQueryCtx queryCtx = planner.getQueryCtx();
-    AnalysisContext.AnalysisResult analysisResult = planner.getAnalysisResult();
+    AnalysisResult analysisResult = planner.getAnalysisResult();
     boolean isMtExec = analysisResult.isQueryStmt()
         && queryCtx.client_request.query_options.isSetMt_dop()
         && queryCtx.client_request.query_options.mt_dop > 0;
@@ -1012,6 +896,9 @@ public class Frontend {
       planRoots.add(planner.createPlan().get(0));
     }
 
+    // Compute resource requirements of the final plans.
+    planner.computeResourceReqs(planRoots, queryCtx, result);
+
     // create per-plan exec info;
     // also assemble list of names of tables with missing or corrupt stats for
     // assembling a warning message
@@ -1024,6 +911,7 @@ public class Frontend {
     // or if all tables have stats.
     boolean disableSpilling =
         queryCtx.client_request.query_options.isDisable_unsafe_spills()
+          && queryCtx.isSetTables_missing_stats()
           && !queryCtx.tables_missing_stats.isEmpty()
           && !analysisResult.getAnalyzer().hasPlanHints();
     queryCtx.setDisable_spilling(disableSpilling);
@@ -1043,20 +931,45 @@ public class Frontend {
     return result;
   }
 
+  public StatementBase parse(String stmt) throws AnalysisException {
+    SqlScanner input = new SqlScanner(new StringReader(stmt));
+    SqlParser parser = new SqlParser(input);
+    try {
+      return (StatementBase) parser.parse().value;
+    } catch (Exception e) {
+      throw new AnalysisException(parser.getErrorMsg(stmt), e);
+    }
+  }
+
   /**
    * Create a populated TExecRequest corresponding to the supplied TQueryCtx.
    */
   public TExecRequest createExecRequest(TQueryCtx queryCtx, StringBuilder explainString)
       throws ImpalaException {
-    // Analyze the statement
-    AnalysisContext.AnalysisResult analysisResult = analyzeStmt(queryCtx);
-    EventSequence timeline = analysisResult.getTimeline();
+    // Timeline of important events in the planning process, used for debugging
+    // and profiling.
+    EventSequence timeline = new EventSequence("Query Compilation");
+    LOG.info("Analyzing query: " + queryCtx.client_request.stmt);
+
+    // Parse stmt and collect/load metadata to populate a stmt-local table cache
+    StatementBase stmt = parse(queryCtx.client_request.stmt);
+    StmtMetadataLoader metadataLoader =
+        new StmtMetadataLoader(this, queryCtx.session.database, timeline);
+    StmtTableCache stmtTableCache = metadataLoader.loadTables(stmt);
+
+    // Analyze and authorize stmt
+    AnalysisContext analysisCtx = new AnalysisContext(queryCtx, authzConfig_, timeline);
+    AnalysisResult analysisResult =
+        analysisCtx.analyzeAndAuthorize(stmt, stmtTableCache, authzChecker_.get());
+    LOG.info("Analysis finished.");
     timeline.markEvent("Analysis finished");
     Preconditions.checkNotNull(analysisResult.getStmt());
+
     TExecRequest result = new TExecRequest();
     result.setQuery_options(queryCtx.client_request.getQuery_options());
     result.setAccess_events(analysisResult.getAccessEvents());
     result.analysis_warnings = analysisResult.getAnalyzer().getWarnings();
+    result.setUser_has_profile_access(analysisResult.userHasProfileAccess());
 
     TQueryOptions queryOptions = queryCtx.client_request.query_options;
     if (analysisResult.isCatalogOp()) {
@@ -1087,7 +1000,8 @@ public class Frontend {
       result.stmt_type = TStmtType.SET;
       result.setResult_set_metadata(new TResultSetMetadata(Arrays.asList(
           new TColumn("option", Type.STRING.toThrift()),
-          new TColumn("value", Type.STRING.toThrift()))));
+          new TColumn("value", Type.STRING.toThrift()),
+          new TColumn("level", Type.STRING.toThrift()))));
       result.setSet_query_option_request(analysisResult.getSetStmt().toThrift());
       return result;
     }
@@ -1099,9 +1013,9 @@ public class Frontend {
         || analysisResult.isCreateTableAsSelectStmt() || analysisResult.isUpdateStmt()
         || analysisResult.isDeleteStmt());
 
-    Planner planner = new Planner(analysisResult, queryCtx);
+    Planner planner = new Planner(analysisResult, queryCtx, timeline);
     TQueryExecRequest queryExecRequest = createExecRequest(planner, explainString);
-    queryExecRequest.setDesc_tbl(
+    queryCtx.setDesc_tbl(
         planner.getAnalysisResult().getAnalyzer().getDescTbl().toThrift());
     queryExecRequest.setQuery_ctx(queryCtx);
     queryExecRequest.setHost_list(analysisResult.getAnalyzer().getHostIndex().getList());
@@ -1163,7 +1077,7 @@ public class Frontend {
     }
 
     timeline.markEvent("Planning finished");
-    result.setTimeline(analysisResult.getTimeline().toThrift());
+    result.setTimeline(timeline.toThrift());
     return result;
   }
 
@@ -1200,32 +1114,12 @@ public class Frontend {
         ImpalaInternalAdminUser.getInstance();
     switch (request.opcode) {
       case GET_TYPE_INFO: return MetadataOp.getTypeInfo();
-      case GET_SCHEMAS:
-      {
-        TGetSchemasReq req = request.getGet_schemas_req();
-        return MetadataOp.getSchemas(this, req.getCatalogName(),
-            req.getSchemaName(), user);
-      }
-      case GET_TABLES:
-      {
-        TGetTablesReq req = request.getGet_tables_req();
-        return MetadataOp.getTables(this, req.getCatalogName(),
-            req.getSchemaName(), req.getTableName(), req.getTableTypes(), user);
-      }
-      case GET_COLUMNS:
-      {
-        TGetColumnsReq req = request.getGet_columns_req();
-        return MetadataOp.getColumns(this, req.getCatalogName(),
-            req.getSchemaName(), req.getTableName(), req.getColumnName(), user);
-      }
+      case GET_SCHEMAS: return MetastoreShim.execGetSchemas(this, request, user);
+      case GET_TABLES: return MetastoreShim.execGetTables(this, request, user);
+      case GET_COLUMNS: return MetastoreShim.execGetColumns(this, request, user);
       case GET_CATALOGS: return MetadataOp.getCatalogs();
       case GET_TABLE_TYPES: return MetadataOp.getTableTypes();
-      case GET_FUNCTIONS:
-      {
-        TGetFunctionsReq req = request.getGet_functions_req();
-        return MetadataOp.getFunctions(this, req.getCatalogName(),
-            req.getSchemaName(), req.getFunctionName(), user);
-      }
+      case GET_FUNCTIONS: return MetastoreShim.execGetFunctions(this, request, user);
       default:
         throw new NotImplementedException(request.opcode + " has not been implemented.");
     }
@@ -1236,7 +1130,7 @@ public class Frontend {
    */
   public TResultSet getTableFiles(TShowFilesParams request)
       throws ImpalaException{
-    Table table = impaladCatalog_.getTable(request.getTable_name().getDb_name(),
+    Table table = impaladCatalog_.get().getTable(request.getTable_name().getDb_name(),
         request.getTable_name().getTable_name());
     if (table instanceof HdfsTable) {
       return ((HdfsTable) table).getFiles(request.getPartition_set());

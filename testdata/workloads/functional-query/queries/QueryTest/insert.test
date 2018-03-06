@@ -946,28 +946,13 @@ RESET alltypesnopart_insert
 : 100
 ====
 ---- QUERY
-# IMPALA-4163: insert into table sortby() plan hint
-insert into table alltypesinsert
-partition (year, month) /*+ clustered,shuffle,sortby(int_col, bool_col) */
-select * from alltypestiny;
----- SETUP
-DROP PARTITIONS alltypesinsert
-RESET alltypesinsert
+# IMPALA-6280: clustered with outer join, inline view, and TupleisNullPredicate
+insert into table alltypesinsert (int_col)
+partition (year, month) /*+ clustered,shuffle */
+select v.id, t1.id, t1.month from
+(select coalesce(id, 10) id from functional.alltypessmall) v
+right outer join functional.alltypestiny t1 on t1.id = v.id
+where v.id = 0
 ---- RESULTS
-year=2009/month=1/: 2
-year=2009/month=2/: 2
-year=2009/month=3/: 2
-year=2009/month=4/: 2
-====
----- QUERY
-# IMPALA-4163: insert into table sortby() plan hint
-insert into table alltypesnopart_insert
-/*+ clustered,shuffle,sortby(int_col, bool_col) */
-select id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col,
-double_col, date_string_col, string_col, timestamp_col from alltypestiny;
----- SETUP
-DROP PARTITIONS alltypesinsert
-RESET alltypesinsert
----- RESULTS
-: 8
+year=0/month=1/: 1
 ====

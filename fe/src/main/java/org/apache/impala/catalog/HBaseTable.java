@@ -19,7 +19,6 @@ package org.apache.impala.catalog;
 
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -33,10 +32,8 @@ import org.apache.hadoop.hbase.HColumnDescriptor;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.HRegionInfo;
 import org.apache.hadoop.hbase.HRegionLocation;
-import org.apache.hadoop.hbase.HTableDescriptor;
 import org.apache.hadoop.hbase.KeyValue;
 import org.apache.hadoop.hbase.ServerLoad;
-import org.apache.hadoop.hbase.ServerName;
 import org.apache.hadoop.hbase.RegionLoad;
 import org.apache.hadoop.hbase.client.Admin;
 import org.apache.hadoop.hbase.client.Connection;
@@ -67,6 +64,8 @@ import org.apache.impala.thrift.TTableDescriptor;
 import org.apache.impala.thrift.TTableType;
 import org.apache.impala.util.StatsHelper;
 import org.apache.impala.util.TResultRowBuilder;
+
+import com.codahale.metrics.Timer;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 
@@ -324,6 +323,8 @@ public class HBaseTable extends Table {
   public void load(boolean reuseMetadata, IMetaStoreClient client,
       org.apache.hadoop.hive.metastore.api.Table msTbl) throws TableLoadingException {
     Preconditions.checkNotNull(getMetaStoreTable());
+    final Timer.Context context =
+        getMetrics().getTimer(Table.LOAD_DURATION_METRIC).time();
     try {
       msTable_ = msTbl;
       hbaseTableName_ = getHBaseTableName(getMetaStoreTable());
@@ -408,7 +409,7 @@ public class HBaseTable extends Table {
       }
 
       // Set table stats.
-      numRows_ = getRowCount(super.getMetaStoreTable().getParameters());
+      setTableStats(msTable_);
 
       // since we don't support composite hbase rowkeys yet, all hbase tables have a
       // single clustering col
@@ -417,6 +418,8 @@ public class HBaseTable extends Table {
     } catch (Exception e) {
       throw new TableLoadingException("Failed to load metadata for HBase table: " +
           name_, e);
+    } finally {
+      context.stop();
     }
   }
 
@@ -670,11 +673,6 @@ public class HBaseTable extends Table {
     return hbaseTableName_;
   }
 
-  public int getNumNodes() {
-    // TODO: implement
-    return 100;
-  }
-
   @Override
   public TCatalogObjectType getCatalogObjectType() {
     return TCatalogObjectType.TABLE;
@@ -705,16 +703,16 @@ public class HBaseTable extends Table {
   }
 
   /**
-   * This is copied from org.apache.hadoop.hbase.client.HTable. The only difference is
-   * that it does not use cache when calling getRegionLocation.
-   * TODO: Remove this function and use HTable.getRegionsInRange (IMPALA-4082).
    * Get the corresponding regions for an arbitrary range of keys.
-   * <p>
+   * This is copied from org.apache.hadoop.hbase.client.HTable in HBase 0.95. The
+   * differences are:
+   * 1. It does not use cache when calling getRegionLocation.
+   * 2. It is synchronized on hbaseTbl.
    *
-   * @param startRow
-   *          Starting row in range, inclusive
-   * @param endRow
-   *          Ending row in range, exclusive
+   * @param startKey
+   *          Starting key in range, inclusive
+   * @param endKey
+   *          Ending key in range, exclusive
    * @return A list of HRegionLocations corresponding to the regions that
    *         contain the specified range
    * @throws IOException

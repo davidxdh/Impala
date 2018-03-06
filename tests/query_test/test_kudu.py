@@ -30,7 +30,12 @@ from kudu.schema import (
 from kudu.client import Partitioning
 import logging
 import pytest
+import random
 import textwrap
+import threading
+import time
+from datetime import datetime
+from pytz import utc
 
 from tests.common.kudu_test_suite import KuduTestSuite
 from tests.common.impala_cluster import ImpalaCluster
@@ -44,6 +49,33 @@ class TestKuduOperations(KuduTestSuite):
   """
   This suite tests the different modification operations when using a kudu table.
   """
+
+  def test_out_of_range_timestamps(self, vector, cursor, kudu_client, unique_database):
+    """Test timestamp values that are outside of Impala's supported date range."""
+    cursor.execute("""CREATE TABLE %s.times (a INT PRIMARY KEY, ts TIMESTAMP)
+        PARTITION BY HASH(a) PARTITIONS 3 STORED AS KUDU""" % unique_database)
+    assert kudu_client.table_exists(
+        KuduTestSuite.to_kudu_table_name(unique_database, "times"))
+
+    table = kudu_client.table(KuduTestSuite.to_kudu_table_name(unique_database, "times"))
+    session = kudu_client.new_session()
+    session.apply(table.new_insert((0, datetime(1987, 5, 19, 0, 0, tzinfo=utc))))
+    # Add a date before 1400
+    session.apply(table.new_insert((1, datetime(1300, 1, 1, 0, 0, tzinfo=utc))))
+    # TODO: Add a date after 9999. There isn't a way to represent a date greater than
+    # 9999 in Python datetime.
+    #session.apply(table.new_insert((2, datetime(12000, 1, 1, 0, 0, tzinfo=utc))))
+    session.flush()
+
+    # TODO: The test driver should have a way to specify query options in an 'options'
+    # section rather than having to split abort_on_error cases into separate files.
+    vector.get_value('exec_option')['abort_on_error'] = 0
+    self.run_test_case('QueryTest/kudu-overflow-ts', vector,
+        use_db=unique_database)
+
+    vector.get_value('exec_option')['abort_on_error'] = 1
+    self.run_test_case('QueryTest/kudu-overflow-ts-abort-on-error', vector,
+        use_db=unique_database)
 
   def test_kudu_scan_node(self, vector, unique_database):
     self.run_test_case('QueryTest/kudu-scan-node', vector, use_db=unique_database)
@@ -286,18 +318,6 @@ class TestKuduOperations(KuduTestSuite):
     cursor.execute("SELECT * FROM %s.foo" % (unique_database))
     assert cursor.fetchall() == [(0, )]
 
-  def test_kudu_rename_table(self, cursor, kudu_client, unique_database):
-    """Test Kudu table rename"""
-    cursor.execute("""CREATE TABLE %s.foo (a INT PRIMARY KEY) PARTITION BY HASH(a)
-        PARTITIONS 3 STORED AS KUDU""" % unique_database)
-    kudu_tbl_name = KuduTestSuite.to_kudu_table_name(unique_database, "foo")
-    assert kudu_client.table_exists(kudu_tbl_name)
-    new_kudu_tbl_name = "blah"
-    cursor.execute("ALTER TABLE %s.foo SET TBLPROPERTIES('kudu.table_name'='%s')" % (
-        unique_database, new_kudu_tbl_name))
-    assert kudu_client.table_exists(new_kudu_tbl_name)
-    assert not kudu_client.table_exists(kudu_tbl_name)
-
   def test_kudu_show_unbounded_range_partition(self, cursor, kudu_client,
                                                unique_database):
     """Check that a single unbounded range partition gets printed correctly."""
@@ -329,7 +349,118 @@ class TestKuduOperations(KuduTestSuite):
         kudu_client.delete_table(name)
 
 
+  def test_column_storage_attributes(self, cursor, unique_database):
+    """Tests that for every valid combination of column type, encoding, and compression,
+       we can insert a value and scan it back from Kudu."""
+    # This test takes about 2min and is unlikely to break, so only run it in exhaustive.
+    if self.exploration_strategy() != 'exhaustive':
+      pytest.skip("Only runs in exhaustive to reduce core time.")
+    table_name = "%s.storage_attrs" % unique_database
+    types = ['boolean', 'tinyint', 'smallint', 'int', 'bigint', 'float', 'double', \
+        'string', 'timestamp', 'decimal']
+
+    create_query = "create table %s (id int primary key" % table_name
+    for t in types:
+      create_query += ", %s_col %s" % (t, t)
+    create_query += ") partition by hash(id) partitions 16 stored as kudu"
+    cursor.execute(create_query)
+
+    encodings = ['AUTO_ENCODING', 'PLAIN_ENCODING', 'PREFIX_ENCODING', 'GROUP_VARINT', \
+        'RLE', 'DICT_ENCODING', 'BIT_SHUFFLE']
+    compressions = ['DEFAULT_COMPRESSION', 'NO_COMPRESSION', 'SNAPPY', 'LZ4', 'ZLIB']
+    i = 0
+    for e in encodings:
+      for c in compressions:
+        for t in types:
+          try:
+            cursor.execute("""alter table %s alter column %s_col
+                set encoding %s compression %s""" % (table_name, t, e, c))
+          except Exception as err:
+            assert "encoding %s not supported for type" % e in str(err)
+        cursor.execute("""insert into %s values (%s, true, 0, 0, 0, 0, 0, 0, '0',
+            cast('2009-01-01' as timestamp), cast(0 as decimal))""" % (table_name, i))
+        cursor.execute("select * from %s where id = %s" % (table_name, i))
+        assert cursor.fetchall() == \
+            [(i, True, 0, 0, 0, 0, 0.0, 0.0, '0', datetime(2009, 1, 1, 0, 0), 0)]
+        i += 1
+    cursor.execute("select count(*) from %s" % table_name)
+    print cursor.fetchall() == [(i, )]
+
+  def test_concurrent_schema_change(self, cursor, unique_database):
+    """Tests that an insert into a Kudu table with a concurrent schema change either
+    succeeds or fails gracefully."""
+    table_name = "%s.test_schema_change" % unique_database
+    cursor.execute("""create table %s (col0 bigint primary key, col1 bigint)
+    partition by hash(col0) partitions 16 stored as kudu""" % table_name)
+
+    iters = 5
+    def insert_values():
+      threading.current_thread().errors = []
+      client = self.create_impala_client()
+      for i in range(0, iters):
+        time.sleep(random.random()) # sleeps for up to one second
+        try:
+          client.execute("insert into %s values (0, 0), (1, 1)" % table_name)
+        except Exception as e:
+          threading.current_thread().errors.append(e)
+
+    insert_thread = threading.Thread(target=insert_values)
+    insert_thread.start()
+
+    for i in range(0, iters):
+      time.sleep(random.random()) # sleeps for up to one second
+      cursor.execute("alter table %s drop column col1" % table_name)
+      if i % 2 == 0:
+        cursor.execute("alter table %s add columns (col1 string)" % table_name)
+      else:
+        cursor.execute("alter table %s add columns (col1 bigint)" % table_name)
+
+    insert_thread.join()
+
+    for error in insert_thread.errors:
+      msg = str(error)
+      # The first two are AnalysisExceptions, the next two come from KuduTableSink::Open()
+      # if the schema has changed since analysis, the last comes from the Kudu server if
+      # the schema changes between KuduTableSink::Open() and when the write ops are sent.
+      assert "has fewer columns (1) than the SELECT / VALUES clause returns (2)" in msg \
+        or "(type: TINYINT) is not compatible with column 'col1' (type: STRING)" in msg \
+        or "has fewer columns than expected." in msg \
+        or "Column col1 has unexpected type." in msg \
+        or "Client provided column col1[int64 NULLABLE] not present in tablet" in msg
+
 class TestCreateExternalTable(KuduTestSuite):
+
+  def test_external_timestamp_default_value(self, cursor, kudu_client, unique_database):
+    """Checks that a Kudu table created outside Impala with a default value on a
+       UNIXTIME_MICROS column can be loaded by Impala, and validates the DESCRIBE
+       output is correct."""
+    schema_builder = SchemaBuilder()
+    column_spec = schema_builder.add_column("id", INT64)
+    column_spec.nullable(False)
+    column_spec = schema_builder.add_column("ts", UNIXTIME_MICROS)
+    column_spec.default(datetime(2009, 1, 1, 0, 0, tzinfo=utc))
+    schema_builder.set_primary_keys(["id"])
+    schema = schema_builder.build()
+    name = unique_database + ".tsdefault"
+
+    try:
+      kudu_client.create_table(name, schema,
+        partitioning=Partitioning().set_range_partition_columns(["id"]))
+      kudu_table = kudu_client.table(name)
+      impala_table_name = self.get_kudu_table_base_name(kudu_table.name)
+      props = "TBLPROPERTIES('kudu.table_name'='%s')" % kudu_table.name
+      cursor.execute("CREATE EXTERNAL TABLE %s STORED AS KUDU %s" % (impala_table_name,
+        props))
+      with self.drop_impala_table_after_context(cursor, impala_table_name):
+        cursor.execute("DESCRIBE %s" % impala_table_name)
+        table_desc = [[col.strip() if col else col for col in row] for row in cursor]
+        # Pytest shows truncated output on failure, so print the details just in case.
+        LOG.info(table_desc)
+        assert ["ts", "timestamp", "", "false", "true", "1230768000000000", \
+          "AUTO_ENCODING", "DEFAULT_COMPRESSION", "0"] in table_desc
+    finally:
+      if kudu_client.table_exists(name):
+        kudu_client.delete_table(name)
 
   def test_implicit_table_props(self, cursor, kudu_client):
     """Check that table properties added internally during table creation are as
@@ -354,6 +485,7 @@ class TestCreateExternalTable(KuduTestSuite):
 
   def test_col_types(self, cursor, kudu_client):
     """Check that a table can be created using all available column types."""
+    # TODO: Add DECIMAL when the Kudu python client supports decimal
     kudu_types = [STRING, BOOL, DOUBLE, FLOAT, INT16, INT32, INT64, INT8]
     with self.temp_kudu_table(kudu_client, kudu_types) as kudu_table:
       impala_table_name = self.get_kudu_table_base_name(kudu_table.name)
@@ -380,22 +512,9 @@ class TestCreateExternalTable(KuduTestSuite):
             STORED AS KUDU
             TBLPROPERTIES('kudu.table_name' = '%s')""" % (impala_table_name,
                 kudu_table.name))
+        assert False
       except Exception as e:
         assert "Kudu type 'binary' is not supported in Impala" in str(e)
-
-  def test_unsupported_unixtime_col(self, cursor, kudu_client):
-    """Check that external tables with UNIXTIME_MICROS columns fail gracefully.
-    """
-    with self.temp_kudu_table(kudu_client, [INT32, UNIXTIME_MICROS]) as kudu_table:
-      impala_table_name = self.random_table_name()
-      try:
-        cursor.execute("""
-            CREATE EXTERNAL TABLE %s
-            STORED AS KUDU
-            TBLPROPERTIES('kudu.table_name' = '%s')""" % (impala_table_name,
-                kudu_table.name))
-      except Exception as e:
-        assert "Kudu type 'unixtime_micros' is not supported in Impala" in str(e)
 
   def test_drop_external_table(self, cursor, kudu_client):
     """Check that dropping an external table only affects the catalog and does not delete
@@ -454,6 +573,7 @@ class TestCreateExternalTable(KuduTestSuite):
           STORED AS KUDU
           TBLPROPERTIES('kudu.table_name' = '%s')""" % (
               self.random_table_name(), kudu_table_name))
+      assert False
     except Exception as e:
       assert "Table does not exist in Kudu: '%s'" % kudu_table_name in str(e)
 
@@ -469,16 +589,127 @@ class TestCreateExternalTable(KuduTestSuite):
             STORED AS KUDU
             TBLPROPERTIES('kudu.table_name' = '%s')""" % (
               self.get_kudu_table_base_name(kudu_table.name), table_name))
+        assert False
       except Exception as e:
         assert "Table does not exist in Kudu: '%s'" % table_name in str(e)
 
+  def test_table_without_partitioning(self, cursor, kudu_client, unique_database):
+    """Test a Kudu table created without partitioning (i.e. equivalent to a single
+       unbounded partition). It is not possible to create such a table in Impala, but
+       it can be created directly in Kudu and then loaded as an external table.
+       Regression test for IMPALA-5154."""
+    schema_builder = SchemaBuilder()
+    column_spec = schema_builder.add_column("id", INT64)
+    column_spec.nullable(False)
+    schema_builder.set_primary_keys(["id"])
+    schema = schema_builder.build()
+    partitioning = Partitioning().set_range_partition_columns([])
+    name = "%s.one_big_unbounded_partition" % unique_database
+
+    try:
+      kudu_client.create_table(name, schema, partitioning=partitioning)
+      kudu_table = kudu_client.table(name)
+
+      props = "TBLPROPERTIES('kudu.table_name'='%s')" % name
+      cursor.execute("CREATE EXTERNAL TABLE %s STORED AS KUDU %s" % (name, props))
+      with self.drop_impala_table_after_context(cursor, name):
+        cursor.execute("INSERT INTO %s VALUES (1), (2), (3)" % name)
+        cursor.execute("SELECT COUNT(*) FROM %s" % name)
+        assert cursor.fetchall() == [(3, )]
+        try:
+          cursor.execute("SHOW RANGE PARTITIONS %s" % name)
+          assert False
+        except Exception as e:
+          assert "AnalysisException: SHOW RANGE PARTITIONS requested but table does "\
+              "not have range partitions" in str(e)
+    finally:
+      if kudu_client.table_exists(name):
+        kudu_client.delete_table(name)
+
+  def test_column_name_case(self, cursor, kudu_client, unique_database):
+    """IMPALA-5286: Tests that an external Kudu table that was created with a column name
+       containing upper case letters is handled correctly."""
+    table_name = '%s.kudu_external_test' % unique_database
+    if kudu_client.table_exists(table_name):
+      kudu_client.delete_table(table_name)
+
+    schema_builder = SchemaBuilder()
+    key_col = 'Key'
+    schema_builder.add_column(key_col, INT64).nullable(False).primary_key()
+    schema = schema_builder.build()
+    partitioning = Partitioning().set_range_partition_columns([key_col])\
+        .add_range_partition([1], [10])
+
+    try:
+      kudu_client.create_table(table_name, schema, partitioning)
+
+      props = "tblproperties('kudu.table_name' = '%s')" % table_name
+      cursor.execute("create external table %s stored as kudu %s" % (table_name, props))
+
+      # Perform a variety of operations on the table.
+      cursor.execute("insert into %s (kEy) values (5), (1), (4)" % table_name)
+      cursor.execute("select keY from %s where KeY %% 2 = 0" % table_name)
+      assert cursor.fetchall() == [(4, )]
+      cursor.execute("select * from %s order by kEY" % (table_name))
+      assert cursor.fetchall() == [(1, ), (4, ), (5, )]
+
+      # Do a join with a runtime filter targeting the column.
+      cursor.execute("select count(*) from %s a, %s b where a.key = b.key" %
+          (table_name, table_name))
+      assert cursor.fetchall() == [(3, )]
+
+      cursor.execute("alter table %s add range partition 11 < values < 20" % table_name)
+
+      new_key = "KEY2"
+      cursor.execute("alter table %s change KEy %s bigint" % (table_name, new_key))
+      val_col = "vaL"
+      cursor.execute("alter table %s add columns (%s bigint)" % (table_name, val_col))
+
+      cursor.execute("describe %s" % table_name)
+      results = cursor.fetchall()
+      # 'describe' should print the column name in lower case.
+      assert new_key.lower() in results[0]
+      assert val_col.lower() in results[1]
+
+      cursor.execute("alter table %s drop column Val" % table_name);
+      cursor.execute("describe %s" % table_name)
+      assert len(cursor.fetchall()) == 1
+
+      cursor.execute("alter table %s drop range partition 11 < values < 20" % table_name)
+    finally:
+      if kudu_client.table_exists(table_name):
+        kudu_client.delete_table(table_name)
+
+  def test_conflicting_column_name(self, cursor, kudu_client, unique_database):
+    """IMPALA-5283: Tests that loading an external Kudu table that was created with column
+       names that differ only in case results in an error."""
+    table_name = '%s.kudu_external_test' % unique_database
+    if kudu_client.table_exists(table_name):
+      kudu_client.delete_table(table_name)
+
+    schema_builder = SchemaBuilder()
+    col0 = 'col'
+    schema_builder.add_column(col0, INT64).nullable(False).primary_key()
+    col1 = 'COL'
+    schema_builder.add_column(col1, INT64)
+    schema = schema_builder.build()
+    partitioning = Partitioning().set_range_partition_columns([col0])\
+        .add_range_partition([1], [10])
+
+    try:
+      kudu_client.create_table(table_name, schema, partitioning)
+
+      props = "tblproperties('kudu.table_name' = '%s')" % table_name
+      cursor.execute("create external table %s stored as kudu %s" % (table_name, props))
+      assert False, 'create table should have resulted in an exception'
+    except Exception as e:
+      assert 'Error loading Kudu table: Impala does not support column names that ' \
+          + 'differ only in casing' in str(e)
+    finally:
+      if kudu_client.table_exists(table_name):
+        kudu_client.delete_table(table_name)
 
 class TestShowCreateTable(KuduTestSuite):
-
-  @classmethod
-  def get_conn_timeout(cls):
-    # For IMPALA-4454
-    return 60 * 5 # 5 minutes
 
   def assert_show_create_equals(self, cursor, create_sql, show_create_sql):
     """Executes 'create_sql' to create a table, then runs "SHOW CREATE TABLE" and checks
@@ -569,37 +800,91 @@ class TestShowCreateTable(KuduTestSuite):
         STORED AS KUDU
         TBLPROPERTIES ('kudu.master_addresses'='{kudu_addr}')""".format(
             db=cursor.conn.db_name, kudu_addr=KUDU_MASTER_HOSTS))
-
-  def test_properties(self, cursor):
-    # If an explicit table name is used for the Kudu table and it differs from what
-    # would be the default Kudu table name, the name should be shown as a table property.
-    kudu_table = self.random_table_name()
-    props = "'kudu.table_name'='%s'" % kudu_table
     self.assert_show_create_equals(cursor,
         """
-        CREATE TABLE {{table}} (c INT PRIMARY KEY)
-        PARTITION BY HASH (c) PARTITIONS 3
-        STORED AS KUDU
-        TBLPROPERTIES ({props})""".format(props=props),
+        CREATE TABLE {table} (c INT PRIMARY KEY) STORED AS KUDU""",
         """
         CREATE TABLE {db}.{{table}} (
           c INT NOT NULL ENCODING AUTO_ENCODING COMPRESSION DEFAULT_COMPRESSION,
           PRIMARY KEY (c)
         )
+        STORED AS KUDU
+        TBLPROPERTIES ('kudu.master_addresses'='{kudu_addr}')""".format(
+            db=cursor.conn.db_name, kudu_addr=KUDU_MASTER_HOSTS))
+
+
+  def test_timestamp_default_value(self, cursor):
+    create_sql_fmt = """
+        CREATE TABLE {table} (c INT, d TIMESTAMP,
+        e TIMESTAMP NULL DEFAULT CAST('%s' AS TIMESTAMP),
+        PRIMARY KEY(c, d))
+        PARTITION BY HASH(c) PARTITIONS 3
+        STORED AS KUDU"""
+    # Long lines are unfortunate, but extra newlines will break the test.
+    show_create_sql_fmt = """
+        CREATE TABLE {db}.{{table}} (
+          c INT NOT NULL ENCODING AUTO_ENCODING COMPRESSION DEFAULT_COMPRESSION,
+          d TIMESTAMP NOT NULL ENCODING AUTO_ENCODING COMPRESSION DEFAULT_COMPRESSION,
+          e TIMESTAMP NULL ENCODING AUTO_ENCODING COMPRESSION DEFAULT_COMPRESSION DEFAULT unix_micros_to_utc_timestamp(%s),
+          PRIMARY KEY (c, d)
+        )
         PARTITION BY HASH (c) PARTITIONS 3
         STORED AS KUDU
-        TBLPROPERTIES ('kudu.master_addresses'='{kudu_addr}', {props})""".format(
-            db=cursor.conn.db_name, kudu_addr=KUDU_MASTER_HOSTS, props=props))
+        TBLPROPERTIES ('kudu.master_addresses'='{kudu_addr}')""".format(
+            db=cursor.conn.db_name, kudu_addr=KUDU_MASTER_HOSTS)
 
-    # If the name is explicitly given (or not given at all) so that the name is the same
-    # as the default name, the table name is not shown.
-    props = "'kudu.table_name'='impala::{db}.{table}'"
+    self.assert_show_create_equals(cursor,
+      create_sql_fmt % ("2009-01-01 00:00:00.000001000"),
+      show_create_sql_fmt % ("1230768000000001"))
+    self.assert_show_create_equals(cursor,
+      create_sql_fmt % ("2009-01-01 00:00:00.000001001"),
+      show_create_sql_fmt % ("1230768000000001"))
+    self.assert_show_create_equals(cursor,
+      create_sql_fmt % ("2009-01-01 00:00:00.000000999"),
+      show_create_sql_fmt % ("1230768000000001"))
+
+  def test_external_kudu_table_name_with_show_create(self, cursor, kudu_client,
+      unique_database):
+    """Check that the generated kudu.table_name tblproperty is present with
+       show create table with external Kudu tables.
+    """
+    schema_builder = SchemaBuilder()
+    column_spec = schema_builder.add_column("id", INT64)
+    column_spec.nullable(False)
+    schema_builder.set_primary_keys(["id"])
+    partitioning = Partitioning().set_range_partition_columns(["id"])
+    schema = schema_builder.build()
+
+    kudu_table_name = self.random_table_name()
+    try:
+      kudu_client.create_table(kudu_table_name, schema, partitioning)
+      kudu_table = kudu_client.table(kudu_table_name)
+
+      table_name_prop = "'kudu.table_name'='%s'" % kudu_table.name
+      self.assert_show_create_equals(cursor,
+          """
+          CREATE EXTERNAL TABLE {{table}} STORED AS KUDU
+          TBLPROPERTIES({props})""".format(
+              props=table_name_prop),
+          """
+          CREATE EXTERNAL TABLE {db}.{{table}}
+          STORED AS KUDU
+          TBLPROPERTIES ('kudu.master_addresses'='{kudu_addr}', {kudu_table})""".format(
+              db=cursor.conn.db_name, kudu_addr=KUDU_MASTER_HOSTS,
+              kudu_table=table_name_prop))
+    finally:
+      if kudu_client.table_exists(kudu_table_name):
+        kudu_client.delete_table(kudu_table_name)
+
+  def test_managed_kudu_table_name_with_show_create(self, cursor):
+    """Check that the generated kudu.table_name tblproperty is not present with
+       show create table with managed Kudu tables.
+    """
     self.assert_show_create_equals(cursor,
         """
-        CREATE TABLE {{table}} (c INT PRIMARY KEY)
+        CREATE TABLE {table} (c INT PRIMARY KEY)
         PARTITION BY HASH (c) PARTITIONS 3
-        STORED AS KUDU
-        TBLPROPERTIES ({props})""".format(props=props),
+        STORED AS KUDU""",
         """
         CREATE TABLE {db}.{{table}} (
           c INT NOT NULL ENCODING AUTO_ENCODING COMPRESSION DEFAULT_COMPRESSION,
@@ -609,7 +894,6 @@ class TestShowCreateTable(KuduTestSuite):
         STORED AS KUDU
         TBLPROPERTIES ('kudu.master_addresses'='{kudu_addr}')""".format(
             db=cursor.conn.db_name, kudu_addr=KUDU_MASTER_HOSTS))
-
 
 class TestDropDb(KuduTestSuite):
 
@@ -648,9 +932,9 @@ class TestDropDb(KuduTestSuite):
       managed_table_name = self.random_table_name()
       unique_cursor.execute("""
           CREATE TABLE %s (a INT PRIMARY KEY) PARTITION BY HASH (a) PARTITIONS 3
-          STORED AS KUDU TBLPROPERTIES ('kudu.table_name' = '%s')"""
-          % (managed_table_name, managed_table_name))
-      assert kudu_client.table_exists(managed_table_name)
+          STORED AS KUDU""" % managed_table_name)
+      kudu_table_name = "impala::" + db_name + "." + managed_table_name
+      assert kudu_client.table_exists(kudu_table_name)
 
       # Create a table in HDFS
       hdfs_table_name = self.random_table_name()
@@ -727,7 +1011,6 @@ class TestImpalaKuduIntegration(KuduTestSuite):
       cursor.execute("SHOW TABLES")
       assert (impala_table_name,) not in cursor.fetchall()
 
-
   def test_delete_managed_kudu_table(self, cursor, kudu_client, unique_database):
     """Check that dropping a managed Kudu table works even if the underlying Kudu table
         has been dropped externally."""
@@ -744,54 +1027,15 @@ class TestImpalaKuduIntegration(KuduTestSuite):
 
 class TestKuduMemLimits(KuduTestSuite):
 
-  QUERIES = ["select * from lineitem where l_orderkey = -1",
-             "select * from lineitem where l_commitdate like '%cheese'",
-             "select * from lineitem limit 90"]
+  QUERIES = ["select * from tpch_kudu.lineitem where l_orderkey = -1",
+             "select * from tpch_kudu.lineitem where l_commitdate like '%cheese'",
+             "select * from tpch_kudu.lineitem limit 90"]
 
   # The value indicates the minimum memory requirements for the queries above, the first
   # memory limit corresponds to the first query
   QUERY_MEM_LIMITS = [1, 1, 10]
 
-  CREATE = """
-    CREATE TABLE lineitem (
-    l_orderkey BIGINT,
-    l_linenumber INT,
-    l_partkey BIGINT,
-    l_suppkey BIGINT,
-    l_quantity double,
-    l_extendedprice double,
-    l_discount double,
-    l_tax double,
-    l_returnflag STRING,
-    l_linestatus STRING,
-    l_shipdate STRING,
-    l_commitdate STRING,
-    l_receiptdate STRING,
-    l_shipinstruct STRING,
-    l_shipmode STRING,
-    l_comment STRING,
-    PRIMARY KEY (l_orderkey, l_linenumber))
-  PARTITION BY HASH (l_orderkey, l_linenumber) PARTITIONS 3
-  STORED AS KUDU"""
-
-  LOAD = """
-  insert into lineitem
-  select l_orderkey, l_linenumber, l_partkey, l_suppkey, cast(l_quantity as double),
-  cast(l_extendedprice as double), cast(l_discount as double), cast(l_tax as double),
-  l_returnflag, l_linestatus, l_shipdate, l_commitdate, l_receiptdate, l_shipinstruct,
-  l_shipmode, l_comment from tpch_parquet.lineitem"""
-
-  @classmethod
-  def auto_create_db(cls):
-    return True
-
-  @pytest.fixture(scope='class')
-  def test_data(cls, cls_cursor):
-    cls_cursor.execute(cls.CREATE)
-    cls_cursor.execute(cls.LOAD)
-
   @pytest.mark.execute_serially
-  @pytest.mark.usefixtures("test_data")
   @pytest.mark.parametrize("mem_limit", [1, 10, 0])
   def test_low_mem_limit_low_selectivity_scan(self, cursor, mem_limit, vector):
     """Tests that the queries specified in this test suite run under the given

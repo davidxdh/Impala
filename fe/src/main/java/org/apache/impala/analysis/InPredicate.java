@@ -40,7 +40,7 @@ import com.google.common.collect.Lists;
 public class InPredicate extends Predicate {
   private static final String IN_SET_LOOKUP = "in_set_lookup";
   private static final String NOT_IN_SET_LOOKUP = "not_in_set_lookup";
-  private static final String IN_ITERATE= "in_iterate";
+  private static final String IN_ITERATE = "in_iterate";
   private static final String NOT_IN_ITERATE = "not_in_iterate";
   private final boolean isNotIn_;
 
@@ -173,18 +173,24 @@ public class InPredicate extends Predicate {
     // TODO: Fix selectivity_ for nested predicate
     Reference<SlotRef> slotRefRef = new Reference<SlotRef>();
     Reference<Integer> idxRef = new Reference<Integer>();
-    if (isSingleColumnPredicate(slotRefRef, idxRef)
-        && idxRef.getRef() == 0
+    if (isSingleColumnPredicate(slotRefRef, idxRef) && idxRef.getRef() == 0
         && slotRefRef.getRef().getNumDistinctValues() > 0) {
-      selectivity_ = (double) (getChildren().size() - 1)
-          / (double) slotRefRef.getRef().getNumDistinctValues();
+      if (isNotIn()) {
+        selectivity_ = 1.0 - ((double) (getChildren().size() - 1)
+            / (double) slotRefRef.getRef().getNumDistinctValues());
+      } else {
+        selectivity_ = (double) (getChildren().size() - 1)
+            / (double) slotRefRef.getRef().getNumDistinctValues();
+      }
       selectivity_ = Math.max(0.0, Math.min(1.0, selectivity_));
     }
+  }
 
-    if (hasChildCosts()) {
-      // BINARY_PREDICATE_COST accounts for the cost of performing the comparison.
-      evalCost_ = getChildCosts() + BINARY_PREDICATE_COST * (children_.size() - 1);
-    }
+  @Override
+  protected float computeEvalCost() {
+    if (!hasChildCosts()) return UNKNOWN_COST;
+    // BINARY_PREDICATE_COST accounts for the cost of performing the comparison.
+    return getChildCosts() + BINARY_PREDICATE_COST * (children_.size() - 1);
   }
 
   @Override

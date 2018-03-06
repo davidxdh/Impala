@@ -79,7 +79,7 @@ inline bool TextConverter::WriteSlot(const SlotDescriptor* slot_desc, Tuple* tup
         // 3. HdfsScanner::WriteCompleteTuple() always calls this function with
         //    'copy_string' == false.
         str.ptr = type.IsVarLenStringType() ?
-            reinterpret_cast<char*>(pool->TryAllocate(buffer_len)) :
+            reinterpret_cast<char*>(pool->TryAllocateUnaligned(buffer_len)) :
             reinterpret_cast<char*>(slot);
         if (UNLIKELY(str.ptr == NULL)) return false;
         if (need_escape) {
@@ -130,7 +130,7 @@ inline bool TextConverter::WriteSlot(const SlotDescriptor* slot_desc, Tuple* tup
       break;
     case TYPE_TIMESTAMP: {
       TimestampValue* ts_slot = reinterpret_cast<TimestampValue*>(slot);
-      *ts_slot = TimestampValue(data, len);
+      *ts_slot = TimestampValue::Parse(data, len);
       if (!ts_slot->HasDateOrTime()) {
         parse_result = StringParser::PARSE_FAILURE;
       }
@@ -141,12 +141,12 @@ inline bool TextConverter::WriteSlot(const SlotDescriptor* slot_desc, Tuple* tup
         case 4:
           *reinterpret_cast<Decimal4Value*>(slot) =
               StringParser::StringToDecimal<int32_t>(
-                  data, len, slot_desc->type(), &parse_result);
+                  data, len, slot_desc->type(), false, &parse_result);
           break;
         case 8:
           *reinterpret_cast<Decimal8Value*>(slot) =
               StringParser::StringToDecimal<int64_t>(
-                  data, len, slot_desc->type(), &parse_result);
+                  data, len, slot_desc->type(), false, &parse_result);
           break;
         case 12:
           DCHECK(false) << "Planner should not generate this.";
@@ -154,7 +154,7 @@ inline bool TextConverter::WriteSlot(const SlotDescriptor* slot_desc, Tuple* tup
         case 16:
           *reinterpret_cast<Decimal16Value*>(slot) =
               StringParser::StringToDecimal<int128_t>(
-                  data, len, slot_desc->type(), &parse_result);
+                  data, len, slot_desc->type(), false, &parse_result);
           break;
         default:
           DCHECK(false) << "Decimal slots can't be this size.";

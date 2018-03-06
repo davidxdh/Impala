@@ -89,7 +89,7 @@ CREATE TABLE {db_name}{db_suffix}.{table_name} (
   double_col DOUBLE,
   date_string_col STRING,
   string_col STRING,
-  timestamp_col STRING,
+  timestamp_col TIMESTAMP,
   year INT,
   month INT
 )
@@ -97,7 +97,7 @@ PARTITION BY HASH (id) PARTITIONS 3 STORED AS KUDU;
 ---- DEPENDENT_LOAD_KUDU
 INSERT into TABLE {db_name}{db_suffix}.{table_name}
 SELECT id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col,
-       cast(timestamp_col as string), year, month
+       timestamp_col, year, month
 FROM {db_name}.{table_name};
 ====
 ---- DATASET
@@ -167,7 +167,7 @@ CREATE TABLE {db_name}{db_suffix}.{table_name} (
   double_col DOUBLE,
   date_string_col STRING,
   string_col STRING,
-  timestamp_col STRING,
+  timestamp_col TIMESTAMP,
   year INT,
   month INT
 )
@@ -175,7 +175,7 @@ PARTITION BY HASH (id) PARTITIONS 3 STORED AS KUDU;
 ---- DEPENDENT_LOAD_KUDU
 INSERT into TABLE {db_name}{db_suffix}.{table_name}
 SELECT id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col,
-       cast(timestamp_col as string), year, month
+       timestamp_col, year, month
 FROM {db_name}.{table_name};
 ====
 ---- DATASET
@@ -226,7 +226,7 @@ CREATE TABLE {db_name}{db_suffix}.{table_name} (
   double_col DOUBLE,
   date_string_col STRING,
   string_col STRING,
-  timestamp_col STRING,
+  timestamp_col TIMESTAMP,
   year INT,
   month INT
 )
@@ -234,7 +234,7 @@ PARTITION BY HASH (id) PARTITIONS 3 STORED AS KUDU;
 ---- DEPENDENT_LOAD_KUDU
 INSERT INTO TABLE {db_name}{db_suffix}.{table_name}
 SELECT id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col,
-       cast(timestamp_col as string), year, month
+       timestamp_col, year, month
 FROM {db_name}.{table_name};
 ====
 ---- DATASET
@@ -561,7 +561,7 @@ CREATE TABLE {db_name}{db_suffix}.{table_name}_idx (
   double_col DOUBLE NULL,
   date_string_col STRING NULL,
   string_col STRING NULL,
-  timestamp_col STRING NULL,
+  timestamp_col TIMESTAMP NULL,
   year INT NULL,
   month INT NULL,
   day INT NULL
@@ -576,7 +576,7 @@ INSERT into TABLE {db_name}{db_suffix}.{table_name}_idx
 SELECT row_number() over (order by year, month, id, day),
        id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col,
        double_col, date_string_col, string_col,
-       cast(timestamp_col as string), year, month, day
+       timestamp_col, year, month, day
 FROM {db_name}.{table_name};
 ====
 ---- DATASET
@@ -640,7 +640,7 @@ CREATE TABLE {db_name}{db_suffix}.{table_name} (
   double_col DOUBLE,
   date_string_col STRING,
   string_col STRING,
-  timestamp_col STRING,
+  timestamp_col TIMESTAMP,
   year INT,
   month INT,
   day INT
@@ -650,7 +650,7 @@ PARTITION BY HASH (id) PARTITIONS 3 STORED AS KUDU;
 INSERT into TABLE {db_name}{db_suffix}.{table_name}
 SELECT id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col,
        double_col, date_string_col, string_col,
-       cast(timestamp_col as string), year, month, day
+       timestamp_col, year, month, day
 FROM {db_name}.{table_name};
 ====
 ---- DATASET
@@ -712,13 +712,12 @@ CREATE TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name} (
   a array<int>,
   m map<string,bigint>)
 STORED AS {file_format};
----- ALTER
--- This INSERT is placed in the ALTER section and not in the DEPENDENT_LOAD section because
--- it must always be executed in Hive. The DEPENDENT_LOAD section is sometimes executed in
--- Impala, but Impala currently does not support inserting into tables with complex types.
-INSERT OVERWRITE TABLE {table_name} SELECT * FROM functional.{table_name};
 ---- LOAD
 INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} SELECT id, named_struct("f1",string_col,"f2",int_col), array(1, 2, 3), map("k", cast(0 as bigint)) FROM functional.alltypestiny;
+---- DEPENDENT_LOAD_HIVE
+-- This INSERT must run in Hive, because Impala doesn't support inserting into tables
+-- with complex types.
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} SELECT * FROM functional.{table_name};
 ====
 ---- DATASET
 functional
@@ -1247,6 +1246,13 @@ string_col string
 id int
 ---- ALTER
 ALTER TABLE {table_name} ADD IF NOT EXISTS PARTITION (string_col = "partition1");
+ALTER TABLE {table_name} ADD IF NOT EXISTS PARTITION (string_col = "2009-01-01 00:00:00");
+---- LOAD
+SET hive.exec.dynamic.partition.mode=nonstrict;
+SET hive.exec.dynamic.partition=true;
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} PARTITION(string_col)
+SELECT id, timestamp_col as string_col from functional.alltypestiny
+WHERE timestamp_col = "2009-01-01 00:00:00";
 ====
 ---- DATASET
 functional
@@ -1470,8 +1476,9 @@ old_rcfile_table
 ---- COLUMNS
 key INT
 value STRING
----- DEPENDENT_LOAD
-LOAD DATA LOCAL INPATH '${{env:IMPALA_HOME}}/testdata/data/oldrcfile.rc' OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
+---- DEPENDENT_LOAD_HIVE
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/oldrcfile.rc'
+OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
 ====
 ---- DATASET
 functional
@@ -1479,9 +1486,10 @@ functional
 bad_text_lzo
 ---- COLUMNS
 field STRING
----- DEPENDENT_LOAD
+---- DEPENDENT_LOAD_HIVE
 -- Error recovery test data for LZO compression.
-LOAD DATA LOCAL INPATH '${{env:IMPALA_HOME}}/testdata/bad_text_lzo/bad_text.lzo' OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/bad_text_lzo/bad_text.lzo'
+OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
 ====
 ---- DATASET
 functional
@@ -1490,8 +1498,9 @@ bad_text_gzip
 ---- COLUMNS
 s STRING
 i INT
----- DEPENDENT_LOAD
-LOAD DATA LOCAL INPATH '${{env:IMPALA_HOME}}/testdata/bad_text_gzip/file_not_finished.gz' OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
+---- DEPENDENT_LOAD_HIVE
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/bad_text_gzip/file_not_finished.gz'
+OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
 ====
 ---- DATASET
 functional
@@ -1499,9 +1508,10 @@ functional
 bad_seq_snap
 ---- COLUMNS
 field STRING
----- DEPENDENT_LOAD
+---- DEPENDENT_LOAD_HIVE
 -- This data file contains format errors and is accessed by the unit test: sequence-file-recover-test.
-LOAD DATA LOCAL INPATH '${{env:IMPALA_HOME}}/testdata/bad_seq_snap/bad_file' OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/bad_seq_snap/bad_file'
+OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
 ====
 ---- DATASET
 functional
@@ -1509,10 +1519,13 @@ functional
 bad_avro_snap_strings
 ---- COLUMNS
 s STRING
----- DEPENDENT_LOAD
-LOAD DATA LOCAL INPATH '${{env:IMPALA_HOME}}/testdata/bad_avro_snap/negative_string_len.avro' OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
-LOAD DATA LOCAL INPATH '${{env:IMPALA_HOME}}/testdata/bad_avro_snap/invalid_union.avro' INTO TABLE {db_name}{db_suffix}.{table_name};
-LOAD DATA LOCAL INPATH '${{env:IMPALA_HOME}}/testdata/bad_avro_snap/truncated_string.avro' INTO TABLE {db_name}{db_suffix}.{table_name};
+---- DEPENDENT_LOAD_HIVE
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/bad_avro_snap/negative_string_len.avro'
+OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/bad_avro_snap/invalid_union.avro'
+INTO TABLE {db_name}{db_suffix}.{table_name};
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/bad_avro_snap/truncated_string.avro'
+INTO TABLE {db_name}{db_suffix}.{table_name};
 ====
 ---- DATASET
 functional
@@ -1520,8 +1533,9 @@ functional
 bad_avro_snap_floats
 ---- COLUMNS
 c1 FLOAT
----- DEPENDENT_LOAD
-LOAD DATA LOCAL INPATH '${{env:IMPALA_HOME}}/testdata/bad_avro_snap/truncated_float.avro' OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
+---- DEPENDENT_LOAD_HIVE
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/bad_avro_snap/truncated_float.avro'
+OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
 ====
 ---- DATASET
 functional
@@ -1530,8 +1544,9 @@ bad_avro_decimal_schema
 ---- COLUMNS
 name STRING
 value DECIMAL(5,2)
----- DEPENDENT_LOAD
-LOAD DATA LOCAL INPATH '${{env:IMPALA_HOME}}/testdata/bad_avro_snap/invalid_decimal_schema.avro' OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
+---- DEPENDENT_LOAD_HIVE
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/bad_avro_snap/invalid_decimal_schema.avro'
+OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
 ====
 ---- DATASET
 -- IMPALA-694: uses data file produced by parquet-mr version 1.2.5-cdh4.5.0
@@ -1706,11 +1721,28 @@ ALTER TABLE {table_name} ADD IF NOT EXISTS PARTITION(d6=1);
 ---- ROW_FORMAT
 delimited fields terminated by ','
 ---- LOAD
-`hadoop fs -mkdir -p /test-warehouse/decimal_tbl/d6=1 && hadoop fs -put -f \
-${IMPALA_HOME}/testdata/data/decimal_tbl.txt /test-warehouse/decimal_tbl/d6=1/
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/decimal_tbl.txt'
+OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name} PARTITION(d6=1);
 ---- DEPENDENT_LOAD
 INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} partition(d6)
 select * from functional.{table_name};
+---- CREATE_KUDU
+DROP TABLE IF EXISTS {db_name}{db_suffix}.{table_name};
+CREATE TABLE {db_name}{db_suffix}.{table_name} (
+  d1 DECIMAL,
+  d2 DECIMAL(10, 0),
+  d3 DECIMAL(20, 10),
+  d4 DECIMAL(38, 38),
+  d5 DECIMAL(10, 5),
+  d6 DECIMAL(9, 0),
+  PRIMARY KEY (d1, d2, d3, d4, d5, d6)
+)
+PARTITION BY HASH PARTITIONS 3
+STORED AS KUDU;
+---- DEPENDENT_LOAD_KUDU
+INSERT into TABLE {db_name}{db_suffix}.{table_name}
+SELECT d1, d2, d3, d4, d5, d6
+FROM {db_name}.{table_name};
 ====
 ---- DATASET
 functional
@@ -1723,11 +1755,25 @@ c3 DECIMAL(1,1)
 ---- ROW_FORMAT
 delimited fields terminated by ','
 ---- LOAD
-`hadoop fs -mkdir -p /test-warehouse/decimal_tiny && hadoop fs -put -f \
-${IMPALA_HOME}/testdata/data/decimal-tiny.txt /test-warehouse/decimal_tiny/
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/decimal-tiny.txt'
+OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
 ---- DEPENDENT_LOAD
 INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name}
 select * from functional.{table_name};
+---- CREATE_KUDU
+DROP TABLE IF EXISTS {db_name}{db_suffix}.{table_name};
+CREATE TABLE {db_name}{db_suffix}.{table_name} (
+  c1 DECIMAL(10, 4),
+  c2 DECIMAL(15, 5),
+  c3 DECIMAL(1, 1),
+  PRIMARY KEY (c1, c2, c3)
+)
+PARTITION BY HASH PARTITIONS 3
+STORED AS KUDU;
+---- DEPENDENT_LOAD_KUDU
+INSERT into TABLE {db_name}{db_suffix}.{table_name}
+SELECT c1, c2, c3
+FROM {db_name}.{table_name};
 ====
 ---- DATASET
 functional
@@ -1795,8 +1841,8 @@ avro_decimal_tbl
 ---- COLUMNS
 name STRING
 value DECIMAL(5,2)
----- DEPENDENT_LOAD
-LOAD DATA LOCAL INPATH '${{env:IMPALA_HOME}}/testdata/data/avro_decimal_tbl.avro'
+---- DEPENDENT_LOAD_HIVE
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/avro_decimal_tbl.avro'
 OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
 ====
 ---- DATASET
@@ -2036,6 +2082,25 @@ L_SHIPMODE STRING
 L_COMMENT STRING
 ====
 ---- DATASET
+-- IMPALA-4933: tests nested collections stored in multiple row-groups.
+---- BASE_TABLE_NAME
+customer_multiblock
+---- COLUMNS
+C_CUSTKEY BIGINT
+C_NAME STRING
+C_ADDRESS STRING
+C_NATIONKEY SMALLINT
+C_PHONE STRING
+C_ACCTBAL DECIMAL(12, 2)
+C_MKTSEGMENT STRING
+C_COMMENT STRING
+C_ORDERS ARRAY<STRUCT<O_ORDERKEY: BIGINT, O_ORDERSTATUS: STRING, O_TOTALPRICE: DECIMAL(12, 2), O_ORDERDATE: STRING, O_ORDERPRIORITY: STRING, O_CLERK: STRING, O_SHIPPRIORITY: INT, O_COMMENT: STRING, O_LINEITEMS: ARRAY<STRUCT<L_PARTKEY: BIGINT, L_SUPPKEY: BIGINT, L_LINENUMBER: INT, L_QUANTITY: DECIMAL(12, 2), L_EXTENDEDPRICE: DECIMAL(12, 2), L_DISCOUNT: DECIMAL(12, 2), L_TAX: DECIMAL(12, 2), L_RETURNFLAG: STRING, L_LINESTATUS: STRING, L_SHIPDATE: STRING, L_COMMITDATE: STRING, L_RECEIPTDATE: STRING, L_SHIPINSTRUCT: STRING, L_SHIPMODE: STRING, L_COMMENT: STRING>>>>
+---- DEPENDENT_LOAD
+`hadoop fs -mkdir -p /test-warehouse/customer_multiblock_parquet && \
+hadoop fs -put -f ${IMPALA_HOME}/testdata/CustomerMultiBlock/customer_multiblock.parquet \
+/test-warehouse/customer_multiblock_parquet/
+====
+---- DATASET
 functional
 ---- BASE_TABLE_NAME
 bzip2_tbl
@@ -2087,7 +2152,11 @@ delimited fields terminated by ','  escaped by '\\'
 ---- ALTER
 ALTER TABLE {table_name} SET TBLPROPERTIES('skip.header.line.count'='1');
 ---- LOAD
-LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/table_with_header.csv' OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/table_with_header.csv'
+OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
+---- DEPENDENT_LOAD_HIVE
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/table_with_header.gz'
+OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
 ====
 ---- DATASET
 functional
@@ -2101,7 +2170,11 @@ delimited fields terminated by ','  escaped by '\\'
 ---- ALTER
 ALTER TABLE {table_name} SET TBLPROPERTIES('skip.header.line.count'='2');
 ---- LOAD
-LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/table_with_header_2.csv' OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/table_with_header_2.csv'
+OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
+---- DEPENDENT_LOAD_HIVE
+LOAD DATA LOCAL INPATH '{impala_home}/testdata/data/table_with_header_2.gz'
+OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
 ====
 ---- DATASET
 functional

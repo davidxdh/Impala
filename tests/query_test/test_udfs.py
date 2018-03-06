@@ -18,7 +18,11 @@
 from copy import copy
 import os
 import pytest
-from subprocess import check_call
+import random
+import threading
+import time
+import tempfile
+from subprocess import call, check_call
 
 from tests.beeswax.impala_beeswax import ImpalaBeeswaxException
 from tests.common.impala_cluster import ImpalaCluster
@@ -30,6 +34,7 @@ from tests.common.test_dimensions import (
     create_uncompressed_text_dimension)
 from tests.util.calculation_util import get_random_id
 from tests.util.filesystem_utils import get_fs_path, IS_S3
+from tests.verifiers.metric_verifier import MetricVerifier
 
 class TestUdfBase(ImpalaTestSuite):
   """
@@ -103,6 +108,16 @@ create aggregate function {database}.agg_decimal_intermediate(decimal(2,1), int)
 returns decimal(6,5) intermediate decimal(4,3) location '{location}'
 init_fn='AggDecimalIntermediateInit' update_fn='AggDecimalIntermediateUpdate'
 merge_fn='AggDecimalIntermediateMerge' finalize_fn='AggDecimalIntermediateFinalize';
+
+create aggregate function {database}.agg_string_intermediate(decimal(20,10), bigint, string)
+returns decimal(20,0) intermediate string location '{location}'
+init_fn='AggStringIntermediateInit' update_fn='AggStringIntermediateUpdate'
+merge_fn='AggStringIntermediateMerge' finalize_fn='AggStringIntermediateFinalize';
+
+create aggregate function {database}.char_intermediate_sum(int) returns int
+intermediate char(10) LOCATION '{location}' update_fn='AggCharIntermediateUpdate'
+init_fn='AggCharIntermediateInit' merge_fn='AggCharIntermediateMerge'
+serialize_fn='AggCharIntermediateSerialize' finalize_fn='AggCharIntermediateFinalize';
 """
 
   # Create test UDF functions in {database} from library {location}
@@ -255,6 +270,7 @@ class TestUdfExecution(TestUdfBase):
     super(TestUdfExecution, cls).add_test_dimensions()
     cls.ImpalaTestMatrix.add_dimension(
         create_exec_option_dimension_from_dict({"disable_codegen" : [False, True],
+          "disable_codegen_rows_threshold" : [0],
           "exec_single_node_rows_threshold" : [0,100],
           "enable_expr_rewrites" : [False, True]}))
     # There is no reason to run these tests using all dimensions.
@@ -304,6 +320,8 @@ class TestUdfExecution(TestUdfBase):
       self.run_test_case('QueryTest/udf-non-deterministic', vector,
           use_db=unique_database)
 
+  # Runs serially as a temporary workaround for IMPALA_6092.
+  @pytest.mark.execute_serially
   def test_java_udfs(self, vector, unique_database):
     self.run_test_case('QueryTest/load-java-udfs', vector, use_db=unique_database)
     self.run_test_case('QueryTest/java-udf', vector, use_db=unique_database)
@@ -313,8 +331,19 @@ class TestUdfExecution(TestUdfBase):
     # Aim to exercise two failure cases:
     # 1. too many arguments
     # 2. IR UDF
-    if vector.get_value('exec_option')['disable_codegen']:
-      self.run_test_case('QueryTest/udf-errors', vector, use_db=unique_database)
+    fd, dir_name = tempfile.mkstemp()
+    hdfs_path = get_fs_path("/test-warehouse/{0}_bad_udf.ll".format(unique_database))
+    try:
+      with open(dir_name, "w") as f:
+        f.write("Hello World")
+      check_call(["hadoop", "fs", "-put", "-f", f.name, hdfs_path])
+      if vector.get_value('exec_option')['disable_codegen']:
+        self.run_test_case('QueryTest/udf-errors', vector, use_db=unique_database)
+    finally:
+      if os.path.exists(f.name):
+        os.remove(f.name)
+      call(["hadoop", "fs", "-rm", "-f", hdfs_path])
+      os.close(fd)
 
   # Run serially because this will blow the process limit, potentially causing other
   # queries to fail
@@ -335,6 +364,14 @@ class TestUdfExecution(TestUdfBase):
       assert False, "Query was expected to fail"
     except ImpalaBeeswaxException, e:
       self._check_exception(e)
+
+    # It takes a long time for Impala to free up memory after this test, especially if
+    # ASAN is enabled. Verify that all fragments finish executing before moving on to the
+    # next test to make sure that the next test is not affected.
+    for impalad in ImpalaCluster().impalads:
+      verifier = MetricVerifier(impalad.service)
+      verifier.wait_for_metric("impala-server.num-fragments-in-flight", 0)
+      verifier.verify_num_unused_buffers()
 
   def test_udf_constant_folding(self, vector, unique_database):
     """Test that constant folding of UDFs is handled correctly. Uses count_rows(),
@@ -384,15 +421,22 @@ class TestUdfTargeted(TestUdfBase):
   def test_udf_invalid_symbol(self, vector, unique_database):
     """ IMPALA-1642: Impala crashes if the symbol for a Hive UDF doesn't exist
         Crashing is non-deterministic so we run the UDF several times."""
+    src_udf_path = os.path.join(
+        os.environ['IMPALA_HOME'], 'testdata/udfs/impala-hive-udfs.jar')
+    tgt_udf_path = get_fs_path(
+        '/test-warehouse/{0}.db/impala-hive-udfs.jar'.format(unique_database))
     drop_fn_stmt = (
         "drop function if exists `{0}`.fn_invalid_symbol(STRING)".format(unique_database))
     create_fn_stmt = (
         "create function `{0}`.fn_invalid_symbol(STRING) returns "
         "STRING LOCATION '{1}' SYMBOL='not.a.Symbol'".format(
-            unique_database,
-            get_fs_path('/test-warehouse/impala-hive-udfs.jar')))
+            unique_database, tgt_udf_path))
     query = "select `{0}`.fn_invalid_symbol('test')".format(unique_database)
 
+    # Dropping the function can interact with other tests whose Java classes are in
+    # the same jar. Use a copy of the jar to avoid unintended interactions.
+    # See IMPALA-6215 and IMPALA-6092 for examples.
+    check_call(["hadoop", "fs", "-put", "-f", src_udf_path, tgt_udf_path])
     self.client.execute(drop_fn_stmt)
     self.client.execute(create_fn_stmt)
     for _ in xrange(5):
@@ -405,7 +449,8 @@ class TestUdfTargeted(TestUdfBase):
     """ IMPALA-2365: Impalad shouldn't crash if the udf jar isn't present
     on HDFS"""
     # Copy hive-exec.jar to a temporary file
-    jar_path = get_fs_path("/test-warehouse/" + get_random_id(5) + ".jar")
+    jar_path = get_fs_path("/test-warehouse/{0}.db/".format(unique_database)
+                           + get_random_id(5) + ".jar")
     hive_jar = get_fs_path("/test-warehouse/hive-exec.jar")
     check_call(["hadoop", "fs", "-cp", hive_jar, jar_path])
     drop_fn_stmt = (
@@ -454,7 +499,7 @@ class TestUdfTargeted(TestUdfBase):
     new_udf = os.path.join(
         os.environ['IMPALA_HOME'], 'tests/test-hive-udfs/target/test-hive-udfs-1.0.jar')
     udf_dst = get_fs_path(
-        '/test-warehouse/impala-hive-udfs2-{0}.jar'.format(unique_database))
+        '/test-warehouse/{0}.db/impala-hive-udfs.jar'.format(unique_database))
 
     drop_fn_stmt = (
         'drop function if exists `{0}`.`udf_update_test_drop`()'.format(unique_database))
@@ -487,7 +532,7 @@ class TestUdfTargeted(TestUdfBase):
     new_udf = os.path.join(
         os.environ['IMPALA_HOME'], 'tests/test-hive-udfs/target/test-hive-udfs-1.0.jar')
     udf_dst = get_fs_path(
-        '/test-warehouse/impala-hive-udfs3-{0}.jar'.format(unique_database))
+        '/test-warehouse/{0}.db/impala-hive-udfs.jar'.format(unique_database))
     old_function_name = "udf_update_test_create1"
     new_function_name = "udf_update_test_create2"
 
@@ -550,4 +595,3 @@ class TestUdfTargeted(TestUdfBase):
     results = self.client.fetch(query, handle, -1)
     assert results.success
     assert len(results.data) == 9999
-

@@ -42,19 +42,15 @@ typedef boost::gregorian::date Date;
 
 namespace impala {
 
-// Constant strings used for DayName function.
-const char* TimestampFunctions::SUNDAY = "Sunday";
-const char* TimestampFunctions::MONDAY = "Monday";
-const char* TimestampFunctions::TUESDAY = "Tuesday";
-const char* TimestampFunctions::WEDNESDAY = "Wednesday";
-const char* TimestampFunctions::THURSDAY = "Thursday";
-const char* TimestampFunctions::FRIDAY = "Friday";
-const char* TimestampFunctions::SATURDAY = "Saturday";
-
 const string TimestampFunctions::DAY_ARRAY[7] = {"Sun", "Mon", "Tue", "Wed", "Thu",
     "Fri", "Sat"};
+const string TimestampFunctions::DAYNAME_ARRAY[7] = {"Sunday", "Monday", "Tuesday",
+    "Wednesday", "Thursday", "Friday", "Saturday"};
 const string TimestampFunctions::MONTH_ARRAY[12] = {"Jan", "Feb", "Mar", "Apr", "May",
     "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+const string TimestampFunctions::MONTHNAME_ARRAY[12] = {"January", "February", "March",
+    "April", "May", "June", "July", "August", "September", "October", "November",
+    "December"};
 
 namespace {
 /// Uses Boost's internal checking to throw an exception if 'date' is out of the
@@ -81,7 +77,7 @@ TimestampVal TimestampFunctions::FromUtc(FunctionContext* context,
     const TimestampVal& ts_val, const StringVal& tz_string_val) {
   if (ts_val.is_null || tz_string_val.is_null) return TimestampVal::null();
   const TimestampValue& ts_value = TimestampValue::FromTimestampVal(ts_val);
-  if (!ts_value.HasDateOrTime()) return TimestampVal::null();
+  if (!ts_value.HasDateAndTime()) return TimestampVal::null();
 
   const StringValue& tz_string_value = StringValue::FromStringVal(tz_string_val);
   time_zone_ptr timezone = TimezoneDatabase::FindTimezone(
@@ -106,7 +102,7 @@ TimestampVal TimestampFunctions::FromUtc(FunctionContext* context,
   } catch (boost::exception&) {
     const string& msg = Substitute(
         "Timestamp '$0' did not convert to a valid local time in timezone '$1'",
-        ts_value.DebugString(), tz_string_value.DebugString());
+        ts_value.ToString(), tz_string_value.DebugString());
     context->AddWarning(msg.c_str());
     return TimestampVal::null();
   }
@@ -119,7 +115,7 @@ TimestampVal TimestampFunctions::ToUtc(FunctionContext* context,
     const TimestampVal& ts_val, const StringVal& tz_string_val) {
   if (ts_val.is_null || tz_string_val.is_null) return TimestampVal::null();
   const TimestampValue& ts_value = TimestampValue::FromTimestampVal(ts_val);
-  if (!ts_value.HasDateOrTime()) return TimestampVal::null();
+  if (!ts_value.HasDateAndTime()) return TimestampVal::null();
 
   const StringValue& tz_string_value = StringValue::FromStringVal(tz_string_val);
   time_zone_ptr timezone = TimezoneDatabase::FindTimezone(
@@ -154,7 +150,7 @@ TimestampVal TimestampFunctions::ToUtc(FunctionContext* context,
   } catch (boost::exception&) {
     const string& msg =
         Substitute("Timestamp '$0' in timezone '$1' could not be converted to UTC",
-            ts_value.DebugString(), tz_string_value.DebugString());
+            ts_value.ToString(), tz_string_value.DebugString());
     context->AddWarning(msg.c_str());
     return TimestampVal::null();
   }
@@ -184,6 +180,7 @@ void TimestampFunctions::UnixAndFromUnixPrepare(
     // This is much cheaper vs alloc/dealloc'ing a context for each evaluation.
     dt_ctx = new DateTimeFormatContext();
   }
+  dt_ctx->SetCenturyBreak(*context->impl()->state()->now());
   context->SetFunctionState(scope, dt_ctx);
 }
 
@@ -193,6 +190,7 @@ void TimestampFunctions::UnixAndFromUnixClose(FunctionContext* context,
     DateTimeFormatContext* dt_ctx =
         reinterpret_cast<DateTimeFormatContext*>(context->GetFunctionState(scope));
     delete dt_ctx;
+    context->SetFunctionState(scope, nullptr);
   }
 }
 

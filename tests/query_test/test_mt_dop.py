@@ -21,7 +21,7 @@ import pytest
 
 from copy import deepcopy
 from tests.common.impala_test_suite import ImpalaTestSuite
-from tests.common.skip import SkipIfOldAggsJoins
+from tests.common.kudu_test_suite import KuduTestSuite
 from tests.common.test_vector import ImpalaTestDimension
 
 # COMPUTE STATS on Parquet tables automatically sets MT_DOP=4, so include
@@ -93,23 +93,22 @@ class TestMtDopParquet(ImpalaTestSuite):
 
   @pytest.mark.xfail(pytest.config.option.testing_remote_cluster,
                      reason='IMPALA-4641')
-  @SkipIfOldAggsJoins.nested_types
   def test_parquet_nested(self, vector):
     vector.get_value('exec_option')['mt_dop'] = vector.get_value('mt_dop')
     self.run_test_case('QueryTest/mt-dop-parquet-nested', vector)
 
-# Parquet filtering test rlies on a specific mt_dop value, so keep in its own test
-class TestMtDopParquetFiltering(ImpalaTestSuite):
-  @classmethod
-  def get_workload(cls):
-    return 'functional-query'
+  def test_parquet_filtering(self, vector):
+    """IMPALA-4624: Test that dictionary filtering eliminates row groups correctly."""
+    vector.get_value('exec_option')['mt_dop'] = vector.get_value('mt_dop')
+    self.run_test_case('QueryTest/parquet-filtering', vector)
 
+class TestMtDopKudu(KuduTestSuite):
   @classmethod
   def add_test_dimensions(cls):
-    super(TestMtDopParquetFiltering, cls).add_test_dimensions()
-    cls.ImpalaTestMatrix.add_constraint(
-      lambda v: v.get_value('table_format').file_format == 'parquet')
+    super(TestMtDopKudu, cls).add_test_dimensions()
+    cls.ImpalaTestMatrix.add_dimension(ImpalaTestDimension('mt_dop', *MT_DOP_VALUES))
 
-  def test_parquet_filtering(self, vector):
-    vector.get_value('exec_option')['mt_dop'] = 3
-    self.run_test_case('QueryTest/mt-dop-parquet-filtering', vector)
+  def test_kudu(self, vector, unique_database):
+    vector.get_value('exec_option')['mt_dop'] = vector.get_value('mt_dop')
+    self.run_test_case('QueryTest/mt-dop-kudu', vector, use_db=unique_database)
+

@@ -21,12 +21,12 @@
 
 #include <boost/date_time/compiler_config.hpp>
 #include <boost/date_time/gregorian/gregorian.hpp>
-#include <boost/date_time/posix_time/conversion.hpp>
-#include <boost/date_time/posix_time/posix_time_types.hpp>
+#include <boost/date_time/local_time/local_time.hpp>
 #include <ctime>
 #include <gflags/gflags.h>
 #include <string>
 
+#include "gen-cpp/Data_types.h"
 #include "udf/udf.h"
 #include "util/hash-util.h"
 
@@ -41,7 +41,7 @@ struct DateTimeFormatContext;
 
 /// Represents either a (1) date and time, (2) a date with an undefined time, or (3)
 /// a time with an undefined date. In all cases, times have up to nanosecond resolution
-/// and the minimum and maximum dates are 1400-01-01 and 10000-12-31.
+/// and the minimum and maximum dates are 1400-01-01 and 9999-12-31.
 //
 /// This type is similar to Postgresql TIMESTAMP WITHOUT TIME ZONE datatype and MySQL's
 /// DATETIME datatype. Note that because TIMESTAMP does not contain time zone
@@ -74,36 +74,56 @@ class TimestampValue {
   TimestampValue(const boost::gregorian::date& d,
       const boost::posix_time::time_duration& t)
       : time_(t),
-        date_(d) {}
+        date_(d) {
+    Validate();
+  }
   TimestampValue(const boost::posix_time::ptime& t)
       : time_(t.time_of_day()),
-        date_(t.date()) {}
+        date_(t.date()) {
+    Validate();
+  }
   TimestampValue(const TimestampValue& tv) : time_(tv.time_), date_(tv.date_) {}
-  TimestampValue(const char* str, int len);
-  TimestampValue(const char* str, int len, const DateTimeFormatContext& dt_ctx);
+
+  /// Constructors that parse from a date/time string. See TimestampParser for details
+  /// about the date-time format.
+  static TimestampValue Parse(const std::string& str);
+  static TimestampValue Parse(const char* str, int len);
+  static TimestampValue Parse(const char* str, int len,
+      const DateTimeFormatContext& dt_ctx);
 
   /// Unix time (seconds since 1970-01-01 UTC by definition) constructors.
-  /// Conversion to local time will be done if
-  /// FLAGS_use_local_tz_for_unix_timestamp_conversions is true.
-  TimestampValue(int64_t unix_time, int64_t nanos) {
-    boost::posix_time::ptime temp = UnixTimeToPtime(unix_time);
-    temp += boost::posix_time::nanoseconds(nanos);
-    *this = temp;
+  /// Return the corresponding timestamp in the local timezone if
+  /// FLAGS_use_local_tz_for_unix_timestamp_conversions is true. Otherwise, return the
+  /// corresponding timestamp in UTC.
+  static TimestampValue FromUnixTime(time_t unix_time) {
+    return TimestampValue(UnixTimeToPtime(unix_time));
   }
 
-  explicit TimestampValue(double unix_time) {
+  /// Same as FromUnixTime() above, but adds the specified number of nanoseconds to the
+  /// resulting TimestampValue. Handles negative nanoseconds and the case where
+  /// abs(nanos) >= 1e9.
+  static TimestampValue FromUnixTimeNanos(time_t unix_time, int64_t nanos) {
+    boost::posix_time::ptime temp = UnixTimeToPtime(unix_time);
+    temp += boost::posix_time::nanoseconds(nanos);
+    return TimestampValue(temp);
+  }
+
+  /// Return the corresponding timestamp in local time zone for the Unix time specified in
+  /// microseconds.
+  static TimestampValue FromUnixTimeMicros(int64_t unix_time_micros);
+
+  /// Return the corresponding timestamp in UTC for the Unix time specified in
+  /// microseconds.
+  static TimestampValue UtcFromUnixTimeMicros(int64_t unix_time_micros);
+
+  /// Returns a TimestampValue where the integer part of the specified 'unix_time'
+  /// specifies the number of seconds (see above), and the fractional part is converted
+  /// to nanoseconds and added to the resulting TimestampValue.
+  static TimestampValue FromSubsecondUnixTime(double unix_time) {
     const time_t unix_time_whole = unix_time;
     boost::posix_time::ptime temp = UnixTimeToPtime(unix_time_whole);
     temp += boost::posix_time::nanoseconds((unix_time - unix_time_whole) / ONE_BILLIONTH);
-    *this = temp;
-  }
-
-  /// Returns the current local time with microsecond accuracy. This should not be used
-  /// to time something because it is affected by adjustments to the system clock such
-  /// as a daylight savings or a manual correction by a system admin. For timings, use
-  /// functions in util/time.h.
-  static TimestampValue LocalTime() {
-    return TimestampValue(boost::posix_time::microsec_clock::local_time());
+    return TimestampValue(temp);
   }
 
   /// Returns a TimestampValue converted from a TimestampVal. The caller must ensure
@@ -132,15 +152,29 @@ class TimestampValue {
     *ptp = boost::posix_time::ptime(date_, time_);
   }
 
+  // Store the binary representation of this TimestampValue in 'tvalue'.
+  void ToTColumnValue(TColumnValue* tvalue) const {
+    const uint8_t* data = reinterpret_cast<const uint8_t*>(this);
+    tvalue->timestamp_val.assign(data, data + Size());
+    tvalue->__isset.timestamp_val = true;
+  }
+
+  // Returns a new TimestampValue created from the value in 'tvalue'.
+  static TimestampValue FromTColumnValue(const TColumnValue& tvalue) {
+    TimestampValue value;
+    memcpy(&value, tvalue.timestamp_val.c_str(), Size());
+    return value;
+  }
+
   bool HasDate() const { return !date_.is_special(); }
   bool HasTime() const { return !time_.is_special(); }
   bool HasDateOrTime() const { return HasDate() || HasTime(); }
   bool HasDateAndTime() const { return HasDate() && HasTime(); }
 
-  std::string DebugString() const;
+  std::string ToString() const;
 
-  /// Verifies that the timestamp date falls into a valid range (years 1400..9999).
-  inline bool IsValidDate() const {
+  /// Verifies that the date falls into a valid range (years 1400..9999).
+  static inline bool IsValidDate(const boost::gregorian::date& date) {
     // Smallest valid day number.
     const static int64_t MIN_DAY_NUMBER = static_cast<int64_t>(
         boost::gregorian::date(boost::date_time::min_date_time).day_number());
@@ -148,8 +182,8 @@ class TimestampValue {
     const static int64_t MAX_DAY_NUMBER = static_cast<int64_t>(
         boost::gregorian::date(boost::date_time::max_date_time).day_number());
 
-    return date_.day_number() >= MIN_DAY_NUMBER
-        && date_.day_number() <= MAX_DAY_NUMBER;
+    return date.day_number() >= MIN_DAY_NUMBER
+        && date.day_number() <= MAX_DAY_NUMBER;
   }
 
   /// Formats the timestamp using the given date/time context and places the result in the
@@ -161,37 +195,29 @@ class TimestampValue {
   /// Returns the number of characters copied in to the buffer (minus the terminator)
   int Format(const DateTimeFormatContext& dt_ctx, int len, char* buff) const;
 
+  /// Interpret 'this' as a timestamp in UTC and convert to unix time.
+  /// Returns false if the conversion failed ('unix_time' will be undefined), otherwise
+  /// true.
+  bool UtcToUnixTime(time_t* unix_time) const;
+
+  /// Interpret 'this' as a timestamp in UTC and convert to unix time in microseconds.
+  /// Nanoseconds are rounded to the nearest microsecond supported by Impala. Returns
+  /// false if the conversion failed ('unix_time_micros' will be undefined), otherwise
+  /// true.
+  bool UtcToUnixTimeMicros(int64_t* unix_time_micros) const;
+
   /// Converts to Unix time (seconds since the Unix epoch) representation. The time
   /// zone interpretation of the TimestampValue instance is determined by
   /// FLAGS_use_local_tz_for_unix_timestamp_conversions. If the flag is true, the
   /// instance is interpreted as a local value. If the flag is false, UTC is assumed.
   /// Returns false if the conversion failed (unix_time will be undefined), otherwise
   /// true.
-  bool ToUnixTime(time_t* unix_time) const {
-    DCHECK(unix_time != NULL);
-    if (UNLIKELY(!HasDateAndTime())) return false;
-    const boost::posix_time::ptime temp(date_, time_);
-    tm temp_tm = boost::posix_time::to_tm(temp);
-    if (FLAGS_use_local_tz_for_unix_timestamp_conversions) {
-      *unix_time = mktime(&temp_tm);
-    } else {
-      *unix_time = timegm(&temp_tm);
-    }
-    return true;
-  }
+  bool ToUnixTime(time_t* unix_time) const;
 
   /// Converts to Unix time with fractional seconds.
   /// Returns false if the conversion failed (unix_time will be undefined), otherwise
   /// true.
-  bool ToSubsecondUnixTime(double* unix_time) const {
-    DCHECK(unix_time != NULL);
-    time_t temp;
-    if (UNLIKELY(!ToUnixTime(&temp))) return false;
-    *unix_time = static_cast<double>(temp);
-    DCHECK(HasTime());
-    *unix_time += time_.fractional_seconds() * ONE_BILLIONTH;
-    return true;
-  }
+  bool ToSubsecondUnixTime(double* unix_time) const;
 
   /// Converts from UTC to local time in-place. The caller must ensure the TimestampValue
   /// this function is called upon has both a valid date and time.
@@ -258,11 +284,21 @@ class TimestampValue {
   /// 4 -bytes - stores the date as a day
   boost::gregorian::date date_;
 
+  /// Sets both date and time to invalid if date is outside the valid range.
+  void Validate();
+
   /// Return a ptime representation of the given Unix time (seconds since the Unix epoch).
   /// The time zone of the resulting ptime is determined by
   /// FLAGS_use_local_tz_for_unix_timestamp_conversions. If the flag is true, the value
   /// will be in the local time zone. If the flag is false, the value will be in UTC.
-  boost::posix_time::ptime UnixTimeToPtime(time_t unix_time) const;
+  static boost::posix_time::ptime UnixTimeToPtime(time_t unix_time);
+
+  /// Same as the above, but the time zone of the resulting ptime is always in the local
+  /// time zone.
+  static boost::posix_time::ptime UnixTimeToLocalPtime(time_t unix_time);
+
+  /// Same as the above, but the time zone of the resulting ptime is always in UTC.
+  static boost::posix_time::ptime UnixTimeToUtcPtime(time_t unix_time);
 };
 
 /// This function must be called 'hash_value' to be picked up by boost.

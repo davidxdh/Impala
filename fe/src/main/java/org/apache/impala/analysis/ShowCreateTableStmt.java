@@ -17,12 +17,15 @@
 
 package org.apache.impala.analysis;
 
+import java.util.List;
+
 import org.apache.impala.authorization.Privilege;
 import org.apache.impala.catalog.Table;
 import org.apache.impala.catalog.View;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.thrift.TCatalogObjectType;
 import org.apache.impala.thrift.TTableName;
+
 import com.google.common.base.Preconditions;
 
 /**
@@ -36,7 +39,7 @@ public class ShowCreateTableStmt extends StatementBase {
   private TableName tableName_;
 
   // The object type keyword used, e.g. TABLE or VIEW, needed to output matching SQL.
-  private TCatalogObjectType objectType_;
+  private final TCatalogObjectType objectType_;
 
   public ShowCreateTableStmt(TableName table, TCatalogObjectType objectType) {
     Preconditions.checkNotNull(table);
@@ -50,6 +53,11 @@ public class ShowCreateTableStmt extends StatementBase {
   }
 
   @Override
+  public void collectTableRefs(List<TableRef> tblRefs) {
+    tblRefs.add(new TableRef(tableName_.toPath(), null));
+  }
+
+  @Override
   public void analyze(Analyzer analyzer) throws AnalysisException {
     tableName_ = analyzer.getFqTableName(tableName_);
     Table table = analyzer.getTable(tableName_, Privilege.VIEW_METADATA);
@@ -60,9 +68,9 @@ public class ShowCreateTableStmt extends StatementBase {
       // Only show the view's query if the user has permissions to execute the query, to
       // avoid revealing information, e.g. tables the user does not have access to.
       // Report a masked authorization message if authorization fails.
-      viewAnalyzer.setAuthErrMsg(String.format("User '%s' does not have privileges to " +
-          "see the definition of view '%s'.",
-          analyzer.getUser().getName(), view.getFullName()));
+      viewAnalyzer.setMaskPrivChecks(String.format("User '%s' does not have privileges " +
+          "to see the definition of view '%s'.", analyzer.getUser().getName(),
+          view.getFullName()));
       QueryStmt viewQuery = view.getQueryStmt().clone();
       // Views from the Hive metastore may rely on Hive's column naming if the SQL
       // statement references a column by its implicitly defined column names.

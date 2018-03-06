@@ -135,7 +135,10 @@ struct TTableName {
 
 struct TTableStats {
   // Estimated number of rows in the table or -1 if unknown
-  1: required i64 num_rows;
+  1: required i64 num_rows
+
+  // Sum of file sizes in the table. Only set for tables of type HDFS_TABLE.
+  2: optional i64 total_file_bytes
 }
 
 // Column stats data that Impala uses.
@@ -187,6 +190,7 @@ struct TPartitionStats {
 }
 
 struct TColumn {
+  // The column name, in lower case.
   1: required string columnName
   2: required Types.TColumnType columnType
   3: optional string comment
@@ -210,44 +214,16 @@ struct TColumn {
   14: optional THdfsCompression compression
   15: optional Exprs.TExpr default_value
   16: optional i32 block_size
-}
-
-// Represents a block in an HDFS file
-struct THdfsFileBlock {
-  // Offset of this block within the file
-  1: required i64 offset
-
-  // Total length of the block
-  2: required i64 length
-
-  // Hosts that contain replicas of this block. Each value in the list is an index in to
-  // the network_addresses list of THdfsTable.
-  3: required list<i32> replica_host_idxs
-
-  // The list of disk ids for the file block. May not be set if disk ids are not supported
-  4: optional list<i32> disk_ids
-
-  // For each replica, specifies if the block is cached in memory.
-  5: optional list<bool> is_replica_cached
+  // The column name, in the case that it appears in Kudu.
+  17: optional string kudu_column_name
 }
 
 // Represents an HDFS file in a partition.
 struct THdfsFileDesc {
-  // The name of the file (not the full path). The parent path is assumed to be the
-  // 'location' of the THdfsPartition this file resides within.
-  1: required string file_name
-
-  // The total length of the file, in bytes.
-  2: required i64 length
-
-  // The type of compression used for this file.
-  3: required THdfsCompression compression
-
-  // The last modified time of the file.
-  4: required i64 last_modification_time
-
-  // List of THdfsFileBlocks that make up this file.
-  5: required list<THdfsFileBlock> file_blocks
+  // File descriptor metadata serialized into a FlatBuffer
+  // (defined in common/fbs/CatalogObjects.fbs).
+  // TODO: Put this in a KRPC sidecar to avoid serialization cost.
+  1: required binary file_desc_data
 }
 
 // Represents an HDFS partition's location in a compressed format. 'prefix_index'
@@ -268,6 +244,7 @@ struct THdfsPartition {
   4: required byte mapKeyDelim
   5: required byte escapeChar
   6: required THdfsFileFormat fileFormat
+  // These are Literal expressions
   7: list<Exprs.TExpr> partitionKeyExprs
   8: required i32 blockSize
   9: optional list<THdfsFileDesc> file_desc
@@ -289,6 +266,17 @@ struct THdfsPartition {
 
   // (key,value) pairs stored in the Hive Metastore.
   15: optional map<string, string> hms_parameters
+
+  // The following fields store stats about this partition
+  // which are collected when toThrift() is called.
+  // Total number of blocks in this partition.
+  16: optional i64 num_blocks
+
+  // Total file size in bytes of this partition.
+  17: optional i64 total_file_size_bytes
+
+  // True, if this partition has incremental stats
+  18: optional bool has_incremental_stats
 }
 
 struct THdfsTable {

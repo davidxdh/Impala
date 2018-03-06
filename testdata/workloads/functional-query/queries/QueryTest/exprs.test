@@ -71,6 +71,50 @@ select count(*) from alltypesagg where tinyint_col is not null
 bigint
 ====
 ---- QUERY
+# boolean test: IS [NOT] (TRUE | FALSE | UNKNOWN)
+---- QUERY
+select count(*) from alltypesagg where (int_col < 100) is unknown;
+---- RESULTS
+20
+---- TYPES
+bigint
+====
+---- QUERY
+select count(*) from alltypesagg where (int_col < 100) is true;
+---- RESULTS
+1080
+---- TYPES
+bigint
+====
+---- QUERY
+select count(*) from alltypesagg where (int_col < 100) is false;
+---- RESULTS
+9900
+---- TYPES
+bigint
+====
+---- QUERY
+select count(*) from alltypesagg where (int_col < 100) is not unknown;
+---- RESULTS
+10980
+---- TYPES
+bigint
+====
+---- QUERY
+select count(*) from alltypesagg where (int_col < 100) is not true;
+---- RESULTS
+9920
+---- TYPES
+bigint
+====
+---- QUERY
+select count(*) from alltypesagg where (int_col < 100) is not false;
+---- RESULTS
+1100
+---- TYPES
+bigint
+====
+---- QUERY
 # =
 select count(*) from alltypesagg where tinyint_col = 1
 ---- RESULTS
@@ -830,6 +874,18 @@ order by int_col limit 20
 768,'768'
 ---- TYPES
 int,string
+====
+---- QUERY
+# IMPALA-2495: In predicate containing a TupleIsNullPredicate
+select count(id) from functional.alltypestiny t1
+left join (select coalesce(1, 10) as int_col
+           from functional.alltypessmall) t2
+on t1.id = t2.int_col
+where t2.int_col in (t2.int_col, 10)
+---- RESULTS
+100
+---- TYPES
+BIGINT
 ====
 ---- QUERY
 select count(*) from alltypesagg
@@ -1866,7 +1922,7 @@ Infinity,NaN,-0,-Infinity,Nan
 double,double,double,double,double
 ====
 ---- QUERY
-# Test that abs() retains the type of the paramter IMPALA-1424
+# Test that abs() promotes the type of the paramter IMPALA-4513
 select abs(cast(1 as int)), abs(cast(1 as smallint)),
   abs(cast(1 as tinyint)), abs(cast(8589934592 as bigint)),
   abs(cast(-1.3 as double)), abs(cast(-1.3 as float)),
@@ -1874,7 +1930,7 @@ select abs(cast(1 as int)), abs(cast(1 as smallint)),
 ---- RESULTS
 1,1,1,8589934592,1.3,1.299999952316284,1.322
 ---- TYPES
-int, smallint, tinyint, bigint, double, float, decimal
+bigint, int, smallint, bigint, double, float, decimal
 ====
 ---- QUERY
 # Regression test for IMPALA-1508
@@ -2300,8 +2356,8 @@ select dayofyear(trunc('2014-11-11', string_col)) from functional.alltypestiny l
 Invalid Truncate Unit: 0
 ====
 ---- QUERY
-select regexp_match_count(tmp.str, tmp.pattern) from (values
-('aaa' as str, 'a' as pattern),
+select regexp_match_count(tmp.str, tmp.`pattern`) from (values
+('aaa' as str, 'a' as `pattern`),
 ('aaa', 'aa'),
 ('aaaa', 'aa'),
 ('', ''),
@@ -2346,8 +2402,8 @@ select regexp_match_count(tmp.str, tmp.pattern) from (values
 int
 ====
 ---- QUERY
-select regexp_match_count(tmp.str, tmp.pattern, tmp.start_pos, tmp.params) from (values
-('aaa' as str, 'A' as pattern, 1 as start_pos, 'i' as params),
+select regexp_match_count(tmp.str, tmp.`pattern`, tmp.start_pos, tmp.params) from (values
+('aaa' as str, 'A' as `pattern`, 1 as start_pos, 'i' as params),
 ('aaa', 'A', 1, 'c'),
 ('this\nis\nnewline', '.*', 1, ''),
 ('this\nis\nnewline', '.*', 1, 'n'),
@@ -2380,20 +2436,48 @@ select regexp_match_count(tmp.str, tmp.pattern, tmp.start_pos, tmp.params) from 
 int
 ====
 ---- QUERY
-select regexp_match_count(tmp.str, tmp.pattern, tmp.start_pos, tmp.params) from (values
-('a' as str, 'a' as pattern, -1 as start_pos, '' as params),
+select regexp_match_count(tmp.str, tmp.`pattern`, tmp.start_pos, tmp.params) from (values
+('a' as str, 'a' as `pattern`, -1 as start_pos, '' as params),
 ('foobar', 'foobar', 1, 'i'),
 ('iPhone\niPad\niPod', '^I.*$', 1, 'imn')) as tmp
 ---- CATCH
 Illegal starting position -1
 ====
 ---- QUERY
-select regexp_match_count(tmp.str, tmp.pattern, tmp.start_pos, tmp.params) from (values
-('a' as str, 'a' as pattern, 1 as start_pos, 'xyz' as params),
+select regexp_match_count(tmp.str, tmp.`pattern`, tmp.start_pos, tmp.params) from (values
+('a' as str, 'a' as `pattern`, 1 as start_pos, 'xyz' as params),
 ('foobar', 'foobar', 1, 'i'),
 ('iPhone\niPad\niPod', '^I.*$', 1, 'imn')) as tmp
 ---- CATCH
 Illegal match parameter x
+====
+---- QUERY
+select regexp_escape(tmp.str) from (values
+('a.b\\c+d*e?f[g]h$i(j)k{l}m=n!o<p>q|r:s-t' as str)) as tmp
+---- RESULTS
+'a\\.b\\\\c\\+d\\*e\\?f\\[g\\]h\\$i\\(j\\)k\\{l\\}m\\=n\\!o\\<p\\>q\\|r\\:s\\-t'
+---- TYPES
+string
+====
+---- QUERY
+select regexp_extract(regexp_escape(tmp.str),
+tmp.`pattern`, tmp.index) from (values
+('Hello\\world' as str, '([[:alpha:]]+)(\\\\\\\\)([[:alpha:]]+)' as `pattern`, 2 as index)
+) as tmp
+---- RESULTS
+'\\\\'
+---- TYPES
+string
+====
+---- QUERY
+select regexp_extract(regexp_escape(tmp.str),
+tmp.`pattern`, tmp.index) from (values
+('Hello\\world' as str, '([[:alpha:]]+)(\\\\\\\\)([[:alpha:]]+)' as `pattern`, 3 as index)
+) as tmp
+---- RESULTS
+'world'
+---- TYPES
+string
 ====
 ---- QUERY
 # IMPALA-2147: IS [NOT] DISTINCT FROM and "<=>"
@@ -2459,7 +2543,7 @@ set EXEC_SINGLE_NODE_ROWS_THRESHOLD=0;
 select min(from_unixtime(ts))
 from (values (1429705108399870 as ts), (1429704907057354)) invalid_timestamps;
 ---- RESULTS
-''
+'NULL'
 ---- TYPES
 STRING
 ====
@@ -2662,6 +2746,88 @@ TIMESTAMP
 UDF WARNING: Cannot subtract interval 1: Year is out of valid range: 1400..9999
 ====
 ---- QUERY
+# Test <1400 date handling during double to timestamp conversion.
+select CAST(CAST(CAST('1400-01-01' AS TIMESTAMP) AS DOUBLE) - 0.1 AS TIMESTAMP)
+---- RESULTS
+NULL
+---- TYPES
+TIMESTAMP
+====
+---- QUERY
+# Test >=10000 date handling during double to timestamp conversion.
+select CAST(CAST(CAST('9999-12-31 23:59:59' AS TIMESTAMP) AS DOUBLE) + 1.1 AS TIMESTAMP)
+---- RESULTS
+NULL
+---- TYPES
+TIMESTAMP
+====
+---- QUERY
+# Test <1400 date handling during bigint to timestamp conversion.
+select CAST(CAST(CAST('1400-01-01' AS TIMESTAMP) AS BIGINT) - 1 AS TIMESTAMP)
+---- RESULTS
+NULL
+---- TYPES
+TIMESTAMP
+====
+---- QUERY
+# Test >=10000 date handling during bigint to timestamp conversion.
+select CAST(CAST(CAST('9999-12-31 23:59:59' AS TIMESTAMP) AS BIGINT) + 1 AS TIMESTAMP)
+---- RESULTS
+NULL
+---- TYPES
+TIMESTAMP
+====
+---- QUERY
+# Test <1400 date handling during microsecond unix time to timestamp conversion.
+select unix_micros_to_utc_timestamp(
+  CAST(CAST('1400-01-01' AS TIMESTAMP) AS BIGINT) * 1000000 - 1)
+---- RESULTS
+NULL
+---- TYPES
+TIMESTAMP
+====
+---- QUERY
+# Test >=10000 date handling during microsecond unix time to timestamp conversion.
+select unix_micros_to_utc_timestamp(
+  (CAST(CAST('9999-12-31 23:59:59' AS TIMESTAMP) AS BIGINT) + 1) * 1000000 + 1)
+---- RESULTS
+NULL
+---- TYPES
+TIMESTAMP
+====
+---- QUERY
+# Test <1400 date handling during string to timestamp conversion.
+select CAST("1399-12-31 23:59:59.99999" AS TIMESTAMP);
+---- RESULTS
+NULL
+---- TYPES
+TIMESTAMP
+====
+---- QUERY
+# Test >=10000 date handling during string to timestamp conversion.
+select CAST("10000-01-01" AS TIMESTAMP);
+---- RESULTS
+NULL
+---- TYPES
+TIMESTAMP
+====
+---- QUERY
+# Test leap year checking during string to timestamp conversion.
+select CAST("1900-02-29" AS TIMESTAMP);
+---- RESULTS
+NULL
+---- TYPES
+TIMESTAMP
+====
+---- QUERY
+# Test invalid format handling during string to timestamp conversion.
+select CAST("not a timestamp" AS TIMESTAMP);
+---- RESULTS
+NULL
+---- TYPES
+TIMESTAMP
+====
+---- QUERY
 # IMPALA-4574: UUID() is not a constant expression.
 select count(*) from functional.alltypestiny group by concat(uuid(), "_test")
 ---- RESULTS
@@ -2733,4 +2899,63 @@ select distinct case when true then id else 0 end from functional.alltypestiny
 7
 ---- TYPES
 INT
+====
+---- QUERY
+# IMPALA-5125: test behavior when an agg function could be eliminated by expr rewrites.
+select if (true, 0, sum(id)) from functional.alltypestiny
+---- RESULTS
+0
+---- TYPES
+BIGINT
+====
+---- QUERY
+# IMPALA-5725: test coalesce() is not rewritten when its first parameter is a non-nullable
+# Kudu column, but can have NULL values due to an outer join.
+select coalesce(b.id, a.id), b.id, a.id
+from functional_kudu.alltypes a left join functional_kudu.alltypestiny b on a.id = b.id
+where a.id = 100
+---- RESULTS
+100,NULL,100
+---- TYPES
+INT,INT,INT
+====
+---- QUERY
+# IMPALA-5725: test coalesce() is not rewritten when its first parameter is an HDFS
+# partition col with no NULL partitions, but can have NULL values due to an outer join.
+select coalesce(b.year, a.id), b.id, a.id
+from functional.alltypes a left join functional.alltypestiny b on a.id = b.id
+where a.id = 100
+---- RESULTS
+100,NULL,100
+---- TYPES
+INT,INT,INT
+====
+---- QUERY
+select id from functional.alltypes
+where id = case cast('nan' as double) when cast('nan' as double) then 0 else 1 end
+---- RESULTS
+1
+---- TYPES
+INT
+====
+---- QUERY
+# Test expr rewrite behavior of RemoveRedundantStringCast with timestamp column
+select id, timestamp_col from functional.alltypestiny
+where cast(timestamp_col as string) = '2009-02-01 00:00:00'
+---- RESULTS
+2,2009-02-01 00:00:00
+---- TYPES
+int, timestamp
+====
+---- QUERY
+select
+murmur_hash(bool_col), murmur_hash(tinyint_col), murmur_hash(smallint_col),
+murmur_hash(int_col), murmur_hash(bigint_col), murmur_hash(float_col),
+murmur_hash(double_col), murmur_hash(date_string_col), murmur_hash(string_col),
+murmur_hash(timestamp_col), murmur_hash(year), murmur_hash(month)
+from functional.alltypes where id = 7
+---- RESULTS
+6351753276682545529,-8688181892109895221,5243888771994935971,988560926123810380,7108101660231151623,-8653637999116590182,-6387622242983883150,3788918177590065252,-7446916648201533712,7077699884854357665,7331012058162401363,-780611581681153783
+---- TYPES
+BIGINT , BIGINT , BIGINT , BIGINT , BIGINT , BIGINT , BIGINT , BIGINT , BIGINT , BIGINT , BIGINT , BIGINT
 ====

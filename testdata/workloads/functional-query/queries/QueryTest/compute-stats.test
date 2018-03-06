@@ -50,7 +50,7 @@ show column stats alltypes
 ---- LABELS
 COLUMN, TYPE, #DISTINCT VALUES, #NULLS, MAX SIZE, AVG SIZE
 ---- RESULTS
-'id','INT',7505,-1,4,4
+'id','INT',7300,-1,4,4
 'bool_col','BOOLEAN',2,-1,1,1
 'tinyint_col','TINYINT',10,-1,1,1
 'smallint_col','SMALLINT',10,-1,2,2
@@ -60,7 +60,7 @@ COLUMN, TYPE, #DISTINCT VALUES, #NULLS, MAX SIZE, AVG SIZE
 'double_col','DOUBLE',10,-1,8,8
 'date_string_col','STRING',736,-1,8,8
 'string_col','STRING',10,-1,1,1
-'timestamp_col','TIMESTAMP',7554,-1,16,16
+'timestamp_col','TIMESTAMP',7300,-1,16,16
 'year','INT',2,0,4,4
 'month','INT',12,0,4,4
 ---- TYPES
@@ -76,7 +76,7 @@ show column stats alltypes
 ---- LABELS
 COLUMN, TYPE, #DISTINCT VALUES, #NULLS, MAX SIZE, AVG SIZE
 ---- RESULTS
-'id','INT',7505,-1,4,4
+'id','INT',7300,-1,4,4
 'bool_col','BOOLEAN',2,-1,1,1
 'tinyint_col','TINYINT',10,-1,1,1
 'smallint_col','SMALLINT',10,-1,2,2
@@ -86,7 +86,7 @@ COLUMN, TYPE, #DISTINCT VALUES, #NULLS, MAX SIZE, AVG SIZE
 'double_col','DOUBLE',10,-1,8,8
 'date_string_col','STRING',736,-1,8,8
 'string_col','STRING',10,-1,1,1
-'timestamp_col','TIMESTAMP',7554,-1,16,16
+'timestamp_col','TIMESTAMP',7300,-1,16,16
 'year','INT',2,0,4,4
 'month','INT',12,0,4,4
 'new_col','INT',-1,-1,4,4
@@ -105,7 +105,7 @@ show column stats alltypes
 ---- LABELS
 COLUMN, TYPE, #DISTINCT VALUES, #NULLS, MAX SIZE, AVG SIZE
 ---- RESULTS
-'id','INT',7505,-1,4,4
+'id','INT',7300,-1,4,4
 'bool_col','BOOLEAN',2,-1,1,1
 'tinyint_col','TINYINT',10,-1,1,1
 'smallint_col','SMALLINT',10,-1,2,2
@@ -115,7 +115,7 @@ COLUMN, TYPE, #DISTINCT VALUES, #NULLS, MAX SIZE, AVG SIZE
 'double_col','DOUBLE',10,-1,8,8
 'date_string_col','STRING',736,-1,8,8
 'string_col','STRING',10,-1,1,1
-'timestamp_col','TIMESTAMP',7554,-1,16,16
+'timestamp_col','TIMESTAMP',7300,-1,16,16
 'year','INT',2,0,4,4
 'month','INT',12,0,4,4
 'new_col2','INT',-1,-1,4,4
@@ -132,7 +132,7 @@ show column stats alltypes
 ---- LABELS
 COLUMN, TYPE, #DISTINCT VALUES, #NULLS, MAX SIZE, AVG SIZE
 ---- RESULTS
-'id','INT',7505,-1,4,4
+'id','INT',7300,-1,4,4
 'bool_col','BOOLEAN',2,-1,1,1
 'tinyint_col','TINYINT',10,-1,1,1
 'smallint_col','SMALLINT',10,-1,2,2
@@ -142,7 +142,7 @@ COLUMN, TYPE, #DISTINCT VALUES, #NULLS, MAX SIZE, AVG SIZE
 'double_col','DOUBLE',10,-1,8,8
 'date_string_col','STRING',736,-1,8,8
 'string_col','STRING',10,-1,1,1
-'timestamp_col','TIMESTAMP',7554,-1,16,16
+'timestamp_col','TIMESTAMP',7300,-1,16,16
 'year','INT',2,0,4,4
 'month','INT',12,0,4,4
 ---- TYPES
@@ -188,6 +188,140 @@ STRING, STRING, BIGINT, BIGINT, STRING, STRING, STRING, STRING, STRING, STRING
 ---- QUERY
 # Note - the NDV for partition columns is read from the table metadata.
 show column stats alltypes
+---- LABELS
+COLUMN, TYPE, #DISTINCT VALUES, #NULLS, MAX SIZE, AVG SIZE
+---- RESULTS
+'id','INT',-1,-1,4,4
+'bool_col','BOOLEAN',-1,-1,1,1
+'tinyint_col','TINYINT',-1,-1,1,1
+'smallint_col','SMALLINT',-1,-1,2,2
+'int_col','INT',-1,-1,4,4
+'bigint_col','BIGINT',-1,-1,8,8
+'float_col','FLOAT',-1,-1,4,4
+'double_col','DOUBLE',-1,-1,8,8
+'date_string_col','STRING',-1,-1,-1,-1
+'string_col','STRING',-1,-1,-1,-1
+'timestamp_col','TIMESTAMP',-1,-1,16,16
+'year','INT',2,0,4,4
+'month','INT',12,0,4,4
+---- TYPES
+STRING, STRING, BIGINT, BIGINT, BIGINT, DOUBLE
+====
+---- QUERY
+# Restricts stats to a subset of columns.
+create table alltypes_for_coltest like functional.alltypes;
+insert into alltypes_for_coltest partition(year, month)
+select * from functional.alltypes;
+====
+---- QUERY
+compute stats alltypes_for_coltest(tinyint_col, float_col)
+---- RESULTS
+'Updated 24 partition(s) and 2 column(s).'
+---- TYPES
+STRING
+====
+---- QUERY
+show table stats alltypes_for_coltest
+---- LABELS
+YEAR, MONTH, #ROWS, #FILES, SIZE, BYTES CACHED, CACHE REPLICATION, FORMAT, INCREMENTAL STATS, LOCATION
+---- RESULTS
+'2009','1',310,1,'24.56KB','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'2009','2',280,1,'22.27KB','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'2009','3',310,1,'24.67KB','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'2009','4',300,1,'24.06KB','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'2009','5',310,1,'24.97KB','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'2009','6',300,1,'24.16KB','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'2009','7',310,1,'24.97KB','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'2009','8',310,1,'24.97KB','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'2009','9',300,1,'24.16KB','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'2009','10',310,1,'24.97KB','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'2009','11',300,1,'24.16KB','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'2009','12',310,1,'24.97KB','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'2010','1',310,1,'24.97KB','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'2010','2',280,1,'22.54KB','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'2010','3',310,1,'24.97KB','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'2010','4',300,1,'24.16KB','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'2010','5',310,1,'24.97KB','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'2010','6',300,1,'24.16KB','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'2010','7',310,1,'24.97KB','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'2010','8',310,1,'24.97KB','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'2010','9',300,1,'24.16KB','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'2010','10',310,1,'24.97KB','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'2010','11',300,1,'24.16KB','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'2010','12',310,1,'24.97KB','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'Total','',7300,24,'586.84KB','0B','','','',''
+---- TYPES
+STRING, STRING, BIGINT, BIGINT, STRING, STRING, STRING, STRING, STRING, STRING
+====
+---- QUERY
+show column stats alltypes_for_coltest
+---- LABELS
+COLUMN, TYPE, #DISTINCT VALUES, #NULLS, MAX SIZE, AVG SIZE
+---- RESULTS
+'id','INT',-1,-1,4,4
+'bool_col','BOOLEAN',-1,-1,1,1
+'tinyint_col','TINYINT',10,-1,1,1
+'smallint_col','SMALLINT',-1,-1,2,2
+'int_col','INT',-1,-1,4,4
+'bigint_col','BIGINT',-1,-1,8,8
+'float_col','FLOAT',10,-1,4,4
+'double_col','DOUBLE',-1,-1,8,8
+'date_string_col','STRING',-1,-1,-1,-1
+'string_col','STRING',-1,-1,-1,-1
+'timestamp_col','TIMESTAMP',-1,-1,16,16
+'year','INT',2,0,4,4
+'month','INT',12,0,4,4
+---- TYPES
+STRING, STRING, BIGINT, BIGINT, BIGINT, DOUBLE
+====
+---- QUERY
+# Computes only table statistics; no column statistics.
+create table alltypes_no_col_stats like functional.alltypes;
+insert into alltypes_no_col_stats partition(year, month)
+select * from functional.alltypes;
+====
+---- QUERY
+compute stats alltypes_no_col_stats()
+---- RESULTS
+'Updated 24 partition(s) and 0 column(s).'
+---- TYPES
+STRING
+====
+---- QUERY
+show table stats alltypes_no_col_stats
+---- LABELS
+YEAR, MONTH, #ROWS, #FILES, SIZE, BYTES CACHED, CACHE REPLICATION, FORMAT, INCREMENTAL STATS, LOCATION
+---- RESULTS
+'2009','1',310,1,'24.56KB','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'2009','2',280,1,'22.27KB','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'2009','3',310,1,'24.67KB','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'2009','4',300,1,'24.06KB','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'2009','5',310,1,'24.97KB','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'2009','6',300,1,'24.16KB','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'2009','7',310,1,'24.97KB','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'2009','8',310,1,'24.97KB','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'2009','9',300,1,'24.16KB','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'2009','10',310,1,'24.97KB','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'2009','11',300,1,'24.16KB','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'2009','12',310,1,'24.97KB','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'2010','1',310,1,'24.97KB','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'2010','2',280,1,'22.54KB','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'2010','3',310,1,'24.97KB','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'2010','4',300,1,'24.16KB','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'2010','5',310,1,'24.97KB','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'2010','6',300,1,'24.16KB','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'2010','7',310,1,'24.97KB','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'2010','8',310,1,'24.97KB','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'2010','9',300,1,'24.16KB','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'2010','10',310,1,'24.97KB','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'2010','11',300,1,'24.16KB','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'2010','12',310,1,'24.97KB','NOT CACHED','NOT CACHED','TEXT','false',regex:.*
+'Total','',7300,24,'586.84KB','0B','','','',''
+---- TYPES
+STRING, STRING, BIGINT, BIGINT, STRING, STRING, STRING, STRING, STRING, STRING
+====
+---- QUERY
+show column stats alltypes_no_col_stats
 ---- LABELS
 COLUMN, TYPE, #DISTINCT VALUES, #NULLS, MAX SIZE, AVG SIZE
 ---- RESULTS
@@ -354,7 +488,7 @@ COLUMN, TYPE, #DISTINCT VALUES, #NULLS, MAX SIZE, AVG SIZE
 'double_col','DOUBLE',10,-1,8,8
 'date_string_col','STRING',12,-1,8,8
 'string_col','STRING',10,-1,1,1
-'timestamp_col','TIMESTAMP',101,-1,16,16
+'timestamp_col','TIMESTAMP',100,-1,16,16
 ---- TYPES
 STRING, STRING, BIGINT, BIGINT, BIGINT, DOUBLE
 ====
@@ -423,7 +557,7 @@ show column stats alltypes_parquet
 ---- LABELS
 COLUMN, TYPE, #DISTINCT VALUES, #NULLS, MAX SIZE, AVG SIZE
 ---- RESULTS
-'id','INT',7505,-1,4,4
+'id','INT',7300,-1,4,4
 'bool_col','BOOLEAN',2,-1,1,1
 'tinyint_col','TINYINT',10,-1,1,1
 'smallint_col','SMALLINT',10,-1,2,2
@@ -433,7 +567,7 @@ COLUMN, TYPE, #DISTINCT VALUES, #NULLS, MAX SIZE, AVG SIZE
 'double_col','DOUBLE',10,-1,8,8
 'date_string_col','STRING',736,-1,8,8
 'string_col','STRING',10,-1,1,1
-'timestamp_col','TIMESTAMP',7554,-1,16,16
+'timestamp_col','TIMESTAMP',7300,-1,16,16
 'year','INT',2,0,4,4
 'month','INT',12,0,4,4
 ---- TYPES

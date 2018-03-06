@@ -20,19 +20,66 @@
 
 #include "util/metrics.h"
 
-#include <boost/thread/mutex.hpp>
 #include <boost/bind.hpp>
+#include <boost/thread/mutex.hpp>
 #include <gperftools/malloc_extension.h>
+#if defined(ADDRESS_SANITIZER) || defined(THREAD_SANITIZER)
+#include <sanitizer/allocator_interface.h>
+#endif
 
-#include "util/debug-util.h"
 #include "gen-cpp/Frontend_types.h"
+#include "util/debug-util.h"
 
 namespace impala {
 
+class BufferPool;
+class ReservationTracker;
 class Thread;
 
+/// Memory metrics including TCMalloc and BufferPool memory.
+class AggregateMemoryMetrics {
+ public:
+  /// The sum of Tcmalloc TOTAL_BYTES_RESERVED and BufferPool SYSTEM_ALLOCATED.
+  /// Approximates the total amount of physical memory consumed by the backend (i.e. not
+  /// including JVM memory), which is either in use by queries or cached by the BufferPool
+  /// or the malloc implementation.
+  /// TODO: IMPALA-691 - consider changing this to include JVM memory.
+  static SumGauge* TOTAL_USED;
+
+  /// The total number of virtual memory regions for the process.
+  /// The value must be refreshed by calling Refresh().
+  static IntGauge* NUM_MAPS;
+
+  /// The total size of virtual memory regions for the process.
+  /// The value must be refreshed by calling Refresh().
+  static IntGauge* MAPPED_BYTES;
+
+  /// The total RSS of all virtual memory regions for the process.
+  /// The value must be refreshed by calling Refresh().
+  static IntGauge* RSS;
+
+  /// The total RSS of all virtual memory regions for the process.
+  /// The value must be refreshed by calling Refresh().
+  static IntGauge* ANON_HUGE_PAGE_BYTES;
+
+  /// The string reporting the /enabled setting for transparent huge pages.
+  /// The value must be refreshed by calling Refresh().
+  static StringProperty* THP_ENABLED;
+
+  /// The string reporting the /defrag setting for transparent huge pages.
+  /// The value must be refreshed by calling Refresh().
+  static StringProperty* THP_DEFRAG;
+
+  /// The string reporting the khugepaged/defrag setting for transparent huge pages.
+  /// The value must be refreshed by calling Refresh().
+  static StringProperty* THP_KHUGEPAGED_DEFRAG;
+
+  /// Refreshes values of any of the aggregate metrics that require refreshing.
+  static void Refresh();
+};
+
 /// Specialised metric which exposes numeric properties from tcmalloc.
-class TcmallocMetric : public UIntGauge {
+class TcmallocMetric : public IntGauge {
  public:
   /// Number of bytes allocated by tcmalloc, currently used by the application.
   static TcmallocMetric* BYTES_IN_USE;
@@ -55,13 +102,12 @@ class TcmallocMetric : public UIntGauge {
   /// Derived metric computing the amount of physical memory (in bytes) used by the
   /// process, including that actually in use and free bytes reserved by tcmalloc. Does not
   /// include the tcmalloc metadata.
-  class PhysicalBytesMetric : public UIntGauge {
+  class PhysicalBytesMetric : public IntGauge {
    public:
-    PhysicalBytesMetric(const TMetricDef& def) : UIntGauge(def, 0) { }
+    PhysicalBytesMetric(const TMetricDef& def) : IntGauge(def, 0) { }
 
-   private:
-    virtual void CalculateValue() {
-      value_ = TOTAL_BYTES_RESERVED->value() - PAGEHEAP_UNMAPPED_BYTES->value();
+    virtual int64_t GetValue() override {
+      return TOTAL_BYTES_RESERVED->GetValue() - PAGEHEAP_UNMAPPED_BYTES->GetValue();
     }
   };
 
@@ -70,19 +116,38 @@ class TcmallocMetric : public UIntGauge {
   static TcmallocMetric* CreateAndRegister(MetricGroup* metrics, const std::string& key,
       const std::string& tcmalloc_var);
 
+  virtual int64_t GetValue() override {
+    int64_t retval = 0;
+#if !defined(ADDRESS_SANITIZER) && !defined(THREAD_SANITIZER)
+    MallocExtension::instance()->GetNumericProperty(tcmalloc_var_.c_str(),
+        reinterpret_cast<size_t*>(&retval));
+#endif
+    return retval;
+  }
+
  private:
   /// Name of the tcmalloc property this metric should fetch.
   const std::string tcmalloc_var_;
 
   TcmallocMetric(const TMetricDef& def, const std::string& tcmalloc_var)
-      : UIntGauge(def, 0), tcmalloc_var_(tcmalloc_var) { }
+    : IntGauge(def, 0), tcmalloc_var_(tcmalloc_var) { }
+};
 
-  virtual void CalculateValue() {
-#ifndef ADDRESS_SANITIZER
-    DCHECK_EQ(sizeof(size_t), sizeof(value_));
-    MallocExtension::instance()->GetNumericProperty(tcmalloc_var_.c_str(),
-        reinterpret_cast<size_t*>(&value_));
+/// Alternative to TCMallocMetric if we're running under a sanitizer that replaces
+/// malloc(), e.g. address or thread sanitizer.
+class SanitizerMallocMetric : public IntGauge {
+ public:
+  SanitizerMallocMetric(const TMetricDef& def) : IntGauge(def, 0) {}
+
+  static SanitizerMallocMetric* BYTES_ALLOCATED;
+
+  virtual int64_t GetValue() override {
+#if defined(ADDRESS_SANITIZER) || defined(THREAD_SANITIZER)
+    return __sanitizer_get_current_allocated_bytes();
+#else
+    return 0;
 #endif
+
   }
 };
 
@@ -94,12 +159,11 @@ class JvmMetric : public IntGauge {
  public:
   /// Registers many Jvm memory metrics: one for every member of JvmMetricType for each
   /// pool (usually ~5 pools plus a synthetic 'total' pool).
-  static Status InitMetrics(MetricGroup* metrics);
+  static Status InitMetrics(MetricGroup* metrics) WARN_UNUSED_RESULT;
 
- protected:
   /// Searches through jvm_metrics_response_ for a matching memory pool and pulls out the
   /// right value from that structure according to metric_type_.
-  virtual void CalculateValue();
+  virtual int64_t GetValue() override;
 
  private:
   /// Each names one of the fields in TJvmMemoryPool.
@@ -128,10 +192,59 @@ class JvmMetric : public IntGauge {
   JvmMetricType metric_type_;
 };
 
-/// Registers common tcmalloc memory metrics. If register_jvm_metrics is true, the JVM
-/// memory metrics are also registered.
-Status RegisterMemoryMetrics(MetricGroup* metrics, bool register_jvm_metrics);
+/// Metric that reports information about the buffer pool.
+class BufferPoolMetric : public IntGauge {
+ public:
+  static Status InitMetrics(MetricGroup* metrics, ReservationTracker* global_reservations,
+      BufferPool* buffer_pool) WARN_UNUSED_RESULT;
 
+  /// Global metrics, initialized by InitMetrics().
+  static BufferPoolMetric* LIMIT;
+  static BufferPoolMetric* SYSTEM_ALLOCATED;
+  static BufferPoolMetric* RESERVED;
+  static BufferPoolMetric* UNUSED_RESERVATION_BYTES;
+  static BufferPoolMetric* NUM_FREE_BUFFERS;
+  static BufferPoolMetric* FREE_BUFFER_BYTES;
+  static BufferPoolMetric* CLEAN_PAGES_LIMIT;
+  static BufferPoolMetric* NUM_CLEAN_PAGES;
+  static BufferPoolMetric* CLEAN_PAGE_BYTES;
+
+  virtual int64_t GetValue() override;
+
+ private:
+  friend class ReservationTrackerTest;
+
+  enum class BufferPoolMetricType {
+    LIMIT, // Limit on memory allocated to buffers.
+    // Total amount of buffer memory allocated from the system. Always <= LIMIT.
+    SYSTEM_ALLOCATED,
+    // Total of all buffer reservations. May be < SYSTEM_ALLOCATED if not all reservations
+    // are fulfilled, or > SYSTEM_ALLOCATED because of additional memory cached by
+    // BufferPool. Always <= LIMIT.
+    RESERVED,
+    // Total bytes of reservations that have not been used to allocate buffers from the
+    // pool.
+    UNUSED_RESERVATION_BYTES,
+    NUM_FREE_BUFFERS, // Total number of free buffers in BufferPool.
+    FREE_BUFFER_BYTES, // Total bytes of free buffers in BufferPool.
+    CLEAN_PAGES_LIMIT, // Limit on number of clean pages in BufferPool.
+    NUM_CLEAN_PAGES, // Total number of clean pages in BufferPool.
+    CLEAN_PAGE_BYTES, // Total bytes of clean pages in BufferPool.
+  };
+
+  BufferPoolMetric(const TMetricDef& def, BufferPoolMetricType type,
+      ReservationTracker* global_reservations, BufferPool* buffer_pool);
+
+  BufferPoolMetricType type_;
+  ReservationTracker* global_reservations_;
+  BufferPool* buffer_pool_;
+};
+
+/// Registers common tcmalloc memory metrics. If 'register_jvm_metrics' is true, the JVM
+/// memory metrics are also registered. If 'global_reservations' and 'buffer_pool' are
+/// not NULL, also register buffer pool metrics.
+Status RegisterMemoryMetrics(MetricGroup* metrics, bool register_jvm_metrics,
+    ReservationTracker* global_reservations, BufferPool* buffer_pool);
 }
 
 #endif

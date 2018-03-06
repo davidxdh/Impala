@@ -48,6 +48,8 @@ import com.google.common.collect.Lists;
  * The list of slots tracks the named slots that are actually referenced in a query, as
  * well as all anonymous slots. Although not required, a tuple descriptor typically
  * only has named or anonymous slots and not a mix of both.
+ * Each tuple and slot descriptor has an associated unique id (within the scope of a
+ * query). A given slot descriptor is owned by exactly one tuple descriptor.
  *
  * For example, every table reference has a corresponding tuple descriptor. The columns
  * of the table are represented by the tuple descriptor's type (struct type with one
@@ -231,11 +233,23 @@ public class TupleDescriptor {
     return ttupleDesc;
   }
 
+  /**
+   * In some cases changes are made to a tuple after the memory layout has been computed.
+   * This function allows us to recompute the memory layout, if necessary. No-op if this
+   * tuple does not have an existing mem layout.
+   */
+  public void recomputeMemLayout() {
+    if (!hasMemLayout_) return;
+    hasMemLayout_ = false;
+    computeMemLayout();
+  }
+
   public void computeMemLayout() {
     if (hasMemLayout_) return;
     hasMemLayout_ = true;
 
     boolean alwaysAddNullBit = hasNullableKuduScanSlots();
+    avgSerializedSize_ = 0;
 
     // maps from slot size to slot descriptors with that size
     Map<Integer, List<SlotDescriptor>> slotsBySize =
@@ -327,21 +341,9 @@ public class TupleDescriptor {
     for (SlotDescriptor slotDesc: getSlots()) {
       if (!slotDesc.isMaterialized()) continue;
       if (slotDesc.getColumn() == null ||
-          slotDesc.getColumn().getPosition() >= hdfsTable.getNumClusteringCols()) {
+          !hdfsTable.isClusteringColumn(slotDesc.getColumn())) {
         return false;
       }
-    }
-    return true;
-  }
-
-  /**
-   * Returns true if tuples of type 'this' can be assigned to tuples of type 'desc'
-   * (checks that both have the same number of slots and that slots are of the same type)
-   */
-  public boolean isCompatible(TupleDescriptor desc) {
-    if (slots_.size() != desc.slots_.size()) return false;
-    for (int i = 0; i < slots_.size(); ++i) {
-      if (!slots_.get(i).getType().equals(desc.slots_.get(i).getType())) return false;
     }
     return true;
   }
@@ -358,5 +360,15 @@ public class TupleDescriptor {
       }
     }
     return partitionSlots;
+  }
+
+  /**
+   * Returns true if the tuple has any variable-length slots.
+   */
+  public boolean hasVarLenSlots() {
+    for (SlotDescriptor slot: slots_) {
+      if (!slot.getType().isFixedLengthType()) return true;
+    }
+    return false;
   }
 }

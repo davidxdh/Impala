@@ -17,7 +17,7 @@
 
 #include "service/child-query.h"
 #include "service/impala-server.inline.h"
-#include "service/query-exec-state.h"
+#include "service/client-request-state.h"
 #include "service/query-options.h"
 #include "util/debug-util.h"
 
@@ -34,7 +34,7 @@ const string ChildQuery::PARENT_QUERY_OPT = "impala.parent_query_id";
 // any HS2 "RPC" into the impala server. It is important not to hold any locks (in
 // particular the parent query's lock_) while invoking HS2 functions to avoid deadlock.
 Status ChildQuery::ExecAndFetch() {
-  const TUniqueId& session_id = parent_exec_state_->session_id();
+  const TUniqueId& session_id = parent_request_state_->session_id();
   VLOG_QUERY << "Executing child query: " << query_ << " in session "
              << PrintId(session_id);
 
@@ -45,8 +45,9 @@ Status ChildQuery::ExecAndFetch() {
   ImpalaServer::TUniqueIdToTHandleIdentifier(session_id, session_id,
       &exec_stmt_req.sessionHandle.sessionId);
   exec_stmt_req.__set_statement(query_);
-  SetQueryOptions(parent_exec_state_->exec_request().query_options, &exec_stmt_req);
-  exec_stmt_req.confOverlay[PARENT_QUERY_OPT] = PrintId(parent_exec_state_->query_id());
+  SetQueryOptions(parent_request_state_->exec_request().query_options, &exec_stmt_req);
+  exec_stmt_req.confOverlay[PARENT_QUERY_OPT] =
+      PrintId(parent_request_state_->query_id());
 
   // Starting executing of the child query and setting is_running are not made atomic
   // because holding a lock while calling into the parent_server_ may result in deadlock.
@@ -105,7 +106,7 @@ Status ChildQuery::ExecAndFetch() {
 void ChildQuery::SetQueryOptions(const TQueryOptions& parent_options,
     TExecuteStatementReq* exec_stmt_req) {
   map<string, string> conf;
-#define QUERY_OPT_FN(NAME, ENUM)\
+#define QUERY_OPT_FN(NAME, ENUM, LEVEL)\
   if (parent_options.__isset.NAME) {\
     stringstream val;\
     val << parent_options.NAME;\
@@ -127,9 +128,17 @@ void ChildQuery::Cancel() {
     if (!is_running_) return;
     is_running_ = false;
   }
-  VLOG_QUERY << "Cancelling and closing child query with operation id: "
-             << hs2_handle_.operationId.guid;
+  TUniqueId session_id;
+  TUniqueId secret_unused;
   // Ignore return statuses because they are not actionable.
+  Status status = ImpalaServer::THandleIdentifierToTUniqueId(hs2_handle_.operationId,
+      &session_id, &secret_unused);
+  if (status.ok()) {
+    VLOG_QUERY << "Cancelling and closing child query with operation id: " << session_id;
+  } else {
+    VLOG_QUERY << "Cancelling and closing child query. Failed to get query id: " <<
+        status;
+  }
   TCancelOperationResp cancel_resp;
   TCancelOperationReq cancel_req;
   cancel_req.operationHandle = hs2_handle_;
@@ -151,16 +160,17 @@ ChildQueryExecutor::~ChildQueryExecutor() {
   DCHECK(!is_running_);
 }
 
-void ChildQueryExecutor::ExecAsync(vector<ChildQuery>&& child_queries) {
+Status ChildQueryExecutor::ExecAsync(vector<ChildQuery>&& child_queries) {
   DCHECK(!child_queries.empty());
   lock_guard<SpinLock> lock(lock_);
   DCHECK(child_queries_.empty());
   DCHECK(child_queries_thread_.get() == NULL);
-  if (is_cancelled_) return;
+  if (is_cancelled_) return Status::OK();
   child_queries_ = move(child_queries);
-  child_queries_thread_.reset(new Thread("query-exec-state", "async child queries",
-      bind(&ChildQueryExecutor::ExecChildQueries, this)));
+  RETURN_IF_ERROR(Thread::Create("query-exec-state", "async child queries",
+      bind(&ChildQueryExecutor::ExecChildQueries, this), &child_queries_thread_));
   is_running_ = true;
+  return Status::OK();
 }
 
 void ChildQueryExecutor::ExecChildQueries() {

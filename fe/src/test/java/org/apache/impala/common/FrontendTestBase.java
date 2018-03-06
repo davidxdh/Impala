@@ -26,36 +26,46 @@ import java.util.Collections;
 import java.util.List;
 
 import org.apache.impala.analysis.AnalysisContext;
+import org.apache.impala.analysis.AnalysisContext.AnalysisResult;
 import org.apache.impala.analysis.Analyzer;
 import org.apache.impala.analysis.ColumnDef;
 import org.apache.impala.analysis.CreateTableStmt;
 import org.apache.impala.analysis.CreateViewStmt;
 import org.apache.impala.analysis.FunctionName;
+import org.apache.impala.analysis.InsertStmt;
 import org.apache.impala.analysis.ParseNode;
 import org.apache.impala.analysis.QueryStmt;
 import org.apache.impala.analysis.SqlParser;
 import org.apache.impala.analysis.SqlScanner;
+import org.apache.impala.analysis.StatementBase;
+import org.apache.impala.analysis.StmtMetadataLoader;
+import org.apache.impala.analysis.StmtMetadataLoader.StmtTableCache;
 import org.apache.impala.authorization.AuthorizationConfig;
 import org.apache.impala.catalog.AggregateFunction;
 import org.apache.impala.catalog.Catalog;
+import org.apache.impala.catalog.CatalogException;
 import org.apache.impala.catalog.Column;
 import org.apache.impala.catalog.Db;
 import org.apache.impala.catalog.Function;
 import org.apache.impala.catalog.HdfsTable;
-import org.apache.impala.catalog.ImpaladCatalog;
+import org.apache.impala.catalog.KuduTable;
 import org.apache.impala.catalog.ScalarFunction;
 import org.apache.impala.catalog.ScalarType;
 import org.apache.impala.catalog.Table;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.catalog.View;
+import org.apache.impala.service.CatalogOpExecutor;
 import org.apache.impala.service.Frontend;
 import org.apache.impala.testutil.ImpaladTestCatalog;
 import org.apache.impala.testutil.TestUtils;
 import org.apache.impala.thrift.TFunctionBinaryType;
 import org.apache.impala.thrift.TQueryCtx;
 import org.apache.impala.thrift.TQueryOptions;
+import org.apache.impala.util.EventSequence;
 import org.junit.After;
+import org.junit.AfterClass;
 import org.junit.Assert;
+import org.junit.BeforeClass;
 
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
@@ -67,32 +77,27 @@ import com.google.common.collect.Lists;
  * as well as helper functions for creating test-local tables/views and UDF/UDAs.
  */
 public class FrontendTestBase {
-  protected static ImpaladCatalog catalog_ = new ImpaladTestCatalog();
+  protected static ImpaladTestCatalog catalog_ = new ImpaladTestCatalog();
   protected static Frontend frontend_ = new Frontend(
       AuthorizationConfig.createAuthDisabledConfig(), catalog_);
 
   // Test-local list of test databases and tables. These are cleaned up in @After.
   protected final List<Db> testDbs_ = Lists.newArrayList();
   protected final List<Table> testTables_ = Lists.newArrayList();
+  protected final String[][] hintStyles_ = new String[][] {
+      new String[] { "/* +", "*/" }, // traditional commented hint
+      new String[] { "\n-- +", "\n" }, // eol commented hint
+      new String[] { "[", "]" } // legacy style
+  };
 
-  protected Analyzer createAnalyzer(String defaultDb) {
-    TQueryCtx queryCtx =
-        TestUtils.createQueryContext(defaultDb, System.getProperty("user.name"));
-    return new Analyzer(catalog_, queryCtx,
-        AuthorizationConfig.createAuthDisabledConfig());
+  @BeforeClass
+  public static void setUp() throws Exception {
+    RuntimeEnv.INSTANCE.setTestEnv(true);
   }
 
-  protected Analyzer createAnalyzer(TQueryOptions queryOptions) {
-    TQueryCtx queryCtx = TestUtils.createQueryContext();
-    queryCtx.client_request.query_options = queryOptions;
-    return new Analyzer(catalog_, queryCtx,
-        AuthorizationConfig.createAuthDisabledConfig());
-  }
-
-  protected Analyzer createAnalyzerUsingHiveColLabels() {
-    Analyzer analyzer = createAnalyzer(Catalog.DEFAULT_DB);
-    analyzer.setUseHiveColLabels(true);
-    return analyzer;
+  @AfterClass
+  public static void cleanUp() throws Exception {
+    RuntimeEnv.INSTANCE.setTestEnv(false);
   }
 
   // Adds a Udf: default.name(args) to the catalog.
@@ -137,7 +142,7 @@ public class FrontendTestBase {
   protected Db addTestDb(String dbName, String comment) {
     Db db = catalog_.getDb(dbName);
     Preconditions.checkState(db == null, "Test db must not already exist.");
-    db = new Db(dbName, catalog_, new org.apache.hadoop.hive.metastore.api.Database(
+    db = new Db(dbName, new org.apache.hadoop.hive.metastore.api.Database(
         dbName, comment, "", Collections.<String, String>emptyMap()));
     catalog_.addDb(db);
     testDbs_.add(db);
@@ -151,23 +156,49 @@ public class FrontendTestBase {
   }
 
   /**
-   * Add a new dummy table to the catalog based on the given CREATE TABLE sql.
-   * The dummy table only has the column definitions and no other metadata.
+   * Add a new dummy table to the catalog based on the given CREATE TABLE sql. The
+   * returned table only has its metadata partially set, but is capable of being planned.
+   * Only HDFS tables and external Kudu tables are supported.
    * Returns the new dummy table.
    * The test tables are registered in testTables_ and removed in the @After method.
    */
   protected Table addTestTable(String createTableSql) {
     CreateTableStmt createTableStmt = (CreateTableStmt) AnalyzesOk(createTableSql);
-    // Currently does not support partitioned tables.
-    Preconditions.checkState(createTableStmt.getPartitionColumnDefs().isEmpty());
     Db db = catalog_.getDb(createTableStmt.getDb());
     Preconditions.checkNotNull(db, "Test tables must be created in an existing db.");
-    HdfsTable dummyTable = new HdfsTable(null, db,
-        createTableStmt.getTbl(), createTableStmt.getOwner());
-    List<ColumnDef> columnDefs = createTableStmt.getColumnDefs();
-    for (int i = 0; i < columnDefs.size(); ++i) {
-      ColumnDef colDef = columnDefs.get(i);
-      dummyTable.addColumn(new Column(colDef.getColName(), colDef.getType(), i));
+    org.apache.hadoop.hive.metastore.api.Table msTbl =
+        CatalogOpExecutor.createMetaStoreTable(createTableStmt.toThrift());
+    Table dummyTable = Table.fromMetastoreTable(db, msTbl);
+    if (dummyTable instanceof HdfsTable) {
+      List<ColumnDef> columnDefs = Lists.newArrayList(
+          createTableStmt.getPartitionColumnDefs());
+      dummyTable.setNumClusteringCols(columnDefs.size());
+      columnDefs.addAll(createTableStmt.getColumnDefs());
+      for (int i = 0; i < columnDefs.size(); ++i) {
+        ColumnDef colDef = columnDefs.get(i);
+        dummyTable.addColumn(
+            new Column(colDef.getColName(), colDef.getType(), colDef.getComment(), i));
+      }
+      try {
+        HdfsTable hdfsTable = (HdfsTable) dummyTable;
+        hdfsTable.addDefaultPartition(msTbl.getSd());
+      } catch (CatalogException e) {
+        e.printStackTrace();
+        fail("Failed to add test table:\n" + createTableSql);
+      }
+    } else if (dummyTable instanceof KuduTable) {
+      if (!Table.isExternalTable(msTbl)) {
+        fail("Failed to add table, external kudu table expected:\n" + createTableSql);
+      }
+      try {
+        KuduTable kuduTable = (KuduTable) dummyTable;
+        kuduTable.loadSchemaFromKudu();
+      } catch (ImpalaRuntimeException e) {
+        e.printStackTrace();
+        fail("Failed to add test table:\n" + createTableSql);
+      }
+    } else {
+      fail("Test table type not supported:\n" + createTableSql);
     }
     db.addTable(dummyTable);
     testTables_.add(dummyTable);
@@ -192,10 +223,35 @@ public class FrontendTestBase {
     return dummyView;
   }
 
+  protected Table addAllScalarTypesTestTable() {
+    addTestDb("allscalartypesdb", "");
+    return addTestTable("create table allscalartypes (" +
+      "bool_col boolean, tinyint_col tinyint, smallint_col smallint, int_col int, " +
+      "bigint_col bigint, float_col float, double_col double, dec1 decimal(9,0), " +
+      "d2 decimal(10, 0), d3 decimal(20, 10), d4 decimal(38, 38), d5 decimal(10, 5), " +
+      "timestamp_col timestamp, string_col string, varchar_col varchar(50), " +
+      "char_col char (30))");
+  }
+
   protected void clearTestTables() {
     for (Table testTable: testTables_) {
       testTable.getDb().removeTable(testTable.getName());
     }
+  }
+
+  /**
+   * Inject the hint into the pattern using hint location.
+   *
+   * Example:
+   *   pattern: insert %s into t %s select * from t
+   *   hint: <token_hint_begin> hint_with_args(a) <token_hint_end>
+   *   loc: Start(=oracle style) | End(=traditional style)
+   */
+  protected String InjectInsertHint(String pattern, String hint,
+      InsertStmt.HintLocation loc) {
+    final String oracleHint = (loc == InsertStmt.HintLocation.Start) ? hint : "";
+    final String defaultHint  = (loc == InsertStmt.HintLocation.End) ? hint : "";
+    return String.format(pattern, oracleHint, defaultHint);
   }
 
   @After
@@ -225,7 +281,11 @@ public class FrontendTestBase {
    * Analyze 'stmt', expecting it to pass. Asserts in case of analysis error.
    */
   public ParseNode AnalyzesOk(String stmt) {
-    return AnalyzesOk(stmt, createAnalyzer(Catalog.DEFAULT_DB), null);
+    return AnalyzesOk(stmt, createAnalysisCtx(), null);
+  }
+
+  public ParseNode AnalyzesOk(String stmt, AnalysisContext analysisCtx) {
+    return AnalyzesOk(stmt, analysisCtx, null);
   }
 
   /**
@@ -233,21 +293,56 @@ public class FrontendTestBase {
    * If 'expectedWarning' is not null, asserts that a warning is produced.
    */
   public ParseNode AnalyzesOk(String stmt, String expectedWarning) {
-    return AnalyzesOk(stmt, createAnalyzer(Catalog.DEFAULT_DB), expectedWarning);
+    return AnalyzesOk(stmt, createAnalysisCtx(), expectedWarning);
+  }
+
+  protected AnalysisContext createAnalysisCtx() {
+    return createAnalysisCtx(Catalog.DEFAULT_DB);
+  }
+
+  protected AnalysisContext createAnalysisCtx(String defaultDb) {
+    TQueryCtx queryCtx = TestUtils.createQueryContext(
+        defaultDb, System.getProperty("user.name"));
+    EventSequence timeline = new EventSequence("Frontend Test Timeline");
+    AnalysisContext analysisCtx = new AnalysisContext(queryCtx,
+        AuthorizationConfig.createAuthDisabledConfig(), timeline);
+    return analysisCtx;
+  }
+
+  protected AnalysisContext createAnalysisCtx(TQueryOptions queryOptions) {
+    TQueryCtx queryCtx = TestUtils.createQueryContext();
+    queryCtx.client_request.query_options = queryOptions;
+    EventSequence timeline = new EventSequence("Frontend Test Timeline");
+    AnalysisContext analysisCtx = new AnalysisContext(queryCtx,
+        AuthorizationConfig.createAuthDisabledConfig(), timeline);
+    return analysisCtx;
+  }
+
+  protected AnalysisContext createAnalysisCtx(AuthorizationConfig authzConfig) {
+    return createAnalysisCtx(authzConfig, System.getProperty("user.name"));
+  }
+
+  protected AnalysisContext createAnalysisCtx(AuthorizationConfig authzConfig,
+      String user) {
+    TQueryCtx queryCtx = TestUtils.createQueryContext(Catalog.DEFAULT_DB, user);
+    EventSequence timeline = new EventSequence("Frontend Test Timeline");
+    AnalysisContext analysisCtx = new AnalysisContext(queryCtx, authzConfig, timeline);
+    return analysisCtx;
+  }
+
+  protected AnalysisContext createAnalysisCtxUsingHiveColLabels() {
+    AnalysisContext analysisCtx = createAnalysisCtx();
+    analysisCtx.setUseHiveColLabels(true);
+    return analysisCtx;
   }
 
   /**
    * Analyze 'stmt', expecting it to pass. Asserts in case of analysis error.
    * If 'expectedWarning' is not null, asserts that a warning is produced.
    */
-  public ParseNode AnalyzesOk(String stmt, Analyzer analyzer, String expectedWarning) {
+  public ParseNode AnalyzesOk(String stmt, AnalysisContext ctx, String expectedWarning) {
     try {
-      AnalysisContext analysisCtx = new AnalysisContext(catalog_,
-          TestUtils.createQueryContext(Catalog.DEFAULT_DB,
-            System.getProperty("user.name")),
-          AuthorizationConfig.createAuthDisabledConfig());
-      analysisCtx.analyze(stmt, analyzer);
-      AnalysisContext.AnalysisResult analysisResult = analysisCtx.getAnalysisResult();
+      AnalysisResult analysisResult = parseAndAnalyze(stmt, ctx);
       if (expectedWarning != null) {
         List<String> actualWarnings = analysisResult.getAnalyzer().getWarnings();
         boolean matchedWarning = false;
@@ -273,6 +368,19 @@ public class FrontendTestBase {
   }
 
   /**
+   * Analyzes the given statement without performing rewrites or authorization.
+   */
+  public StatementBase AnalyzesOkNoRewrite(StatementBase stmt) throws ImpalaException {
+    AnalysisContext ctx = createAnalysisCtx();
+    StmtMetadataLoader mdLoader =
+        new StmtMetadataLoader(frontend_, ctx.getQueryCtx().session.database, null);
+    StmtTableCache loadedTables = mdLoader.loadTables(stmt);
+    Analyzer analyzer = ctx.createAnalyzer(loadedTables);
+    stmt.analyze(analyzer);
+    return stmt;
+  }
+
+  /**
    * Asserts if stmt passes analysis.
    */
   public void AnalysisError(String stmt) {
@@ -280,33 +388,21 @@ public class FrontendTestBase {
   }
 
   /**
-   * Analyze 'stmt', expecting it to pass. Asserts in case of analysis error.
-   */
-  public ParseNode AnalyzesOk(String stmt, Analyzer analyzer) {
-    return AnalyzesOk(stmt, analyzer, null);
-  }
-
-  /**
    * Asserts if stmt passes analysis or the error string doesn't match and it
    * is non-null.
    */
   public void AnalysisError(String stmt, String expectedErrorString) {
-    AnalysisError(stmt, createAnalyzer(Catalog.DEFAULT_DB), expectedErrorString);
+    AnalysisError(stmt, createAnalysisCtx(), expectedErrorString);
   }
 
   /**
    * Asserts if stmt passes analysis or the error string doesn't match and it
    * is non-null.
    */
-  public void AnalysisError(String stmt, Analyzer analyzer, String expectedErrorString) {
+  public void AnalysisError(String stmt, AnalysisContext ctx, String expectedErrorString) {
     Preconditions.checkNotNull(expectedErrorString, "No expected error message given.");
     try {
-      AnalysisContext analysisCtx = new AnalysisContext(catalog_,
-          TestUtils.createQueryContext(Catalog.DEFAULT_DB,
-              System.getProperty("user.name")),
-              AuthorizationConfig.createAuthDisabledConfig());
-      analysisCtx.analyze(stmt, analyzer);
-      AnalysisContext.AnalysisResult analysisResult = analysisCtx.getAnalysisResult();
+      AnalysisResult analysisResult = parseAndAnalyze(stmt, ctx);
       Preconditions.checkNotNull(analysisResult.getStmt());
     } catch (Exception e) {
       String errorString = e.getMessage();
@@ -317,5 +413,19 @@ public class FrontendTestBase {
       return;
     }
     fail("Stmt didn't result in analysis error: " + stmt);
+  }
+
+  protected AnalysisResult parseAndAnalyze(String stmt, AnalysisContext ctx)
+      throws ImpalaException {
+    return parseAndAnalyze(stmt, ctx, frontend_);
+  }
+
+  protected AnalysisResult parseAndAnalyze(String stmt, AnalysisContext ctx, Frontend fe)
+      throws ImpalaException {
+    StatementBase parsedStmt = fe.parse(stmt);
+    StmtMetadataLoader mdLoader =
+        new StmtMetadataLoader(fe, ctx.getQueryCtx().session.database, null);
+    StmtTableCache stmtTableCache = mdLoader.loadTables(parsedStmt);
+    return ctx.analyzeAndAuthorize(parsedStmt, stmtTableCache, fe.getAuthzChecker());
   }
 }

@@ -56,6 +56,7 @@ enum TExecNodePhase {
   PREPARE_SCANNER,
   OPEN,
   GETNEXT,
+  GETNEXT_SCANNER,
   CLOSE,
   INVALID
 }
@@ -66,6 +67,9 @@ enum TDebugAction {
   FAIL,
   INJECT_ERROR_LOG,
   MEM_LIMIT_EXCEEDED,
+  // A floating point number in range [0.0, 1.0] that gives the probability of denying
+  // each reservation increase request after the initial reservation.
+  SET_DENY_RESERVATION_PROBABILITY,
 }
 
 // Preference for replica selection
@@ -94,6 +98,16 @@ struct TRuntimeFilterTargetDesc {
   // Indicates if this target is on the same fragment as the join that
   // produced the runtime filter
   5: required bool is_local_target
+
+  // If the target node is a Kudu scan node, the name, in the case it appears in Kudu, and
+  // type of the targeted column.
+  6: optional string kudu_col_name
+  7: optional Types.TColumnType kudu_col_type;
+}
+
+enum TRuntimeFilterType {
+  BLOOM,
+  MIN_MAX
 }
 
 // Specification of a runtime filter.
@@ -128,6 +142,13 @@ struct TRuntimeFilterDesc {
   // The estimated number of distinct values that the planner expects the filter to hold.
   // Used to compute the size of the filter.
   9: optional i64 ndv_estimate
+
+  // The type of runtime filter to build.
+  10: required TRuntimeFilterType type
+
+  // The size of the filter based on the ndv estimate and the min/max limit specified in
+  // the query options. Should be greater than zero for bloom filters, zero otherwise.
+  11: optional i64 filter_size_bytes
 }
 
 // The information contained in subclasses of ScanNode captured in two separate
@@ -212,9 +233,12 @@ struct THdfsScanNode {
   // Tuple to evaluate 'min_max_conjuncts' against.
   8: optional Types.TTupleId min_max_tuple_id
 
-  // Map from SlotIds to the indices in TPlanNode.conjuncts that are eligible
-  // for dictionary filtering.
+  // The conjuncts that are eligible for dictionary filtering.
   9: optional map<Types.TSlotId, list<i32>> dictionary_filter_conjuncts
+
+  // The byte offset of the slot for Parquet metadata if Parquet count star optimization
+  // is enabled.
+  10: optional i32 parquet_count_star_slot_offset
 }
 
 struct TDataSourceScanNode {
@@ -254,6 +278,10 @@ struct THBaseScanNode {
 
 struct TKuduScanNode {
   1: required Types.TTupleId tuple_id
+
+  // Indicates whether the MT scan node implementation should be used.
+  // If this is true, then the MT_DOP query option must be > 0.
+  2: optional bool use_mt_scan_node
 }
 
 struct TEqJoinCondition {
@@ -337,11 +365,22 @@ struct TSortInfo {
   4: optional list<Exprs.TExpr> sort_tuple_slot_exprs
 }
 
+enum TSortType {
+  // Sort the entire input.
+  TOTAL,
+
+  // Return the first N sorted elements.
+  TOPN,
+
+  // Divide the input into batches, each of which is sorted individually.
+  PARTIAL
+}
+
 struct TSortNode {
   1: required TSortInfo sort_info
-  // Indicates whether the backend service should use topn vs. sorting
-  2: required bool use_top_n;
-  // This is the number of rows to skip before returning results
+  2: required TSortType type
+  // This is the number of rows to skip before returning results.
+  // Not used with TSortType::PARTIAL.
   3: optional i64 offset
 }
 
@@ -441,6 +480,8 @@ struct TUnionNode {
   2: required list<list<Exprs.TExpr>> result_expr_lists
   // Separate list of expr lists coming from a constant select stmts.
   3: required list<list<Exprs.TExpr>> const_expr_lists
+  // Index of the first child that needs to be materialized.
+  4: required i64 first_materialized_child_idx
 }
 
 struct TExchangeNode {
@@ -457,6 +498,25 @@ struct TUnnestNode {
   // Expr that returns the in-memory collection to be scanned.
   // Currently always a SlotRef into an array-typed slot.
   1: required Exprs.TExpr collection_expr
+}
+
+// This contains all of the information computed by the plan as part of the resource
+// profile that is needed by the backend to execute.
+struct TBackendResourceProfile {
+  // The minimum reservation for this plan node in bytes.
+  1: required i64 min_reservation
+
+  // The maximum reservation for this plan node in bytes. MAX_INT64 means effectively
+  // unlimited.
+  2: required i64 max_reservation
+
+  // The spillable buffer size in bytes to use for this node, chosen by the planner.
+  // Set iff the node uses spillable buffers.
+  3: optional i64 spillable_buffer_size
+
+  // The buffer size in bytes that is large enough to fit the largest row to be processed.
+  // Set if the node allocates buffers for rows from the buffer pool.
+  4: optional i64 max_row_buffer_size
 }
 
 // This is essentially a union of all messages corresponding to subclasses
@@ -504,6 +564,9 @@ struct TPlanNode {
 
   // Runtime filters assigned to this plan node
   24: optional list<TRuntimeFilterDesc> runtime_filters
+
+  // Resource profile for this plan node.
+  25: required TBackendResourceProfile resource_profile
 }
 
 // A flattened representation of a tree of PlanNodes, obtained by depth-first

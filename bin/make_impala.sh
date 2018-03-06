@@ -35,8 +35,8 @@ MAKE_CMD=make
 MAKE_ARGS="-j${IMPALA_BUILD_THREADS:-4} ${IMPALA_MAKE_FLAGS}"
 
 # The minimal make targets if BUILD_EVERYTHING is 0.
-MAKE_TARGETS="impalad statestored catalogd fesupport loggingsupport ImpalaUdf"
-
+MAKE_TARGETS="impalad statestored catalogd fesupport loggingsupport ImpalaUdf \
+    udasample udfsample"
 # parse command line options
 for ARG in $*
 do
@@ -149,7 +149,8 @@ then
 
       if [[ ("$TARGET_BUILD_TYPE" == "ADDRESS_SANITIZER") \
                 || ("$TARGET_BUILD_TYPE" == "TIDY") \
-                || ("$TARGET_BUILD_TYPE" == "UBSAN") ]]
+                || ("$TARGET_BUILD_TYPE" == "UBSAN") \
+                || ("$TARGET_BUILD_TYPE" == "TSAN") ]]
       then
         CMAKE_ARGS+=(-DCMAKE_TOOLCHAIN_FILE=$IMPALA_HOME/cmake_modules/clang_toolchain.cmake)
       else

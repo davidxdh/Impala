@@ -22,12 +22,14 @@
 
 #include "exec/parquet-common.h"
 #include "exec/read-write-util.h"
-#include "exprs/expr.h"
+#include "exprs/scalar-expr.h"
+#include "gen-cpp/parquet_types.h"
 #include "runtime/mem-pool.h"
 #include "runtime/mem-tracker.h"
 #include "runtime/runtime-state.h"
 #include "runtime/row-batch.h"
 #include "runtime/string-value.h"
+#include "runtime/timestamp-value.h"
 #include "runtime/tuple-row.h"
 #include "util/jni-util.h"
 #include "util/periodic-counter-updater.h"
@@ -147,7 +149,7 @@ Status DataSourceScanNode::GetNextInputBatch() {
   input_batch_.reset(new TGetNextResult());
   next_row_idx_ = 0;
   // Reset all the indexes into the column value arrays to 0
-  memset(&cols_next_val_idx_[0], 0, sizeof(int) * cols_next_val_idx_.size());
+  memset(cols_next_val_idx_.data(), 0, sizeof(int) * cols_next_val_idx_.size());
   TGetNextParams params;
   params.__set_scan_handle(scan_handle_);
   RETURN_IF_ERROR(data_source_executor_->GetNext(params, input_batch_.get()));
@@ -171,24 +173,27 @@ inline Status SetDecimalVal(const ColumnType& type, char* bytes, int len,
   switch (type.GetByteSize()) {
     case 4: {
       Decimal4Value* val = reinterpret_cast<Decimal4Value*>(slot);
-      if (UNLIKELY(len > sizeof(Decimal4Value) ||
-          ParquetPlainEncoder::Decode(buffer, buffer + len, len, val) < 0)) {
+      if (UNLIKELY(len > sizeof(Decimal4Value) || (ParquetPlainEncoder::Decode
+          <Decimal4Value, parquet::Type::FIXED_LEN_BYTE_ARRAY>(buffer, buffer + len, len,
+              val)) < 0)) {
         return Status(ERROR_INVALID_DECIMAL);
       }
       break;
     }
     case 8: {
       Decimal8Value* val = reinterpret_cast<Decimal8Value*>(slot);
-      if (UNLIKELY(len > sizeof(Decimal8Value) ||
-          ParquetPlainEncoder::Decode(buffer, buffer + len, len, val) < 0)) {
+      if (UNLIKELY(len > sizeof(Decimal8Value) || (ParquetPlainEncoder::Decode
+          <Decimal8Value, parquet::Type::FIXED_LEN_BYTE_ARRAY>(buffer, buffer + len, len,
+              val)) < 0)) {
         return Status(ERROR_INVALID_DECIMAL);
       }
       break;
     }
     case 16: {
       Decimal16Value* val = reinterpret_cast<Decimal16Value*>(slot);
-      if (UNLIKELY(len > sizeof(Decimal16Value) ||
-          ParquetPlainEncoder::Decode(buffer, buffer + len, len, val) < 0)) {
+      if (UNLIKELY(len > sizeof(Decimal16Value) || (ParquetPlainEncoder::Decode
+          <Decimal16Value, parquet::Type::FIXED_LEN_BYTE_ARRAY>(buffer, buffer + len, len,
+              val)) < 0)) {
         return Status(ERROR_INVALID_DECIMAL);
       }
       break;
@@ -221,7 +226,8 @@ Status DataSourceScanNode::MaterializeNextRow(MemPool* tuple_pool, Tuple* tuple)
           }
           const string& val = col.string_vals[val_idx];
           size_t val_size = val.size();
-          char* buffer = reinterpret_cast<char*>(tuple_pool->TryAllocate(val_size));
+          char* buffer = reinterpret_cast<char*>(
+              tuple_pool->TryAllocateUnaligned(val_size));
           if (UNLIKELY(buffer == NULL)) {
             string details = Substitute(ERROR_MEM_LIMIT_EXCEEDED, "MaterializeNextRow",
                 val_size, "string slot");
@@ -281,7 +287,7 @@ Status DataSourceScanNode::MaterializeNextRow(MemPool* tuple_pool, Tuple* tuple)
         const string& val = col.binary_vals[val_idx];
         if (val.size() != TIMESTAMP_SIZE) return Status(ERROR_INVALID_TIMESTAMP);
         const uint8_t* bytes = reinterpret_cast<const uint8_t*>(val.data());
-        *reinterpret_cast<TimestampValue*>(slot) = TimestampValue(
+        *reinterpret_cast<TimestampValue*>(slot) = TimestampValue::FromUnixTimeNanos(
             ReadWriteUtil::GetInt<uint64_t>(bytes),
             ReadWriteUtil::GetInt<uint32_t>(bytes + sizeof(int64_t)));
         break;
@@ -320,8 +326,9 @@ Status DataSourceScanNode::GetNext(RuntimeState* state, RowBatch* row_batch, boo
   RETURN_IF_ERROR(
       row_batch->ResizeAndAllocateTupleBuffer(state, &tuple_buffer_size, &tuple_buffer));
   Tuple* tuple = reinterpret_cast<Tuple*>(tuple_buffer);
-  ExprContext** ctxs = &conjunct_ctxs_[0];
-  int num_ctxs = conjunct_ctxs_.size();
+  ScalarExprEvaluator* const* evals = conjunct_evals_.data();
+  int num_conjuncts = conjuncts_.size();
+  DCHECK_EQ(num_conjuncts, conjunct_evals_.size());
 
   while (true) {
     {
@@ -333,7 +340,7 @@ Status DataSourceScanNode::GetNext(RuntimeState* state, RowBatch* row_batch, boo
         TupleRow* tuple_row = row_batch->GetRow(row_idx);
         tuple_row->SetTuple(tuple_idx_, tuple);
 
-        if (ExecNode::EvalConjuncts(ctxs, num_ctxs, tuple_row)) {
+        if (ExecNode::EvalConjuncts(evals, num_conjuncts, tuple_row)) {
           row_batch->CommitLastRow();
           tuple = reinterpret_cast<Tuple*>(
               reinterpret_cast<uint8_t*>(tuple) + tuple_desc_->byte_size());
@@ -363,15 +370,13 @@ Status DataSourceScanNode::Reset(RuntimeState* state) {
 void DataSourceScanNode::Close(RuntimeState* state) {
   if (is_closed()) return;
   SCOPED_TIMER(runtime_profile_->total_time_counter());
-  PeriodicCounterUpdater::StopRateCounter(total_throughput_counter());
-  PeriodicCounterUpdater::StopTimeSeriesCounter(bytes_read_timeseries_counter_);
   input_batch_.reset();
   TCloseParams params;
   params.__set_scan_handle(scan_handle_);
   TCloseResult result;
   Status status = data_source_executor_->Close(params, &result);
   if (!status.ok()) state->LogError(status.msg());
-  ExecNode::Close(state);
+  ScanNode::Close(state);
 }
 
 void DataSourceScanNode::DebugString(int indentation_level, stringstream* out) const {

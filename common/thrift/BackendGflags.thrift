@@ -18,6 +18,11 @@
 namespace cpp impala
 namespace java org.apache.impala.thrift
 
+enum TReservedWordsVersion {
+  IMPALA_2_11
+  IMPALA_3_0
+}
+
 // Used to pass gflags from backend to frontend, JniCatalog and JniFrontend
 // Attributes without comments correspond to gflags
 struct TBackendGflags {
@@ -54,4 +59,18 @@ struct TBackendGflags {
   16: required i32 kudu_operation_timeout_ms
 
   17: required i32 initial_hms_cnxn_timeout_s
+
+  18: required bool enable_stats_extrapolation
+
+  19: required i64 sentry_catalog_polling_frequency_s
+
+  20: required i32 max_hdfs_partitions_parallel_load
+
+  21: required i32 max_nonhdfs_partitions_parallel_load
+
+  22: required TReservedWordsVersion reserved_words_version
+
+  23: required double max_filter_error_rate
+
+  24: required i64 min_buffer_size
 }

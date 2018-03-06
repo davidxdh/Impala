@@ -20,8 +20,11 @@
 
 #include <boost/thread/pthread/timespec.hpp>
 #include <boost/thread/mutex.hpp>
+#include <boost/thread/thread_time.hpp>
 #include <pthread.h>
 #include <unistd.h>
+
+#include "util/time.h"
 
 namespace impala {
 
@@ -29,32 +32,48 @@ namespace impala {
 /// boost's implementation as it doesn't implement boost thread interruption.
 class ConditionVariable {
  public:
-  ConditionVariable() { pthread_cond_init(&cv_, NULL); }
+  ConditionVariable() {
+    pthread_condattr_t attrs;
+    int retval = pthread_condattr_init(&attrs);
+    DCHECK_EQ(0, retval);
+    pthread_condattr_setclock(&attrs, CLOCK_MONOTONIC);
+    retval = pthread_cond_init(&cv_, &attrs);
+    DCHECK_EQ(0, retval);
+    pthread_condattr_destroy(&attrs);
+  }
 
   ~ConditionVariable() { pthread_cond_destroy(&cv_); }
 
   /// Wait indefinitely on the condition variable until it's notified.
-  inline void Wait(boost::unique_lock<boost::mutex>& lock) {
+  void Wait(boost::unique_lock<boost::mutex>& lock) {
     DCHECK(lock.owns_lock());
     pthread_mutex_t* mutex = lock.mutex()->native_handle();
     pthread_cond_wait(&cv_, mutex);
   }
 
-  /// Wait until the condition variable is notified or 'timeout' has passed.
+  /// Wait until the condition variable is notified or 'abs_time' has passed.
   /// Returns true if the condition variable is notified before the absolute timeout
-  /// specified in 'timeout' has passed. Returns false otherwise.
-  inline bool TimedWait(boost::unique_lock<boost::mutex>& lock,
-      const struct timespec* timeout) {
+  /// specified in 'abs_time' has passed. Returns false otherwise.
+  bool WaitUntil(boost::unique_lock<boost::mutex>& lock, const timespec& abs_time) {
     DCHECK(lock.owns_lock());
     pthread_mutex_t* mutex = lock.mutex()->native_handle();
-    return pthread_cond_timedwait(&cv_, mutex, timeout) == 0;
+    return pthread_cond_timedwait(&cv_, mutex, &abs_time) == 0;
+  }
+
+  /// Wait until the condition variable is notified or 'duration_us' microseconds
+  /// have passed. Returns true if the condition variable is notified in time.
+  /// Returns false otherwise.
+  bool WaitFor(boost::unique_lock<boost::mutex>& lock, int64_t duration_us) {
+    timespec deadline;
+    TimeFromNowMicros(duration_us, &deadline);
+    return WaitUntil(lock, deadline);
   }
 
   /// Notify a single waiter on this condition variable.
-  inline void NotifyOne() { pthread_cond_signal(&cv_); }
+  void NotifyOne() { pthread_cond_signal(&cv_); }
 
   /// Notify all waiters on this condition variable.
-  inline void NotifyAll() { pthread_cond_broadcast(&cv_); }
+  void NotifyAll() { pthread_cond_broadcast(&cv_); }
 
  private:
   pthread_cond_t cv_;

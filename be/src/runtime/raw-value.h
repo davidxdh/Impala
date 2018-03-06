@@ -54,15 +54,16 @@ class RawValue {
                                 std::stringstream* stream);
 
   /// Returns hash value for 'v' interpreted as 'type'.  The resulting hash value
-  /// is combined with the seed value.
+  /// is combined with the seed value. Inlined in IR so that the constant 'type' can be
+  /// propagated.
   static uint32_t IR_ALWAYS_INLINE GetHashValue(
       const void* v, const ColumnType& type, uint32_t seed = 0) noexcept;
 
   /// Templatized version of GetHashValue, use if type is known ahead. GetHashValue
-  /// handles nulls.
+  /// handles nulls. Inlined in IR so that the constant 'type' can be propagated.
   template<typename T>
-  static inline uint32_t IR_ALWAYS_INLINE GetHashValue(const T* v, const ColumnType& type,
-      uint32_t seed = 0) noexcept;
+  static inline uint32_t IR_ALWAYS_INLINE GetHashValue(
+      const T* v, const ColumnType& type, uint32_t seed = 0) noexcept;
 
   /// Returns hash value for non-nullable 'v' for type T. GetHashValueNonNull doesn't
   /// handle nulls.
@@ -70,16 +71,16 @@ class RawValue {
   static inline uint32_t GetHashValueNonNull(const T* v, const ColumnType& type,
       uint32_t seed = 0);
 
-  /// Get a 32-bit hash value using the FNV hash function.
-  /// Using different seeds with FNV results in different hash functions.
-  /// GetHashValue() does not have this property and cannot be safely used as the first
-  /// step in data repartitioning. However, GetHashValue() can be significantly faster.
-  /// TODO: fix GetHashValue
-  static uint32_t GetHashValueFnv(const void* v, const ColumnType& type, uint32_t seed);
+  /// Get a 64-bit hash value using the FastHash function.
+  /// https://code.google.com/archive/p/fast-hash/
+  static uint64_t GetHashValueFastHash(const void* v, const ColumnType& type,
+      uint64_t seed);
 
   /// Compares both values.
   /// Return value is < 0  if v1 < v2, 0 if v1 == v2, > 0 if v1 > v2.
-  static int Compare(const void* v1, const void* v2, const ColumnType& type);
+  /// Inlined in IR so that the constant 'type' can be propagated.
+  static int IR_ALWAYS_INLINE Compare(
+      const void* v1, const void* v2, const ColumnType& type) noexcept;
 
   /// Writes the bytes of a given value into the slot of a tuple.
   /// For string values, the string data is copied into memory allocated from 'pool'

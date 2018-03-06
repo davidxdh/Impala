@@ -68,16 +68,16 @@ public class SelectStmt extends QueryStmt {
   // set if we have AnalyticExprs in the select list/order by clause
   private AnalyticInfo analyticInfo_;
 
-  // SQL string of this SelectStmt before inline-view expression substitution.
-  // Set in analyze().
-  protected String sqlString_;
-
   // substitutes all exprs in this select block to reference base tables
   // directly
   private ExprSubstitutionMap baseTblSmap_ = new ExprSubstitutionMap();
 
   // END: Members that need to be reset()
   /////////////////////////////////////////
+
+  // SQL string of this SelectStmt before inline-view expression substitution.
+  // Set in analyze().
+  protected String sqlString_;
 
   SelectStmt(SelectList selectList,
              FromClause fromClause,
@@ -151,6 +151,7 @@ public class SelectStmt extends QueryStmt {
     if (isAnalyzed()) return;
     super.analyze(analyzer);
 
+    // Start out with table refs to establish aliases.
     fromClause_.analyze(analyzer);
 
     // Generate !empty() predicates to filter out empty collections.
@@ -290,6 +291,14 @@ public class SelectStmt extends QueryStmt {
    * - collection table ref is relative and non-correlated
    * - collection table ref represents the rhs of an inner/cross/semi join
    * - collection table ref's parent tuple is not outer joined
+   *
+   * Example: table T has field A which is of type array<array<int>>.
+   * 1) ... T join T.A a join a.item a_nest ... : all nodes on the path T -> a -> a_nest
+   *                                              are required so are checked for !empty.
+   * 2) ... T left outer join T.A a join a.item a_nest ... : no !empty.
+   * 3) ... T join T.A a left outer join a.item a_nest ... : a checked for !empty.
+   * 4) ... T left outer join T.A a left outer join a.item a_nest ... : no !empty.
+   *
    *
    * TODO: In some cases, it is possible to generate !empty() predicates for a correlated
    * table ref, but in general, that is not correct for non-trivial query blocks.
@@ -725,11 +734,10 @@ public class SelectStmt extends QueryStmt {
     for (int i = 0; i < selectList_.getItems().size(); ++i) {
       if (!resultExprs_.get(i).isBound(finalAggInfo.getOutputTupleId())) {
         SelectListItem selectListItem = selectList_.getItems().get(i);
-        Preconditions.checkState(!selectListItem.isStar());
         throw new AnalysisException(
             "select list expression not produced by aggregation output "
             + "(missing from GROUP BY clause?): "
-            + selectListItem.getExpr().toSql());
+            + selectListItem.toSql());
       }
     }
     if (orderByElements_ != null) {
@@ -1012,13 +1020,19 @@ public class SelectStmt extends QueryStmt {
   }
 
   @Override
-  public void collectTableRefs(List<TableRef> tblRefs) {
-    for (TableRef tblRef: fromClause_) {
-      if (tblRef instanceof InlineViewRef) {
-        InlineViewRef inlineViewRef = (InlineViewRef) tblRef;
-        inlineViewRef.getViewStmt().collectTableRefs(tblRefs);
-      } else {
-        tblRefs.add(tblRef);
+  protected void collectTableRefs(List<TableRef> tblRefs, boolean fromClauseOnly) {
+    super.collectTableRefs(tblRefs, fromClauseOnly);
+    if (fromClauseOnly) {
+      fromClause_.collectFromClauseTableRefs(tblRefs);
+    } else {
+      fromClause_.collectTableRefs(tblRefs);
+    }
+    if (!fromClauseOnly && whereClause_ != null) {
+      // Collect TableRefs in WHERE-clause subqueries.
+      List<Subquery> subqueries = Lists.newArrayList();
+      whereClause_.collect(Subquery.class, subqueries);
+      for (Subquery sq: subqueries) {
+        sq.getStatement().collectTableRefs(tblRefs, fromClauseOnly);
       }
     }
   }
@@ -1029,10 +1043,13 @@ public class SelectStmt extends QueryStmt {
     selectList_.reset();
     colLabels_.clear();
     fromClause_.reset();
-    baseTblSmap_.clear();
     if (whereClause_ != null) whereClause_.reset();
     if (groupingExprs_ != null) Expr.resetList(groupingExprs_);
     if (havingClause_ != null) havingClause_.reset();
+    havingPred_ = null;
+    aggInfo_ = null;
+    analyticInfo_ = null;
+    baseTblSmap_.clear();
   }
 
   @Override

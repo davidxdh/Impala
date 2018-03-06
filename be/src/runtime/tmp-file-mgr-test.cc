@@ -17,6 +17,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <numeric>
 
 #include <boost/filesystem.hpp>
 #include <boost/scoped_ptr.hpp>
@@ -46,12 +47,15 @@ DECLARE_int32(stress_scratch_write_delay_ms);
 
 namespace impala {
 
+using namespace io;
+
 class TmpFileMgrTest : public ::testing::Test {
  public:
   virtual void SetUp() {
     metrics_.reset(new MetricGroup("tmp-file-mgr-test"));
-    profile_ = obj_pool_.Add(new RuntimeProfile(&obj_pool_, "tmp-file-mgr-test"));
+    profile_ = RuntimeProfile::Create(&obj_pool_, "tmp-file-mgr-test");
     test_env_.reset(new TestEnv);
+    ASSERT_OK(test_env_->Init());
     cb_counter_ = 0;
 
     // Reset query options that are modified by tests.
@@ -74,7 +78,7 @@ class TmpFileMgrTest : public ::testing::Test {
     vector<TmpFileMgr::DeviceId> active = tmp_file_mgr->ActiveTmpDevices();
     IntGauge* active_metric =
         metrics_->FindMetricForTesting<IntGauge>("tmp-file-mgr.active-scratch-dirs");
-    EXPECT_EQ(active.size(), active_metric->value());
+    EXPECT_EQ(active.size(), active_metric->GetValue());
     SetMetric<string>* active_set_metric =
         metrics_->FindMetricForTesting<SetMetric<string>>(
         "tmp-file-mgr.active-scratch-dirs.list");
@@ -128,9 +132,9 @@ class TmpFileMgrTest : public ::testing::Test {
     group->next_allocation_index_ = value;
   }
 
-  /// Helper to cancel the FileGroup DiskIoRequestContext.
+  /// Helper to cancel the FileGroup RequestContext.
   static void CancelIoContext(TmpFileMgr::FileGroup* group) {
-    group->io_mgr_->CancelContext(group->io_ctx_);
+    group->io_mgr_->CancelContext(group->io_ctx_.get());
   }
 
   /// Helper to get the # of bytes allocated by the group. Validates that the sum across
@@ -142,6 +146,12 @@ class TmpFileMgrTest : public ::testing::Test {
     }
     EXPECT_EQ(bytes_allocated, group->current_bytes_allocated_);
     return bytes_allocated;
+  }
+
+  /// Helpers to call WriteHandle methods.
+  void Cancel(TmpFileMgr::WriteHandle* handle) { handle->Cancel(); }
+  void WaitForWrite(TmpFileMgr::WriteHandle* handle) {
+    handle->WaitForWrite();
   }
 
   // Write callback, which signals 'cb_cv_' and increments 'cb_counter_'.
@@ -232,7 +242,7 @@ TEST_F(TmpFileMgrTest, TestOneDirPerDevice) {
   TmpFileMgr::File* file = files[0];
   // Check the prefix is the expected temporary directory.
   EXPECT_EQ(0, file->path().find(tmp_dirs[0]));
-  FileSystemUtil::RemovePaths(tmp_dirs);
+  ASSERT_OK(FileSystemUtil::RemovePaths(tmp_dirs));
   file_group.Close();
   CheckMetrics(&tmp_file_mgr);
 }
@@ -259,7 +269,7 @@ TEST_F(TmpFileMgrTest, TestMultiDirsPerDevice) {
     // Check the prefix is the expected temporary directory.
     EXPECT_EQ(0, files[i]->path().find(tmp_dirs[i]));
   }
-  FileSystemUtil::RemovePaths(tmp_dirs);
+  ASSERT_OK(FileSystemUtil::RemovePaths(tmp_dirs));
   file_group.Close();
   CheckMetrics(&tmp_file_mgr);
 }
@@ -305,7 +315,7 @@ TEST_F(TmpFileMgrTest, TestReportError) {
   // Attempts to allocate new files on bad device should succeed.
   unique_ptr<TmpFileMgr::File> bad_file2;
   ASSERT_OK(NewFile(&tmp_file_mgr, &file_group, bad_device, &bad_file2));
-  FileSystemUtil::RemovePaths(tmp_dirs);
+  ASSERT_OK(FileSystemUtil::RemovePaths(tmp_dirs));
   file_group.Close();
   CheckMetrics(&tmp_file_mgr);
 }
@@ -336,7 +346,7 @@ TEST_F(TmpFileMgrTest, TestAllocateNonWritable) {
   ASSERT_OK(FileAllocateSpace(allocated_files[1], 1, &offset));
 
   chmod(scratch_subdirs[0].c_str(), S_IRWXU);
-  FileSystemUtil::RemovePaths(tmp_dirs);
+  ASSERT_OK(FileSystemUtil::RemovePaths(tmp_dirs));
   file_group.Close();
 }
 
@@ -376,6 +386,7 @@ TEST_F(TmpFileMgrTest, TestScratchLimit) {
   status = GroupAllocateSpace(&file_group, 1, &alloc_file, &offset);
   ASSERT_FALSE(status.ok());
   ASSERT_EQ(status.code(), TErrorCode::SCRATCH_LIMIT_EXCEEDED);
+  ASSERT_NE(string::npos, status.msg().msg().find(GetBackendString()));
 
   file_group.Close();
 }
@@ -395,7 +406,7 @@ TEST_F(TmpFileMgrTest, TestScratchRangeRecycling) {
       std::iota(data[i].begin(), data[i].end(), i);
     }
 
-    DiskIoMgr::WriteRange::WriteDoneCallback callback =
+    WriteRange::WriteDoneCallback callback =
         bind(mem_fn(&TmpFileMgrTest::SignalCallback), this, _1);
     vector<unique_ptr<TmpFileMgr::WriteHandle>> handles(BLOCKS);
     // 'file_group' should allocate extra scratch bytes for this 'alloc_size'.
@@ -440,7 +451,7 @@ TEST_F(TmpFileMgrTest, TestProcessMemLimitExceeded) {
   CancelIoContext(&file_group);
 
   // After this error, writing via the file group should fail.
-  DiskIoMgr::WriteRange::WriteDoneCallback callback =
+  WriteRange::WriteDoneCallback callback =
       bind(mem_fn(&TmpFileMgrTest::SignalCallback), this, _1);
   unique_ptr<TmpFileMgr::WriteHandle> handle;
   Status status = file_group.Write(MemRange(data.data(), DATA_SIZE), callback, &handle);
@@ -469,25 +480,27 @@ TEST_F(TmpFileMgrTest, TestEncryptionDuringCancellation) {
   // Write out a string repeatedly. We don't want to see this written unencypted to disk.
   string plaintext("the quick brown fox jumped over the lazy dog");
   for (int pos = 0; pos + plaintext.size() < DATA_SIZE; pos += plaintext.size()) {
-    memcpy(&data[pos], &plaintext[0], plaintext.size());
+    memcpy(&data[pos], plaintext.data(), plaintext.size());
   }
 
   // Start a write in flight, which should encrypt the data and write it to disk.
   unique_ptr<TmpFileMgr::WriteHandle> handle;
-  DiskIoMgr::WriteRange::WriteDoneCallback callback =
+  WriteRange::WriteDoneCallback callback =
       bind(mem_fn(&TmpFileMgrTest::SignalCallback), this, _1);
   ASSERT_OK(file_group.Write(data_mem_range, callback, &handle));
   string file_path = handle->TmpFilePath();
 
   // Cancel the write - prior to the IMPALA-4820 fix decryption could race with the write.
-  ASSERT_OK(file_group.CancelWriteAndRestoreData(move(handle), data_mem_range));
+  Cancel(handle.get());
+  WaitForWrite(handle.get());
+  ASSERT_OK(file_group.RestoreData(move(handle), data_mem_range));
   WaitForCallbacks(1);
 
   // Read the data from the scratch file and check that the plaintext isn't present.
   FILE* file = fopen(file_path.c_str(), "r");
   ASSERT_EQ(DATA_SIZE, fread(&data[0], 1, DATA_SIZE, file));
   for (int pos = 0; pos + plaintext.size() < DATA_SIZE; pos += plaintext.size()) {
-    ASSERT_NE(0, memcmp(&data[pos], &plaintext[0], plaintext.size()))
+    ASSERT_NE(0, memcmp(&data[pos], plaintext.data(), plaintext.size()))
         << file_path << "@" << pos;
   }
   fclose(file);

@@ -19,6 +19,7 @@
 #ifndef IMPALA_COMMON_STATUS_H
 #define IMPALA_COMMON_STATUS_H
 
+#include <iosfwd>
 #include <string>
 #include <vector>
 
@@ -32,6 +33,8 @@
 #define STATUS_API_VERSION 2
 
 namespace impala {
+
+class StatusPB;
 
 /// Status is used as a function return type to indicate success, failure or cancellation
 /// of the function. In case of successful completion, it only occupies sizeof(void*)
@@ -79,7 +82,7 @@ namespace impala {
 /// TODO: macros:
 /// RETURN_IF_ERROR(status) << "msg"
 /// MAKE_ERROR() << "msg"
-class Status {
+class NODISCARD Status {
  public:
   typedef strings::internal::SubstituteArg ArgType;
 
@@ -90,6 +93,7 @@ class Status {
 
   // Return a MEM_LIMIT_EXCEEDED error status.
   static Status MemLimitExceeded();
+  static Status MemLimitExceeded(const std::string& details);
 
   static const Status CANCELLED;
   static const Status DEPRECATED_RPC;
@@ -105,7 +109,7 @@ class Status {
 
   /// Status using only the error code as a parameter. This can be used for error messages
   /// that don't take format parameters.
-  Status(TErrorCode::type code);
+  explicit Status(TErrorCode::type code);
 
   /// These constructors are used if the caller wants to indicate a non-successful
   /// execution and supply a client-facing error message. This is the preferred way of
@@ -138,12 +142,24 @@ class Status {
 
   /// Used when the ErrorMsg is created as an intermediate value that is either passed to
   /// the Status or to the RuntimeState.
-  Status(const ErrorMsg& e);
+  explicit Status(const ErrorMsg& e);
 
   /// This constructor creates a Status with a default error code of GENERAL and is not
   /// intended for statuses that might be client-visible.
   /// TODO: deprecate
-  Status(const std::string& error_msg);
+  explicit Status(const std::string& error_msg);
+
+  /// "Copy" c'tor from TStatus.
+  /// Retains the TErrorCode value and the message
+  explicit Status(const TStatus& status);
+
+  /// "Copy" c'tor from StatusPB (a protobuf serialized version of Status object).
+  /// Retains the TErrorCode value and the message
+  explicit Status(const StatusPB& status);
+
+  /// "Copy c'tor from HS2 TStatus.
+  /// Retains the TErrorCode value and the message
+  explicit Status(const apache::hive::service::cli::thrift::TStatus& hs2_status);
 
   /// Create a status instance that represents an expected error and will not be logged
   static Status Expected(const ErrorMsg& e);
@@ -174,19 +190,9 @@ class Status {
     if (UNLIKELY(msg_ != NULL)) FreeMessage();
   }
 
-  /// "Copy" c'tor from TStatus.
-  /// Retains the TErrorCode value and the message
-  Status(const TStatus& status);
-
-  /// same as previous c'tor
   /// Retains the TErrorCode value and the message
   Status& operator=(const TStatus& status);
 
-  /// "Copy c'tor from HS2 TStatus.
-  /// Retains the TErrorCode value and the message
-  Status(const apache::hive::service::cli::thrift::TStatus& hs2_status);
-
-  /// same as previous c'tor
   /// Retains the TErrorCode value and the message
   Status& operator=(const apache::hive::service::cli::thrift::TStatus& hs2_status);
 
@@ -201,9 +207,19 @@ class Status {
         && msg_->error() == TErrorCode::MEM_LIMIT_EXCEEDED;
   }
 
+  bool IsInternalError() const {
+    return msg_ != NULL
+        && msg_->error() == TErrorCode::INTERNAL_ERROR;
+  }
+
   bool IsRecoverableError() const {
     return msg_ != NULL
         && msg_->error() == TErrorCode::RECOVERABLE_ERROR;
+  }
+
+  bool IsDiskIoError() const {
+    return msg_ != NULL
+        && msg_->error() == TErrorCode::DISK_IO_ERROR;
   }
 
   /// Returns the error message associated with a non-successful status.
@@ -230,6 +246,9 @@ class Status {
   /// Convert into TStatus.
   void ToThrift(TStatus* status) const;
 
+  /// Serialize into StatusPB
+  void ToProto(StatusPB* status) const;
+
   /// Returns the formatted message of the error message and the individual details of the
   /// additional messages as a single string. This should only be called internally and
   /// not to report an error back to the client.
@@ -239,6 +258,7 @@ class Status {
     return msg_ == NULL ? TErrorCode::OK : msg_->error();
   }
 
+  static const char* LLVM_CLASS_NAME;
  private:
 
   // Status constructors that can suppress logging via 'silent' parameter
@@ -251,21 +271,35 @@ class Status {
   // A non-inline function for freeing status' message.
   void FreeMessage() noexcept;
 
+  /// A non-inline function for unwrapping a TStatus object.
+  void FromThrift(const TStatus& status);
+
+  /// A non-inline function for unwrapping a StatusPB object.
+  void FromProto(const StatusPB& status);
+
   /// Status uses a naked pointer to ensure the size of an instance on the stack is only
   /// the sizeof(ErrorMsg*). Every Status owns its ErrorMsg instance.
   ErrorMsg* msg_;
 };
 
+/// for debugging
+std::ostream& operator<<(std::ostream& os, const Status& status);
+
 /// some generally useful macros
 #define RETURN_IF_ERROR(stmt)                          \
   do {                                                 \
-    Status __status__ = (stmt);                        \
+    ::impala::Status __status__ = (stmt);              \
     if (UNLIKELY(!__status__.ok())) return __status__; \
+  } while (false)
+
+#define RETURN_VOID_IF_ERROR(stmt)                     \
+  do {                                                 \
+    if (UNLIKELY(!(stmt).ok())) return;                \
   } while (false)
 
 #define ABORT_IF_ERROR(stmt) \
   do { \
-    Status __status__ = (stmt); \
+    ::impala::Status __status__ = (stmt); \
     if (UNLIKELY(!__status__.ok())) { \
       ABORT_WITH_ERROR(__status__.GetDetail()); \
     } \

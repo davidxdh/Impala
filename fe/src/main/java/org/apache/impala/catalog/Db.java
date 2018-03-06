@@ -24,22 +24,20 @@ import java.util.List;
 import java.util.Map;
 
 import org.apache.commons.codec.binary.Base64;
-import org.apache.thrift.protocol.TCompactProtocol;
 import org.apache.thrift.TException;
 import org.apache.thrift.TSerializer;
+import org.apache.thrift.protocol.TCompactProtocol;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import org.apache.impala.catalog.Function;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.ImpalaRuntimeException;
-import org.apache.impala.common.JniUtil;
+import org.apache.impala.thrift.TCatalogObject;
 import org.apache.impala.thrift.TCatalogObjectType;
 import org.apache.impala.thrift.TDatabase;
-import org.apache.impala.thrift.TFunction;
 import org.apache.impala.thrift.TFunctionBinaryType;
 import org.apache.impala.thrift.TFunctionCategory;
 import org.apache.impala.util.PatternMatcher;
+
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
@@ -59,11 +57,9 @@ import com.google.common.collect.Maps;
  * value is the base64 representation of the thrift serialized function object.
  *
  */
-public class Db implements CatalogObject {
+public class Db extends CatalogObjectImpl {
   private static final Logger LOG = LoggerFactory.getLogger(Db.class);
-  private final Catalog parentCatalog_;
   private final TDatabase thriftDb_;
-  private long catalogVersion_ = Catalog.INITIAL_CATALOG_VERSION;
 
   public static final String FUNCTION_INDEX_PREFIX = "impala_registered_function_";
 
@@ -87,10 +83,8 @@ public class Db implements CatalogObject {
   // (e.g. can't drop it, can't add tables to it, etc).
   private boolean isSystemDb_ = false;
 
-  public Db(String name, Catalog catalog,
-      org.apache.hadoop.hive.metastore.api.Database msDb) {
+  public Db(String name, org.apache.hadoop.hive.metastore.api.Database msDb) {
     thriftDb_ = new TDatabase(name.toLowerCase());
-    parentCatalog_ = catalog;
     thriftDb_.setMetastore_db(msDb);
     tableCache_ = new CatalogObjectCache<Table>();
     functions_ = new HashMap<String, List<Function>>();
@@ -101,8 +95,8 @@ public class Db implements CatalogObject {
   /**
    * Creates a Db object with no tables based on the given TDatabase thrift struct.
    */
-  public static Db fromTDatabase(TDatabase db, Catalog parentCatalog) {
-    return new Db(db.getDb_name(), parentCatalog, db.getMetastore_db());
+  public static Db fromTDatabase(TDatabase db) {
+    return new Db(db.getDb_name(), db.getMetastore_db());
   }
 
   /**
@@ -134,16 +128,14 @@ public class Db implements CatalogObject {
   @Override
   public String getName() { return thriftDb_.getDb_name(); }
   @Override
-  public TCatalogObjectType getCatalogObjectType() {
-    return TCatalogObjectType.DATABASE;
-  }
+  public TCatalogObjectType getCatalogObjectType() { return TCatalogObjectType.DATABASE; }
+  @Override
+  public String getUniqueName() { return "DATABASE:" + getName().toLowerCase(); }
 
   /**
    * Adds a table to the table cache.
    */
-  public void addTable(Table table) {
-    tableCache_.add(table);
-  }
+  public void addTable(Table table) { tableCache_.add(table); }
 
   /**
    * Gets all table names in the table cache.
@@ -165,9 +157,7 @@ public class Db implements CatalogObject {
    * Returns the Table with the given name if present in the table cache or null if the
    * table does not exist in the cache.
    */
-  public Table getTable(String tblName) {
-    return tableCache_.get(tblName);
-  }
+  public Table getTable(String tblName) { return tableCache_.get(tblName); }
 
   /**
    * Removes the table name and any cached metadata from the Table cache.
@@ -365,6 +355,12 @@ public class Db implements CatalogObject {
     }
   }
 
+  public void removeAllFunctions() {
+    synchronized (functions_) {
+      functions_.clear();
+    }
+  }
+
   /**
    * Removes a Function with the matching signature string. Returns the removed Function
    * if a Function was removed as a result of this call, null otherwise.
@@ -414,7 +410,7 @@ public class Db implements CatalogObject {
    * This is not thread safe so a higher level lock must be taken while iterating
    * over the returned functions.
    */
-  protected HashMap<String, List<Function>> getAllFunctions() {
+  public HashMap<String, List<Function>> getAllFunctions() {
     return functions_;
   }
 
@@ -489,11 +485,10 @@ public class Db implements CatalogObject {
     return result;
   }
 
-  @Override
-  public long getCatalogVersion() { return catalogVersion_; }
-  @Override
-  public void setCatalogVersion(long newVersion) { catalogVersion_ = newVersion; }
-
-  @Override
-  public boolean isLoaded() { return true; }
+  public TCatalogObject toTCatalogObject() {
+    TCatalogObject catalogObj =
+        new TCatalogObject(getCatalogObjectType(), getCatalogVersion());
+    catalogObj.setDb(toThrift());
+    return catalogObj;
+  }
 }

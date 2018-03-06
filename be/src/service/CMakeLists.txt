@@ -21,28 +21,33 @@ set(LIBRARY_OUTPUT_PATH "${BUILD_OUTPUT_ROOT_DIRECTORY}/service")
 # where to put generated binaries.
 set(EXECUTABLE_OUTPUT_PATH "${BUILD_OUTPUT_ROOT_DIRECTORY}/service")
 
+# Mark the protobuf file as generated
+set_source_files_properties(${DATA_STREAM_SVC_PROTO_SRCS} PROPERTIES GENERATED TRUE)
+
 add_library(Service
+  child-query.cc
+  client-request-state.cc
+  ${DATA_STREAM_SVC_PROTO_SRCS}
+  data-stream-service.cc
   frontend.cc
   fe-support.cc
   hs2-util.cc
-  impala-server.cc
-  impala-http-handler.cc
-  impala-hs2-server.cc
   impala-beeswax-server.cc
+  impala-hs2-server.cc
+  impala-http-handler.cc
   impala-internal-service.cc
-  query-exec-state.cc
+  impalad-main.cc
+  impala-server.cc
   query-options.cc
   query-result-set.cc
-  child-query.cc
-  impalad-main.cc
 )
-add_dependencies(Service thrift-deps)
+add_dependencies(Service gen-deps)
 
 # this shared library provides Impala executor functionality to FE test.
 add_library(fesupport SHARED
   fe-support.cc
 )
-add_dependencies(fesupport thrift-deps)
+add_dependencies(fesupport gen-deps)
 
 target_link_libraries(fesupport ${IMPALA_LINK_LIBS_DYNAMIC_TARGETS})
 

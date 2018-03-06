@@ -26,7 +26,6 @@
 #include "common/names.h"
 
 using namespace apache::hive::service::cli::thrift;
-using namespace llvm;
 
 namespace impala {
 
@@ -49,7 +48,8 @@ ColumnType::ColumnType(const std::vector<TTypeNode>& types, int* idx)
       DCHECK(node.__isset.scalar_type);
       const TScalarType scalar_type = node.scalar_type;
       type = ThriftToType(scalar_type.type);
-      if (type == TYPE_CHAR || type == TYPE_VARCHAR) {
+      if (type == TYPE_CHAR || type == TYPE_VARCHAR
+          || type == TYPE_FIXED_UDA_INTERMEDIATE) {
         DCHECK(scalar_type.__isset.len);
         len = scalar_type.len;
       } else if (type == TYPE_DECIMAL) {
@@ -108,6 +108,7 @@ PrimitiveType ThriftToType(TPrimitiveType::type ttype) {
     case TPrimitiveType::BINARY: return TYPE_BINARY;
     case TPrimitiveType::DECIMAL: return TYPE_DECIMAL;
     case TPrimitiveType::CHAR: return TYPE_CHAR;
+    case TPrimitiveType::FIXED_UDA_INTERMEDIATE: return TYPE_FIXED_UDA_INTERMEDIATE;
     default: return INVALID_TYPE;
   }
 }
@@ -131,6 +132,7 @@ TPrimitiveType::type ToThrift(PrimitiveType ptype) {
     case TYPE_BINARY: return TPrimitiveType::BINARY;
     case TYPE_DECIMAL: return TPrimitiveType::DECIMAL;
     case TYPE_CHAR: return TPrimitiveType::CHAR;
+    case TYPE_FIXED_UDA_INTERMEDIATE: return TPrimitiveType::FIXED_UDA_INTERMEDIATE;
     case TYPE_STRUCT:
     case TYPE_ARRAY:
     case TYPE_MAP:
@@ -158,6 +160,7 @@ string TypeToString(PrimitiveType t) {
     case TYPE_BINARY: return "BINARY";
     case TYPE_DECIMAL: return "DECIMAL";
     case TYPE_CHAR: return "CHAR";
+    case TYPE_FIXED_UDA_INTERMEDIATE: return "FIXED_UDA_INTERMEDIATE";
     case TYPE_STRUCT: return "STRUCT";
     case TYPE_ARRAY: return "ARRAY";
     case TYPE_MAP: return "MAP";
@@ -188,6 +191,10 @@ string TypeToOdbcString(PrimitiveType t) {
     case TYPE_STRUCT: return "struct";
     case TYPE_ARRAY: return "array";
     case TYPE_MAP: return "map";
+    case TYPE_FIXED_UDA_INTERMEDIATE:
+      // This type is not exposed to clients and should not be returned.
+      DCHECK(false);
+      break;
   };
   return "unknown";
 }
@@ -217,7 +224,8 @@ void ColumnType::ToThrift(TColumnType* thrift_type) const {
     node.__set_scalar_type(TScalarType());
     TScalarType& scalar_type = node.scalar_type;
     scalar_type.__set_type(impala::ToThrift(type));
-    if (type == TYPE_CHAR || type == TYPE_VARCHAR) {
+    if (type == TYPE_CHAR || type == TYPE_VARCHAR
+        || type == TYPE_FIXED_UDA_INTERMEDIATE) {
       DCHECK_NE(len, -1);
       scalar_type.__set_len(len);
     } else if (type == TYPE_DECIMAL) {
@@ -293,7 +301,8 @@ TTypeEntry ColumnType::ToHs2Type() const {
       break;
     }
     default:
-      // HiveServer2 does not have a type for invalid, date and datetime.
+      // HiveServer2 does not have a type for invalid, date, datetime or
+      // fixed_uda_intermediate.
       DCHECK(false) << "bad TypeToTValueType() type: " << DebugString();
       type_entry.__set_type(TTypeId::STRING_TYPE);
   };
@@ -315,6 +324,9 @@ string ColumnType::DebugString() const {
     case TYPE_VARCHAR:
       ss << "VARCHAR(" << len << ")";
       return ss.str();
+    case TYPE_FIXED_UDA_INTERMEDIATE:
+      ss << "FIXED_UDA_INTERMEDIATE(" << len << ")";
+      return ss.str();
     default:
       return TypeToString(type);
   }
@@ -331,28 +343,30 @@ ostream& operator<<(ostream& os, const ColumnType& type) {
   return os;
 }
 
-ConstantStruct* ColumnType::ToIR(LlvmCodeGen* codegen) const {
+llvm::ConstantStruct* ColumnType::ToIR(LlvmCodeGen* codegen) const {
   // ColumnType = { i32, i32, i32, i32, <vector>, <vector> }
-  StructType* column_type_type = cast<StructType>(codegen->GetType(LLVM_CLASS_NAME));
+  llvm::StructType* column_type_type = codegen->GetStructType<ColumnType>();
 
   DCHECK_EQ(sizeof(type), sizeof(int32_t));
-  Constant* type_field = ConstantInt::get(codegen->int_type(), type);
+  llvm::Constant* type_field = codegen->GetI32Constant(type);
   DCHECK_EQ(sizeof(len), sizeof(int32_t));
-  Constant* len_field = ConstantInt::get(codegen->int_type(), len);
+  llvm::Constant* len_field = codegen->GetI32Constant(len);
   DCHECK_EQ(sizeof(precision), sizeof(int32_t));
-  Constant* precision_field = ConstantInt::get(codegen->int_type(), precision);
+  llvm::Constant* precision_field = codegen->GetI32Constant(precision);
   DCHECK_EQ(sizeof(scale), sizeof(int32_t));
-  Constant* scale_field = ConstantInt::get(codegen->int_type(), scale);
+  llvm::Constant* scale_field = codegen->GetI32Constant(scale);
 
   // Create empty 'children' and 'field_names' vectors
   DCHECK(children.empty()) << "Nested types NYI";
   DCHECK(field_names.empty()) << "Nested types NYI";
-  Constant* children_field = Constant::getNullValue(column_type_type->getElementType(4));
-  Constant* field_names_field =
-      Constant::getNullValue(column_type_type->getElementType(5));
+  llvm::Constant* children_field =
+      llvm::Constant::getNullValue(column_type_type->getElementType(4));
+  llvm::Constant* field_names_field =
+      llvm::Constant::getNullValue(column_type_type->getElementType(5));
 
-  return cast<ConstantStruct>(ConstantStruct::get(column_type_type, type_field, len_field,
-      precision_field, scale_field, children_field, field_names_field, NULL));
+  return llvm::cast<llvm::ConstantStruct>(
+      llvm::ConstantStruct::get(column_type_type, type_field, len_field, precision_field,
+          scale_field, children_field, field_names_field, NULL));
 }
 
 }

@@ -29,9 +29,6 @@ class HistogramMetric;
 /// Contains the keys (strings) for impala metrics.
 class ImpaladMetricKeys {
  public:
-  /// Local time that the server started
-  static const char* IMPALA_SERVER_START_TIME;
-
   /// Full version string of the Impala server
   static const char* IMPALA_SERVER_VERSION;
 
@@ -109,8 +106,20 @@ class ImpaladMetricKeys {
   /// Number of cache misses for cached HDFS file handles
   static const char* IO_MGR_CACHED_FILE_HANDLES_MISS_COUNT;
 
+  /// Number of cached file handles that hit an error and were reopened
+  static const char* IO_MGR_CACHED_FILE_HANDLES_REOPENED;
+
   /// Number of DBs in the catalog
   static const char* CATALOG_NUM_DBS;
+
+  /// Current version of catalog with impalad.
+  static const char* CATALOG_VERSION;
+
+  /// Catalog topic version  with impalad.
+  static const char* CATALOG_TOPIC_VERSION;
+
+  /// ServiceID of Catalog with impalad.
+  static const char* CATALOG_SERVICE_ID;
 
   /// Number of tables in the catalog
   static const char* CATALOG_NUM_TABLES;
@@ -130,6 +139,10 @@ class ImpaladMetricKeys {
   /// Number of queries expired due to inactivity
   static const char* NUM_QUERIES_EXPIRED;
 
+  /// Number of queries currently registered on this server, i.e. that have been
+  /// registered but are not yet unregistered.
+  static const char* NUM_QUERIES_REGISTERED;
+
   /// Number of queries that spilled.
   static const char* NUM_QUERIES_SPILLED;
 
@@ -139,9 +152,17 @@ class ImpaladMetricKeys {
   /// Total bytes consumed for rows cached to support HS2 FETCH_FIRST.
   static const char* RESULTSET_CACHE_TOTAL_BYTES;
 
-  // Distribution of execution times for queries and DDL statements, in ms.
+  /// Distribution of execution times for queries and DDL statements, in ms.
   static const char* QUERY_DURATIONS;
   static const char* DDL_DURATIONS;
+
+  /// Total number of attempted hedged reads operations.
+  static const char* HEDGED_READ_OPS;
+
+  /// Total number of hedged reads operations that won
+  /// (i.e. returned faster than original read).
+  static const char* HEDGED_READ_OPS_WIN;
+
 };
 
 /// Global impalad-wide metrics.  This is useful for objects that want to update metrics
@@ -165,10 +186,15 @@ class ImpaladMetrics {
   static IntCounter* IO_MGR_CACHED_BYTES_READ;
   static IntCounter* IO_MGR_SHORT_CIRCUIT_BYTES_READ;
   static IntCounter* IO_MGR_BYTES_WRITTEN;
+  static IntCounter* IO_MGR_CACHED_FILE_HANDLES_REOPENED;
+  static IntCounter* HEDGED_READ_OPS;
+  static IntCounter* HEDGED_READ_OPS_WIN;
 
   // Gauges
   static IntGauge* CATALOG_NUM_DBS;
   static IntGauge* CATALOG_NUM_TABLES;
+  static IntGauge* CATALOG_VERSION;
+  static IntGauge* CATALOG_TOPIC_VERSION;
   static IntGauge* IMPALA_SERVER_NUM_OPEN_BEESWAX_SESSIONS;
   static IntGauge* IMPALA_SERVER_NUM_OPEN_HS2_SESSIONS;
   static IntGauge* IO_MGR_NUM_BUFFERS;
@@ -181,13 +207,14 @@ class ImpaladMetrics {
   static IntGauge* IO_MGR_TOTAL_BYTES;
   static IntGauge* MEM_POOL_TOTAL_BYTES;
   static IntGauge* NUM_FILES_OPEN_FOR_INSERT;
+  static IntGauge* NUM_QUERIES_REGISTERED;
   static IntGauge* RESULTSET_CACHE_TOTAL_NUM_ROWS;
   static IntGauge* RESULTSET_CACHE_TOTAL_BYTES;
   // Properties
   static BooleanProperty* CATALOG_READY;
   static BooleanProperty* IMPALA_SERVER_READY;
-  static StringProperty* IMPALA_SERVER_START_TIME;
   static StringProperty* IMPALA_SERVER_VERSION;
+  static StringProperty* CATALOG_SERVICE_ID;
   // Histograms
   static HistogramMetric* QUERY_DURATIONS;
   static HistogramMetric* DDL_DURATIONS;

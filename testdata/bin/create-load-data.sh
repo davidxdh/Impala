@@ -35,8 +35,7 @@ trap 'echo Error in $0 at line $LINENO: $(cd "'$PWD'" && awk "NR == $LINENO" $0)
 . ${IMPALA_HOME}/testdata/bin/run-step.sh
 
 # Environment variables used to direct the data loading process to an external cluster.
-# TODO: We need a better way of managing how these get set. See:
-# https://issues.cloudera.org/browse/IMPALA-4346
+# TODO: We need a better way of managing how these get set. See IMPALA-4346
 : ${HS2_HOST_PORT=localhost:11050}
 : ${HDFS_NN=localhost:20500}
 : ${IMPALAD=localhost:21000}
@@ -142,6 +141,7 @@ function load-custom-schemas {
   hadoop fs -mkdir ${SCHEMA_DEST_DIR}
   hadoop fs -put $SCHEMA_SRC_DIR/zipcode_incomes.parquet ${SCHEMA_DEST_DIR}/
   hadoop fs -put $SCHEMA_SRC_DIR/alltypestiny.parquet ${SCHEMA_DEST_DIR}/
+  hadoop fs -put $SCHEMA_SRC_DIR/enum ${SCHEMA_DEST_DIR}/
   hadoop fs -put $SCHEMA_SRC_DIR/malformed_decimal_tiny.parquet ${SCHEMA_DEST_DIR}/
   hadoop fs -put $SCHEMA_SRC_DIR/decimal.parquet ${SCHEMA_DEST_DIR}/
   hadoop fs -put $SCHEMA_SRC_DIR/nested/modern_nested.parquet ${SCHEMA_DEST_DIR}/
@@ -181,8 +181,7 @@ function load-data {
     WORKLOAD="functional"
   fi
 
-  # TODO: Why is there a REMOTE_LOAD condition?
-  # See https://issues.cloudera.org/browse/IMPALA-4347
+  # TODO: Why is there a REMOTE_LOAD condition? See IMPALA-4347
   #
   # Force load the dataset if we detect a schema change.
   if [[ -z "$REMOTE_LOAD" ]]; then
@@ -296,7 +295,7 @@ function copy-and-load-dependent-tables {
   # The error occurs while loading dependent tables.
   #
   # See: logs/data_loading/copy-and-load-dependent-tables.log)
-  # See also: https://issues.cloudera.org/browse/IMPALA-4345
+  # See also: IMPALA-4345
   hadoop fs -chmod -R 777 /tmp/alltypes_rc
   hadoop fs -chmod -R 777 /tmp/alltypes_seq
 
@@ -312,7 +311,7 @@ function create-internal-hbase-table {
   # Need to investigate this more, but this works around the problem to unblock automation.
   set +o errexit
   beeline -n $USER -u "${JDBC_URL}" -e\
-    "DROP TABLE IF EXISTS functional_hbase.internal_hbase_table"
+    "DROP TABLE IF EXISTS functional_hbase.internal_hbase_table;"
   echo "disable 'functional_hbase.internal_hbase_table'" | hbase shell
   echo "drop 'functional_hbase.internal_hbase_table'" | hbase shell
   set -e
@@ -341,8 +340,7 @@ function load-custom-data {
   # Cleanup the old bad_text_lzo files, if they exist.
   hadoop fs -rm -r -f /test-warehouse/bad_text_lzo/
 
-  # TODO: Why is there a REMOTE_LOAD condition?
-  # See https://issues.cloudera.org/browse/IMPALA-4347
+  # TODO: Why is there a REMOTE_LOAD condition? See IMPALA-4347
   if [[ -z $REMOTE_LOAD ]]; then
     # Index all lzo files in HDFS under /test-warehouse
     ${IMPALA_HOME}/testdata/bin/lzo_indexer.sh /test-warehouse
@@ -414,8 +412,7 @@ function build-and-copy-hive-udfs {
 
 # Additional data loading actions that must be executed after the main data is loaded.
 function custom-post-load-steps {
-  # TODO: Why is there a REMOTE_LOAD condition?
-  # See https://issues.cloudera.org/browse/IMPALA-4347
+  # TODO: Why is there a REMOTE_LOAD condition? See IMPALA-4347
   if [[ -z "$REMOTE_LOAD" ]]; then
     # Configure alltypes_seq as a read-only table. This is required for fe tests.
     # Set both read and execute permissions because accessing the contents of a directory on
@@ -452,6 +449,23 @@ function copy-and-load-ext-data-source {
     ${IMPALA_HOME}/testdata/bin/create-data-source-table.sql
 }
 
+function wait-hdfs-replication {
+  FAIL_COUNT=0
+  while [[ "$FAIL_COUNT" -ne "6" ]] ; do
+    FSCK_OUTPUT="$(hdfs fsck /test-warehouse)"
+    echo "$FSCK_OUTPUT"
+    if grep "Under-replicated blocks:[[:space:]]*0" <<< "$FSCK_OUTPUT"; then
+      return
+    fi
+    let FAIL_COUNT="$FAIL_COUNT"+1
+    sleep 5
+  done
+  echo "Some HDFS blocks are still under replicated after 30s."
+  echo "Some tests cannot pass without fully replicated blocks (IMPALA-3887)."
+  echo "Failing the data loading."
+  exit 1
+}
+
 # For kerberized clusters, use kerberos
 if ${CLUSTER_DIR}/admin is_kerberized; then
   LOAD_DATA_ARGS="${LOAD_DATA_ARGS} --use_kerberos --principal=${MINIKDC_PRINC_HIVE}"
@@ -480,9 +494,15 @@ fi
 
 if [ $SKIP_METADATA_LOAD -eq 0 ]; then
   run-step "Loading custom schemas" load-custom-schemas.log load-custom-schemas
-  run-step "Loading functional-query data" load-functional-query.log \
+  # Run some steps in parallel, with run-step-backgroundable / run-step-wait-all.
+  # This is effective on steps that take a long time and don't depend on each
+  # other. Functional-query takes about ~35 minutes, and TPC-H and TPC-DS can
+  # finish while functional-query is running.
+  run-step-backgroundable "Loading functional-query data" load-functional-query.log \
       load-data "functional-query" "exhaustive"
-  run-step "Loading TPC-H data" load-tpch.log load-data "tpch" "core"
+  run-step-backgroundable "Loading TPC-H data" load-tpch.log load-data "tpch" "core"
+  run-step-backgroundable "Loading TPC-DS data" load-tpcds.log load-data "tpcds" "core"
+  run-step-wait-all
   # Load tpch nested data.
   # TODO: Hacky and introduces more complexity into the system, but it is expedient.
   if [[ -n "$CM_HOST" ]]; then
@@ -490,7 +510,6 @@ if [ $SKIP_METADATA_LOAD -eq 0 ]; then
   fi
   run-step "Loading nested data" load-nested.log \
     ${IMPALA_HOME}/testdata/bin/load_nested.py ${LOAD_NESTED_ARGS:-}
-  run-step "Loading TPC-DS data" load-tpcds.log load-data "tpcds" "core"
   run-step "Loading auxiliary workloads" load-aux-workloads.log load-aux-workloads
   run-step "Loading dependent tables" copy-and-load-dependent-tables.log \
       copy-and-load-dependent-tables
@@ -505,13 +524,14 @@ fi
 
 if $KUDU_IS_SUPPORTED; then
   # Tests depend on the kudu data being clean, so load the data from scratch.
-  run-step "Loading Kudu functional" load-kudu.log \
+  run-step-backgroundable "Loading Kudu functional" load-kudu.log \
         load-data "functional-query" "core" "kudu/none/none" force
-  run-step "Loading Kudu TPCH" load-kudu-tpch.log \
+  run-step-backgroundable "Loading Kudu TPCH" load-kudu-tpch.log \
         load-data "tpch" "core" "kudu/none/none" force
 fi
-run-step "Loading Hive UDFs" build-and-copy-hive-udfs.log \
+run-step-backgroundable "Loading Hive UDFs" build-and-copy-hive-udfs.log \
     build-and-copy-hive-udfs
+run-step-wait-all
 run-step "Running custom post-load steps" custom-post-load-steps.log \
     custom-post-load-steps
 
@@ -531,6 +551,8 @@ if [ "${TARGET_FILESYSTEM}" = "hdfs" ]; then
 
   run-step "Creating internal HBase table" create-internal-hbase-table.log \
       create-internal-hbase-table
+
+  run-step "Waiting for HDFS replication" wait-hdfs-replication.log wait-hdfs-replication
 fi
 
 # TODO: Investigate why all stats are not preserved. Theoretically, we only need to

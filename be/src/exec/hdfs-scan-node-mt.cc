@@ -45,7 +45,8 @@ Status HdfsScanNodeMt::Prepare(RuntimeState* state) {
   // Return an error if this scan node has been assigned a range that is not supported
   // because the scanner of the corresponding file format does implement GetNext().
   for (const auto& files: per_type_files_) {
-    if (!files.second.empty() && files.first != THdfsFileFormat::PARQUET) {
+    if (!files.second.empty() && files.first != THdfsFileFormat::PARQUET
+        && files.first != THdfsFileFormat::TEXT) {
       stringstream msg;
       msg << "Unsupported file format with HdfsScanNodeMt: " << files.first;
       return Status(msg.str());
@@ -76,7 +77,7 @@ Status HdfsScanNodeMt::GetNext(RuntimeState* state, RowBatch* row_batch, bool* e
       scanner_.reset();
     }
     RETURN_IF_ERROR(
-        runtime_state_->io_mgr()->GetNextRange(reader_context_, &scan_range_));
+        runtime_state_->io_mgr()->GetNextRange(reader_context_.get(), &scan_range_));
     if (scan_range_ == NULL) {
       *eos = true;
       StopAndFinalizeCounters();
@@ -87,15 +88,21 @@ Status HdfsScanNodeMt::GetNext(RuntimeState* state, RowBatch* row_batch, bool* e
     int64_t partition_id = metadata->partition_id;
     HdfsPartitionDescriptor* partition = hdfs_table_->GetPartition(partition_id);
     scanner_ctx_.reset(new ScannerContext(
-        runtime_state_, this, partition, scan_range_, filter_ctxs()));
-    RETURN_IF_ERROR(CreateAndOpenScanner(partition, scanner_ctx_.get(), &scanner_));
+        runtime_state_, this, partition, scan_range_, filter_ctxs(),
+        expr_results_pool()));
+    Status status = CreateAndOpenScanner(partition, scanner_ctx_.get(), &scanner_);
+    if (!status.ok()) {
+      DCHECK(scanner_ == NULL);
+      // Avoid leaking unread buffers in the scan range.
+      scan_range_->Cancel(status);
+      return status;
+    }
   }
 
   Status status = scanner_->GetNext(row_batch);
   if (!status.ok()) {
     scanner_->Close(row_batch);
     scanner_.reset();
-    num_owned_io_buffers_.Add(-row_batch->num_io_buffers());
     return status;
   }
   InitNullCollectionValues(row_batch);
@@ -111,7 +118,6 @@ Status HdfsScanNodeMt::GetNext(RuntimeState* state, RowBatch* row_batch, bool* e
     *eos = true;
   }
   COUNTER_SET(rows_returned_counter_, num_rows_returned_);
-  num_owned_io_buffers_.Add(-row_batch->num_io_buffers());
 
   if (*eos) StopAndFinalizeCounters();
   return Status::OK();

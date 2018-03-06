@@ -16,6 +16,7 @@
 # under the License.
 
 add_subdirectory(bufferpool)
+add_subdirectory(io)
 
 # where to put generated libraries
 set(LIBRARY_OUTPUT_PATH "${BUILD_OUTPUT_ROOT_DIRECTORY}/runtime")
@@ -23,31 +24,32 @@ set(LIBRARY_OUTPUT_PATH "${BUILD_OUTPUT_ROOT_DIRECTORY}/runtime")
 # where to put generated binaries
 set(EXECUTABLE_OUTPUT_PATH "${BUILD_OUTPUT_ROOT_DIRECTORY}/runtime")
 
+# Mark the protobuf file as generated
+set_source_files_properties(${ROW_BATCH_PROTO_SRCS} PROPERTIES GENERATED TRUE)
+
 add_library(Runtime
-  buffered-block-mgr.cc
   buffered-tuple-stream.cc
   client-cache.cc
   coordinator.cc
+  coordinator-backend-state.cc
   data-stream-mgr.cc
-  data-stream-sender.cc
   data-stream-recvr.cc
+  data-stream-sender.cc
+  debug-options.cc
   descriptors.cc
-  disk-io-mgr.cc
-  disk-io-mgr-reader-context.cc
-  disk-io-mgr-scan-range.cc
-  disk-io-mgr-stress.cc
   exec-env.cc
-  free-pool.cc
   fragment-instance-state.cc
   hbase-table.cc
   hbase-table-factory.cc
   hdfs-fs-cache.cc
+  initial-reservations.cc
+  krpc-data-stream-mgr.cc
+  krpc-data-stream-recvr.cc
+  krpc-data-stream-sender.cc
   lib-cache.cc
   mem-tracker.cc
   mem-pool.cc
   multi-precision.cc
-  parallel-executor.cc
-  plan-fragment-executor.cc
   query-exec-mgr.cc
   query-state.cc
   test-env.cc
@@ -55,6 +57,7 @@ add_library(Runtime
   raw-value.cc
   raw-value-ir.cc
   row-batch.cc
+  ${ROW_BATCH_PROTO_SRCS}
   runtime-filter.cc
   runtime-filter-bank.cc
   runtime-filter-ir.cc
@@ -66,23 +69,17 @@ add_library(Runtime
   timestamp-parse-util.cc
   timestamp-value.cc
   tuple.cc
+  tuple-ir.cc
   tuple-row.cc
   tmp-file-mgr.cc
 )
-add_dependencies(Runtime thrift-deps)
-
-# This test runs forever so should not be part of 'make test'
-add_executable(disk-io-mgr-stress-test disk-io-mgr-stress-test.cc)
-target_link_libraries(disk-io-mgr-stress-test ${IMPALA_TEST_LINK_LIBS})
+add_dependencies(Runtime gen-deps)
 
 ADD_BE_TEST(mem-pool-test)
 ADD_BE_TEST(free-pool-test)
 ADD_BE_TEST(string-buffer-test)
 ADD_BE_TEST(data-stream-test)
 ADD_BE_TEST(timestamp-test)
-ADD_BE_TEST(disk-io-mgr-test)
-ADD_BE_TEST(buffered-block-mgr-test)
-ADD_BE_TEST(parallel-executor-test)
 ADD_BE_TEST(raw-value-test)
 ADD_BE_TEST(string-compare-test)
 ADD_BE_TEST(string-search-test)

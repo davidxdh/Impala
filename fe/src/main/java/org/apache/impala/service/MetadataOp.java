@@ -22,11 +22,11 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
+import org.apache.hadoop.hive.metastore.TableType;
+import org.apache.impala.analysis.StmtMetadataLoader;
 import org.apache.impala.analysis.TableName;
 import org.apache.impala.authorization.User;
+import org.apache.impala.catalog.Catalog;
 import org.apache.impala.catalog.Column;
 import org.apache.impala.catalog.Db;
 import org.apache.impala.catalog.Function;
@@ -34,7 +34,6 @@ import org.apache.impala.catalog.ImpaladCatalog;
 import org.apache.impala.catalog.PrimitiveType;
 import org.apache.impala.catalog.ScalarType;
 import org.apache.impala.catalog.Table;
-import org.apache.impala.catalog.TableLoadingException;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.thrift.TColumn;
@@ -43,6 +42,10 @@ import org.apache.impala.thrift.TResultRow;
 import org.apache.impala.thrift.TResultSet;
 import org.apache.impala.thrift.TResultSetMetadata;
 import org.apache.impala.util.PatternMatcher;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
 
 /**
@@ -56,7 +59,8 @@ public class MetadataOp {
   // Static column values
   private static final TColumnValue NULL_COL_VAL = new TColumnValue();
   private static final TColumnValue EMPTY_COL_VAL = createTColumnValue("");
-  private static final TColumnValue TABLE_TYPE_COL_VAL = createTColumnValue("TABLE");
+  private static final String TABLE_TYPE_TABLE = "TABLE";
+  private static final String TABLE_TYPE_VIEW = "VIEW";
 
   // Result set schema for each of the metadata operations.
   private final static TResultSetMetadata GET_CATALOGS_MD = new TResultSetMetadata();
@@ -70,7 +74,7 @@ public class MetadataOp {
   // GetTypeInfo contains all primitive types supported by Impala.
   private static final List<TResultRow> GET_TYPEINFO_RESULTS = Lists.newArrayList();
 
-  // GetTableTypes only returns a single value: "TABLE".
+  // GetTableTypes returns values: "TABLE", "VIEW"
   private static final List<TResultRow> GET_TABLE_TYPES_RESULTS = Lists.newArrayList();
 
   // Initialize result set schemas and static result set
@@ -214,6 +218,12 @@ public class MetadataOp {
     // tableNames[i] are the tables within dbs[i]
     public List<List<String>> tableNames = Lists.newArrayList();
 
+    // tableTypes[i] are the type of tables within dbs[i]
+    public List<List<String>> tableTypes = Lists.newArrayList();
+
+    // comments[i][j] is the comment of tableNames[j] in dbs[i].
+    public List<List<String>> comments = Lists.newArrayList();
+
     // columns[i][j] are the columns of tableNames[j] in dbs[i].
     // If the table is missing (not yet loaded) its column list will be empty.
     public List<List<List<Column>>> columns = Lists.newArrayList();
@@ -266,32 +276,61 @@ public class MetadataOp {
         // Get table metadata
         List<String> tableList = Lists.newArrayList();
         List<List<Column>> tablesColumnsList = Lists.newArrayList();
+        List<String> tableComments = Lists.newArrayList();
+        List<String> tableTypes = Lists.newArrayList();
         for (String tabName: fe.getTableNames(db.getName(), tablePatternMatcher, user)) {
-          tableList.add(tabName);
-          Table table = null;
-          try {
-            table = catalog.getTable(db.getName(), tabName);
-          } catch (TableLoadingException e) {
-            // Ignore exception (this table will be skipped).
-          }
+          Table table = catalog.getTable(db.getName(), tabName);
           if (table == null) continue;
 
+          String comment = null;
           List<Column> columns = Lists.newArrayList();
           // If the table is not yet loaded, the columns will be unknown. Add it
           // to the set of missing tables.
+          String tableType = TABLE_TYPE_TABLE;
           if (!table.isLoaded()) {
             result.missingTbls.add(new TableName(db.getName(), tabName));
           } else {
+            if (table.getMetaStoreTable() != null) {
+              comment = table.getMetaStoreTable().getParameters().get("comment");
+              tableType = mapToInternalTableType(table.getMetaStoreTable().getTableType());
+            }
             columns.addAll(fe.getColumns(table, columnPatternMatcher, user));
           }
+          tableList.add(tabName);
           tablesColumnsList.add(columns);
+          tableComments.add(Strings.nullToEmpty(comment));
+          tableTypes.add(tableType);
         }
         result.dbs.add(db.getName());
         result.tableNames.add(tableList);
+        result.comments.add(tableComments);
         result.columns.add(tablesColumnsList);
+        result.tableTypes.add(tableTypes);
       }
     }
     return result;
+  }
+
+  private static String mapToInternalTableType(String typeStr) {
+    String defaultTableType = TABLE_TYPE_TABLE;
+    TableType tType;
+
+    if (typeStr == null) return defaultTableType;
+    try {
+      tType = TableType.valueOf(typeStr.toUpperCase());
+    } catch (Exception e) {
+      return defaultTableType;
+    }
+    switch (tType) {
+      case EXTERNAL_TABLE:
+      case MANAGED_TABLE:
+      case INDEX_TABLE:
+        return TABLE_TYPE_TABLE;
+      case VIRTUAL_VIEW:
+        return TABLE_TYPE_VIEW;
+      default:
+        return defaultTableType;
+    }
   }
 
   /**
@@ -314,25 +353,24 @@ public class MetadataOp {
    * The parameters catalogName, schemaName, tableName and columnName are JDBC search
    * patterns.
    */
-  public static TResultSet getColumns(Frontend fe,
-      String catalogName, String schemaName, String tableName, String columnName,
-      User user)
+  public static TResultSet getColumns(Frontend fe, String catalogName, String schemaName,
+      String tableName, String columnName, User user)
       throws ImpalaException {
-    TResultSet result = createEmptyResultSet(GET_COLUMNS_MD);
-
     // Get the list of schemas, tables, and columns that satisfy the search conditions.
-    DbsMetadata dbsMetadata = null;
     PatternMatcher schemaMatcher = PatternMatcher.createJdbcPatternMatcher(schemaName);
     PatternMatcher tableMatcher = PatternMatcher.createJdbcPatternMatcher(tableName);
     PatternMatcher columnMatcher = PatternMatcher.createJdbcPatternMatcher(columnName);
-    while (dbsMetadata == null || !dbsMetadata.missingTbls.isEmpty()) {
-      dbsMetadata = getDbsMetadata(fe, catalogName, schemaMatcher, tableMatcher,
-          columnMatcher, PatternMatcher.MATCHER_MATCH_NONE, user);
-      if (!fe.requestTblLoadAndWait(dbsMetadata.missingTbls)) {
-        LOG.info("Timed out waiting for missing tables. Load request will be retried.");
-      }
+    DbsMetadata dbsMetadata = getDbsMetadata(fe, catalogName, schemaMatcher,
+        tableMatcher, columnMatcher, PatternMatcher.MATCHER_MATCH_NONE, user);
+    if (!dbsMetadata.missingTbls.isEmpty()) {
+      // Need to load tables for column metadata.
+      StmtMetadataLoader mdLoader = new StmtMetadataLoader(fe, Catalog.DEFAULT_DB, null);
+      mdLoader.loadTables(dbsMetadata.missingTbls);
+      dbsMetadata = getDbsMetadata(fe, catalogName, schemaMatcher,
+          tableMatcher, columnMatcher, PatternMatcher.MATCHER_MATCH_NONE, user);
     }
 
+    TResultSet result = createEmptyResultSet(GET_COLUMNS_MD);
     for (int i = 0; i < dbsMetadata.dbs.size(); ++i) {
       String dbName = dbsMetadata.dbs.get(i);
       for (int j = 0; j < dbsMetadata.tableNames.get(i).size(); ++j) {
@@ -358,7 +396,7 @@ public class MetadataOp {
           row.colVals.add(createTColumnValue(colType.getNumPrecRadix()));
           // NULLABLE
           row.colVals.add(createTColumnValue(DatabaseMetaData.columnNullable));
-          row.colVals.add(NULL_COL_VAL); // REMARKS
+          row.colVals.add(createTColumnValue(column.getComment())); // REMARKS
           row.colVals.add(NULL_COL_VAL); // COLUMN_DEF
           row.colVals.add(NULL_COL_VAL); // SQL_DATA_TYPE
           row.colVals.add(NULL_COL_VAL); // SQL_DATETIME_SUB
@@ -446,19 +484,17 @@ public class MetadataOp {
           throws ImpalaException{
     TResultSet result = createEmptyResultSet(GET_TABLES_MD);
 
-    // Impala catalog only contains TABLE. Returns an empty set if the search does not
-    // include TABLE.
+    List<String> upperCaseTableTypes = null;
     if (tableTypes != null && !tableTypes.isEmpty()) {
-      boolean hasTableType = false;
-      for (String tableType: tableTypes) {
-        if (tableType.toLowerCase().equals("table")) {
-          hasTableType = true;
-          break;
-        }
+      boolean hasValidTableType = false;
+      upperCaseTableTypes = Lists.newArrayList();
+      for (String tableType : tableTypes) {
+        tableType = tableType.toUpperCase();
+        upperCaseTableTypes.add(tableType);
+        if (tableType.equals(TABLE_TYPE_TABLE)) hasValidTableType = true;
+        if (tableType.equals(TABLE_TYPE_VIEW)) hasValidTableType = true;
       }
-      if (!hasTableType) {
-        return result;
-      }
+      if (!hasValidTableType) return result;
     }
 
     // Get the list of schemas, tables that satisfy the search conditions.
@@ -472,14 +508,16 @@ public class MetadataOp {
       String dbName = dbsMetadata.dbs.get(i);
       for (int j = 0; j < dbsMetadata.tableNames.get(i).size(); ++j) {
         String tabName = dbsMetadata.tableNames.get(i).get(j);
+        String tableType = dbsMetadata.tableTypes.get(i).get(j);
+        if (upperCaseTableTypes != null && !upperCaseTableTypes.contains(tableType)) continue;
+
         TResultRow row = new TResultRow();
         row.colVals = Lists.newArrayList();
         row.colVals.add(EMPTY_COL_VAL);
         row.colVals.add(createTColumnValue(dbName));
         row.colVals.add(createTColumnValue(tabName));
-        row.colVals.add(TABLE_TYPE_COL_VAL);
-        // TODO: Return table comments when it is available in the Impala catalog.
-        row.colVals.add(EMPTY_COL_VAL);
+        row.colVals.add(createTColumnValue(tableType));
+        row.colVals.add(createTColumnValue(dbsMetadata.comments.get(i).get(j)));
         result.rows.add(row);
       }
     }
@@ -561,7 +599,8 @@ public class MetadataOp {
           ptype.equals(PrimitiveType.DATETIME) ||
           ptype.equals(PrimitiveType.DECIMAL) ||
           ptype.equals(PrimitiveType.CHAR) ||
-          ptype.equals(PrimitiveType.VARCHAR)) {
+          ptype.equals(PrimitiveType.VARCHAR) ||
+          ptype.equals(PrimitiveType.FIXED_UDA_INTERMEDIATE)) {
         continue;
       }
       Type type = ScalarType.createType(ptype);
@@ -590,12 +629,16 @@ public class MetadataOp {
   }
 
   /**
-   * Fills the GET_TYPEINFO_RESULTS with "TABLE".
+   * Fills the GET_TYPEINFO_RESULTS with "TABLE", "VIEW".
    */
   private static void createGetTableTypesResults() {
     TResultRow row = new TResultRow();
     row.colVals = Lists.newArrayList();
-    row.colVals.add(createTColumnValue("TABLE"));
+    row.colVals.add(createTColumnValue(TABLE_TYPE_TABLE));
+    GET_TABLE_TYPES_RESULTS.add(row);
+    row = new TResultRow();
+    row.colVals = Lists.newArrayList();
+    row.colVals.add(createTColumnValue(TABLE_TYPE_VIEW));
     GET_TABLE_TYPES_RESULTS.add(row);
   }
 

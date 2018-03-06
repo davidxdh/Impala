@@ -30,7 +30,6 @@
 // or may have it disabled by default).
 #if __cplusplus >= 201103L
 #define NOEXCEPT noexcept
-#define USING_TYPE
 #else
 #define NOEXCEPT
 #endif
@@ -78,9 +77,12 @@ class FunctionContext {
     TYPE_DOUBLE,
     TYPE_TIMESTAMP,
     TYPE_STRING,
+    // Not used - maps to CHAR(N), which is not supported for UDFs and UDAs.
     TYPE_FIXED_BUFFER,
     TYPE_DECIMAL,
-    TYPE_VARCHAR
+    TYPE_VARCHAR,
+    // A fixed-size buffer, passed as a StringVal.
+    TYPE_FIXED_UDA_INTERMEDIATE
   };
 
   struct TypeDesc {
@@ -90,7 +92,8 @@ class FunctionContext {
     int precision;
     int scale;
 
-    /// Only valid if type == TYPE_FIXED_BUFFER || type == TYPE_VARCHAR
+    /// Only valid if type is one of TYPE_FIXED_BUFFER, TYPE_FIXED_UDA_INTERMEDIATE or
+    /// TYPE_VARCHAR.
     int len;
   };
 
@@ -109,7 +112,7 @@ class FunctionContext {
     /// concurrently on a single host if the UDF will be evaluated in multiple plan
     /// fragments on that host. In general, read-only state that doesn't need to be
     /// recomputed for every UDF call should be fragment-local.
-    /// TODO: not yet implemented
+    /// TODO: Move FRAGMENT_LOCAL states to query_state for multi-threading.
     FRAGMENT_LOCAL,
 
     /// Indicates that the function state is local to the execution thread. This state
@@ -338,23 +341,21 @@ typedef void (*UdfClose)(FunctionContext* context,
 /// The UDA is registered with three types: the result type, the input type and
 /// the intermediate type.
 ///
-/// If the UDA needs a fixed byte width intermediate buffer, the type should be
-/// TYPE_FIXED_BUFFER and Impala will allocate the buffer. If the UDA needs an unknown
-/// sized buffer, it should use TYPE_STRING and allocate it from the FunctionContext
-/// manually.
+/// If the UDA needs a variable-sized buffer, it should use TYPE_STRING and allocate it
+/// from the FunctionContext manually.
 /// For UDAs that need a complex data structure as the intermediate state, the
 /// intermediate type should be string and the UDA can cast the ptr to the structure
 /// it is using.
 ///
-/// Memory Management: For allocations that are not returned to Impala, the UDA should use
-/// the FunctionContext::Allocate()/Free() methods. In general, Allocate() is called in
-/// Init(), and then Free() must be called in both Serialize() and Finalize(), since
-/// either of these functions may be called to clean up the state. For StringVal
-/// allocations returned to Impala (e.g. returned by UdaSerialize()), the UDA should
-/// allocate the result via StringVal(FunctionContext*, int) ctor or the function
-/// StringVal::CopyFrom(FunctionContext*, const uint8_t*, size_t) and Impala will
-/// automatically handle freeing it.
-//
+/// Memory Management: allocations that are referred to by the intermediate values
+/// returned by Init(), Update() and Merge() must be allocated via
+/// FunctionContext::Allocate() and freed via FunctionContext::Free(). Both Serialize()
+/// and Finalize() are responsible for cleaning up the intermediate value and freeing
+/// such allocations. StringVals returned to Impala directly by Serialize(), Finalize()
+/// or GetValue() should be backed by temporary results memory allocated via the
+/// StringVal(FunctionContext*, int) ctor, StringVal::CopyFrom(FunctionContext*,
+/// const uint8_t*, size_t), or StringVal::Resize().
+///
 /// Note that in the rare case the StringVal ctor or StringVal::CopyFrom() fail to
 /// allocate memory, the StringVal object will be marked as a null string.
 /// Serialize()/Finalize() should handle allocation failures by checking the is_null
@@ -405,6 +406,9 @@ typedef ResultType (*UdaFinalize)(FunctionContext* context, const IntermediateTy
 //-------------Implementation of the *Val structs ----------------------------
 //----------------------------------------------------------------------------
 struct AnyVal {
+  // Whether this value is NULL. If true, all other fields contain arbitrary values.
+  // UDF code should *not* assume that other fields of a NULL *Val struct have any
+  // particular value (e.g. 0 or -1).
   bool is_null;
   AnyVal(bool is_null = false) : is_null(is_null) {}
 };
@@ -569,6 +573,7 @@ struct TimestampVal : public AnyVal {
   bool operator!=(const TimestampVal& other) const { return !(*this == other); }
 };
 
+/// A String value represented as a buffer + length.
 /// Note: there is a difference between a NULL string (is_null == true) and an
 /// empty string (len == 0).
 struct StringVal : public AnyVal {
@@ -577,7 +582,12 @@ struct StringVal : public AnyVal {
   // in case of overflow.
   static const unsigned MAX_LENGTH = (1 << 30);
 
+  // The length of the string buffer in bytes.
   int len;
+
+  // Pointer to the start of the string buffer. The buffer is not aligned and is not
+  // null-terminated. Functions must not read or write past the end of the buffer.
+  // I.e.  accessing ptr[i] where i >= len is invalid.
   uint8_t* ptr;
 
   /// Construct a StringVal from ptr/len. Note: this does not make a copy of ptr
@@ -599,17 +609,19 @@ struct StringVal : public AnyVal {
   /// large, the constructor will construct a NULL string and set an error on the function
   /// context.
   ///
-  /// The memory backing this StringVal is a local allocation, and so doesn't need
+  /// The memory backing this StringVal is managed by the Impala runtime and so doesn't need
   /// to be explicitly freed.
   StringVal(FunctionContext* context, int len) NOEXCEPT;
 
-  /// Reallocate a StringVal that is backed by a local allocation so that it as
-  /// at least as large as len.  May shrink or / expand the string.  If the
-  /// string is expanded, the content of the new space is undefined.
+  /// Resize a string value to 'len'. If 'len' is the same as or smaller than the current
+  /// length, truncates the string. Otherwise, increases the string's length, allocating
+  /// new memory and copying over the current contents if needed. The content of the new
+  /// space is undefined. If a resize fails, the length and contents of the StringVal are
+  /// unchanged.
   ///
-  /// If the resize fails, the original StringVal remains in place.  Callers do not
-  /// otherwise need to be concerned with backing storage, which is allocated from a
-  /// local allocation.
+  /// Resized strings can be returned from UDFs as the result value. Callers do not
+  /// otherwise need to be concerned with backing storage, which is managed by the
+  /// Impala runtime and freed at some point after the UDF returns.
   ///
   /// Returns true on success, false on failure.
   bool Resize(FunctionContext* context, int len) NOEXCEPT;

@@ -25,15 +25,15 @@
 #include "common/names.h"
 
 using namespace impala;
-using namespace llvm;
 
 // (<> && false) is false, (true && NULL) is NULL
-BooleanVal AndPredicate::GetBooleanVal(ExprContext* context, const TupleRow* row) {
+BooleanVal AndPredicate::GetBooleanVal(ScalarExprEvaluator* eval,
+    const TupleRow* row) const {
   DCHECK_EQ(children_.size(), 2);
-  BooleanVal val1 = children_[0]->GetBooleanVal(context, row);
+  BooleanVal val1 = children_[0]->GetBooleanVal(eval, row);
   if (!val1.is_null && !val1.val) return BooleanVal(false); // short-circuit
 
-  BooleanVal val2 = children_[1]->GetBooleanVal(context, row);
+  BooleanVal val2 = children_[1]->GetBooleanVal(eval, row);
   if (!val2.is_null && !val2.val) return BooleanVal(false);
 
   if (val1.is_null || val2.is_null) return BooleanVal::null();
@@ -42,17 +42,18 @@ BooleanVal AndPredicate::GetBooleanVal(ExprContext* context, const TupleRow* row
 
 string AndPredicate::DebugString() const {
   stringstream out;
-  out << "AndPredicate(" << Expr::DebugString() << ")";
+  out << "AndPredicate(" << ScalarExpr::DebugString() << ")";
   return out.str();
 }
 
 // (<> || true) is true, (false || NULL) is NULL
-BooleanVal OrPredicate::GetBooleanVal(ExprContext* context, const TupleRow* row) {
+BooleanVal OrPredicate::GetBooleanVal(ScalarExprEvaluator* eval,
+    const TupleRow* row) const {
   DCHECK_EQ(children_.size(), 2);
-  BooleanVal val1 = children_[0]->GetBooleanVal(context, row);
+  BooleanVal val1 = children_[0]->GetBooleanVal(eval, row);
   if (!val1.is_null && val1.val) return BooleanVal(true); // short-circuit
 
-  BooleanVal val2 = children_[1]->GetBooleanVal(context, row);
+  BooleanVal val2 = children_[1]->GetBooleanVal(eval, row);
   if (!val2.is_null && val2.val) return BooleanVal(true);
 
   if (val1.is_null || val2.is_null) return BooleanVal::null();
@@ -61,7 +62,7 @@ BooleanVal OrPredicate::GetBooleanVal(ExprContext* context, const TupleRow* row)
 
 string OrPredicate::DebugString() const {
   stringstream out;
-  out << "OrPredicate(" << Expr::DebugString() << ")";
+  out << "OrPredicate(" << ScalarExpr::DebugString() << ")";
   return out.str();
 }
 
@@ -69,13 +70,14 @@ string OrPredicate::DebugString() const {
 // null handling as well as many branches so this is pretty complicated.  The IR
 // for x && y is:
 //
-// define i16 @CompoundPredicate(%"class.impala::ExprContext"* %context,
+// define i16 @CompoundPredicate(%"class.impala::ScalarExprEvaluator"* %eval,
 //                               %"class.impala::TupleRow"* %row) #20 {
 // entry:
-//   %lhs_call = call i16 @GetSlotRef1(%"class.impala::ExprContext"* %context,
+//   %lhs_call = call i16 @GetSlotRef1(%"class.impala::ScalarExprEvaluator"* %eval,
 //                                     %"class.impala::TupleRow"* %row)
-//   %rhs_call = call i16 @Eq_IntVal_IntValWrapper(%"class.impala::ExprContext"* %context,
-//                                                 %"class.impala::TupleRow"* %row)
+//   %rhs_call = call i16 @Eq_IntVal_IntValWrapper(
+//                                %"class.impala::ScalarExprEvaluator"* %eval,
+//                                %"class.impala::TupleRow"* %row)
 //   %is_null = trunc i16 %lhs_call to i1
 //   %is_null1 = trunc i16 %rhs_call to i1
 //   %0 = ashr i16 %lhs_call, 8
@@ -118,36 +120,41 @@ string OrPredicate::DebugString() const {
 //   ret i16 %7
 // }
 Status CompoundPredicate::CodegenComputeFn(
-    bool and_fn, LlvmCodeGen* codegen, Function** fn) {
+    bool and_fn, LlvmCodeGen* codegen, llvm::Function** fn) {
   if (ir_compute_fn_ != NULL) {
     *fn = ir_compute_fn_;
     return Status::OK();
   }
 
   DCHECK_EQ(GetNumChildren(), 2);
-  Function* lhs_function;
+  llvm::Function* lhs_function;
   RETURN_IF_ERROR(children()[0]->GetCodegendComputeFn(codegen, &lhs_function));
-  Function* rhs_function;
+  llvm::Function* rhs_function;
   RETURN_IF_ERROR(children()[1]->GetCodegendComputeFn(codegen, &rhs_function));
 
-  LLVMContext& context = codegen->context();
+  llvm::LLVMContext& context = codegen->context();
   LlvmBuilder builder(context);
-  Value* args[2];
-  Function* function = CreateIrFunctionPrototype(codegen, "CompoundPredicate", &args);
+  llvm::Value* args[2];
+  llvm::Function* function =
+      CreateIrFunctionPrototype("CompoundPredicate", codegen, &args);
 
-  BasicBlock* entry_block = BasicBlock::Create(context, "entry", function);
+  llvm::BasicBlock* entry_block = llvm::BasicBlock::Create(context, "entry", function);
   builder.SetInsertPoint(entry_block);
 
   // Control blocks for aggregating results
-  BasicBlock* lhs_null_block = BasicBlock::Create(context, "lhs_null", function);
-  BasicBlock* lhs_not_null_block = BasicBlock::Create(context, "lhs_not_null", function);
-  BasicBlock* lhs_null_rhs_not_null_block =
-      BasicBlock::Create(context, "lhs_null_rhs_not_null", function);
-  BasicBlock* lhs_not_null_rhs_null_block =
-      BasicBlock::Create(context, "lhs_not_null_rhs_null", function);
-  BasicBlock* null_block = BasicBlock::Create(context, "null_block", function);
-  BasicBlock* not_null_block = BasicBlock::Create(context, "not_null_block", function);
-  BasicBlock* ret_block = BasicBlock::Create(context, "ret", function);
+  llvm::BasicBlock* lhs_null_block =
+      llvm::BasicBlock::Create(context, "lhs_null", function);
+  llvm::BasicBlock* lhs_not_null_block =
+      llvm::BasicBlock::Create(context, "lhs_not_null", function);
+  llvm::BasicBlock* lhs_null_rhs_not_null_block =
+      llvm::BasicBlock::Create(context, "lhs_null_rhs_not_null", function);
+  llvm::BasicBlock* lhs_not_null_rhs_null_block =
+      llvm::BasicBlock::Create(context, "lhs_not_null_rhs_null", function);
+  llvm::BasicBlock* null_block =
+      llvm::BasicBlock::Create(context, "null_block", function);
+  llvm::BasicBlock* not_null_block =
+      llvm::BasicBlock::Create(context, "not_null_block", function);
+  llvm::BasicBlock* ret_block = llvm::BasicBlock::Create(context, "ret", function);
 
   // Call lhs
   CodegenAnyVal lhs_result = CodegenAnyVal::CreateCallWrapped(
@@ -156,13 +163,13 @@ Status CompoundPredicate::CodegenComputeFn(
   CodegenAnyVal rhs_result = CodegenAnyVal::CreateCallWrapped(
       codegen, &builder, TYPE_BOOLEAN, rhs_function, args, "rhs_call");
 
-  Value* lhs_is_null = lhs_result.GetIsNull();
-  Value* rhs_is_null = rhs_result.GetIsNull();
-  Value* lhs_value = lhs_result.GetVal();
-  Value* rhs_value = rhs_result.GetVal();
+  llvm::Value* lhs_is_null = lhs_result.GetIsNull();
+  llvm::Value* rhs_is_null = rhs_result.GetIsNull();
+  llvm::Value* lhs_value = lhs_result.GetVal();
+  llvm::Value* rhs_value = rhs_result.GetVal();
 
   // Apply predicate
-  Value* compare = NULL;
+  llvm::Value* compare = NULL;
   if (and_fn) {
     compare = builder.CreateAnd(lhs_value, rhs_value, "tmp_and");
   } else {
@@ -206,7 +213,7 @@ Status CompoundPredicate::CodegenComputeFn(
 
   // not-NULL block
   builder.SetInsertPoint(not_null_block);
-  PHINode* not_null_phi = builder.CreatePHI(codegen->GetType(TYPE_BOOLEAN), 3);
+  llvm::PHINode* not_null_phi = builder.CreatePHI(codegen->bool_type(), 3);
   if (and_fn) {
     not_null_phi->addIncoming(codegen->false_value(), lhs_null_rhs_not_null_block);
     not_null_phi->addIncoming(codegen->false_value(), lhs_not_null_rhs_null_block);
@@ -220,11 +227,11 @@ Status CompoundPredicate::CodegenComputeFn(
 
   // Ret/merge block
   builder.SetInsertPoint(ret_block);
-  PHINode* is_null_phi = builder.CreatePHI(codegen->boolean_type(), 2, "is_null");
+  llvm::PHINode* is_null_phi = builder.CreatePHI(codegen->bool_type(), 2, "is_null");
   is_null_phi->addIncoming(codegen->true_value(), null_block);
   is_null_phi->addIncoming(codegen->false_value(), not_null_block);
 
-  PHINode* val_phi = builder.CreatePHI(codegen->boolean_type(), 2, "val");
+  llvm::PHINode* val_phi = builder.CreatePHI(codegen->bool_type(), 2, "val");
   val_phi->addIncoming(codegen->false_value(), null_block);
   val_phi->addIncoming(not_null_phi, not_null_block);
 

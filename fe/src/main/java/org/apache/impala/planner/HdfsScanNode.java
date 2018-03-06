@@ -27,33 +27,44 @@ import java.util.Set;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
-
+import org.apache.impala.analysis.AggregateInfo;
 import org.apache.impala.analysis.Analyzer;
 import org.apache.impala.analysis.BinaryPredicate;
 import org.apache.impala.analysis.DescriptorTable;
 import org.apache.impala.analysis.Expr;
+import org.apache.impala.analysis.ExprSubstitutionMap;
 import org.apache.impala.analysis.FunctionCallExpr;
+import org.apache.impala.analysis.FunctionName;
+import org.apache.impala.analysis.FunctionParams;
+import org.apache.impala.analysis.InPredicate;
+import org.apache.impala.analysis.IsNotEmptyPredicate;
+import org.apache.impala.analysis.LiteralExpr;
+import org.apache.impala.analysis.NullLiteral;
 import org.apache.impala.analysis.SlotDescriptor;
 import org.apache.impala.analysis.SlotId;
 import org.apache.impala.analysis.SlotRef;
 import org.apache.impala.analysis.TableRef;
+import org.apache.impala.analysis.TableSampleClause;
 import org.apache.impala.analysis.TupleDescriptor;
 import org.apache.impala.analysis.TupleId;
 import org.apache.impala.catalog.Column;
 import org.apache.impala.catalog.HdfsFileFormat;
 import org.apache.impala.catalog.HdfsPartition;
 import org.apache.impala.catalog.HdfsPartition.FileBlock;
+import org.apache.impala.catalog.HdfsPartition.FileDescriptor;
 import org.apache.impala.catalog.HdfsTable;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.FileSystemUtil;
-import org.apache.impala.common.ImpalaRuntimeException;
 import org.apache.impala.common.ImpalaException;
+import org.apache.impala.common.ImpalaRuntimeException;
+import org.apache.impala.common.InternalException;
 import org.apache.impala.common.NotImplementedException;
 import org.apache.impala.common.PrintUtils;
 import org.apache.impala.common.RuntimeEnv;
+import org.apache.impala.fb.FbFileBlock;
+import org.apache.impala.service.BackendConfig;
 import org.apache.impala.thrift.TExplainLevel;
 import org.apache.impala.thrift.TExpr;
-import org.apache.impala.thrift.THdfsFileBlock;
 import org.apache.impala.thrift.THdfsFileSplit;
 import org.apache.impala.thrift.THdfsScanNode;
 import org.apache.impala.thrift.TNetworkAddress;
@@ -64,6 +75,7 @@ import org.apache.impala.thrift.TReplicaPreference;
 import org.apache.impala.thrift.TScanRange;
 import org.apache.impala.thrift.TScanRangeLocation;
 import org.apache.impala.thrift.TScanRangeLocationList;
+import org.apache.impala.thrift.TTableStats;
 import org.apache.impala.util.MembershipSnapshot;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -72,59 +84,101 @@ import com.google.common.base.Joiner;
 import com.google.common.base.Objects;
 import com.google.common.base.Objects.ToStringHelper;
 import com.google.common.base.Preconditions;
-import com.google.common.base.Predicates;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 
 /**
- * Scan of a single table. Currently limited to full-table scans.
+ * Scan of a single table.
  *
  * It's expected that the creator of this object has already done any necessary
  * partition pruning before creating this object. In other words, the 'conjuncts'
- * passed to the constructors are conjucts not fully evaluated by partition pruning
+ * passed to the constructors are conjuncts not fully evaluated by partition pruning
  * and 'partitions' are the remaining partitions after pruning.
  *
- * For scans of tables with Parquet files the class creates an additional list of
- * conjuncts that are passed to the backend and will be evaluated against the
- * parquet::Statistics of row groups. If the conjuncts don't match, then whole row groups
- * will be skipped.
+ * Supports scanning a random sample of files based on the parameters from a
+ * TABLESAMPLE clause. Scan predicates and the sampling are independent, so we first
+ * prune partitions and then randomly select files from those partitions.
+ *
+ * For scans of tables with Parquet files the class sends over additional information
+ * to the backend to enable more aggressive runtime pruning. Two types of pruning are
+ * supported:
+ *
+ * 1. Min-max pruning: the class creates an additional list of conjuncts from applicable
+ * scan-node conjuncts and collection conjuncts. The additional conjuncts are
+ * used to prune a row group if any fail the row group's min-max parquet::Statistics.
+ *
+ * 2. Dictionary pruning: the class identifies which scan-node conjuncts and collection
+ * conjuncts can be used to prune a row group by evaluating conjuncts on the
+ * column dictionaries.
+ *
+ * Count(*) aggregation optimization flow:
+ * The caller passes in an AggregateInfo to the constructor that this scan node uses to
+ * determine whether to apply the optimization or not. The produced smap must then be
+ * applied to the AggregateInfo in this query block. We do not apply the smap in this
+ * class directly to avoid side effects and make it easier to reason about.
+ * See HdfsScanNode.applyParquetCountStartOptimization().
  *
  * TODO: pass in range restrictions.
  */
 public class HdfsScanNode extends ScanNode {
   private final static Logger LOG = LoggerFactory.getLogger(HdfsScanNode.class);
 
-  // Read size of the backend I/O manager. Used in computeCosts().
-  private final static long IO_MGR_BUFFER_SIZE = 8L * 1024L * 1024L;
+  private static final Configuration CONF = new Configuration();
 
   // Maximum number of I/O buffers per thread executing this scan.
-  private final static long MAX_IO_BUFFERS_PER_THREAD = 10;
+  // TODO: it's unclear how this was chosen - this seems like a very high number
+  private static final long MAX_IO_BUFFERS_PER_THREAD = 10;
 
-  // Number of scanner threads per core executing this scan.
-  private final static int THREADS_PER_CORE = 3;
+  // Maximum number of thread tokens per core that may be used to spin up extra scanner
+  // threads. Corresponds to the default value of --num_threads_per_core in the backend.
+  private static final int MAX_THREAD_TOKENS_PER_CORE = 3;
 
   // Factor capturing the worst-case deviation from a uniform distribution of scan ranges
   // among nodes. The factor of 1.2 means that a particular node may have 20% more
   // scan ranges than would have been estimated assuming a uniform distribution.
-  private final static double SCAN_RANGE_SKEW_FACTOR = 1.2;
+  private static final double SCAN_RANGE_SKEW_FACTOR = 1.2;
+
+  // The minimum amount of memory we estimate a scan will use. The number is
+  // derived experimentally: running metadata-only Parquet count(*) scans on TPC-H
+  // lineitem and TPC-DS store_sales of different sizes resulted in memory consumption
+  // between 128kb and 1.1mb.
+  private final static long MIN_MEMORY_ESTIMATE = 1 * 1024 * 1024;
 
   private final HdfsTable tbl_;
 
-  // Partitions that are filtered in for scanning by the key ranges
+  // List of partitions to be scanned. Partitions have been pruned.
   private final List<HdfsPartition> partitions_;
+
+  // Parameters for table sampling. Null if not sampling.
+  private final TableSampleClause sampleParams_;
 
   private final TReplicaPreference replicaPreference_;
   private final boolean randomReplica_;
 
-  // Total number of files from partitions_
-  private long totalFiles_ = 0;
+  // The AggregationInfo from the query block of this scan node. Used for determining if
+  // the Parquet count(*) optimization can be applied.
+  private final AggregateInfo aggInfo_;
 
-  // Total number of bytes from partitions_
+  // Number of partitions, files and bytes scanned. Set in computeScanRangeLocations().
+  // Might not match 'partitions_' due to table sampling.
+  private int numPartitions_ = 0;
+  private long totalFiles_ = 0;
   private long totalBytes_ = 0;
+
+  // Input cardinality based on the partition row counts or extrapolation. -1 if invalid.
+  // Both values can be valid to report them in the explain plan, but only one of them is
+  // used for determining the scan cardinality.
+  private long partitionNumRows_ = -1;
+  private long extrapolatedNumRows_ = -1;
 
   // True if this scan node should use the MT implementation in the backend.
   private boolean useMtScanNode_;
+
+  // Should be applied to the AggregateInfo from the same query block. We cannot use the
+  // PlanNode.outputSmap_ for this purpose because we don't want the smap entries to be
+  // propagated outside the query block.
+  protected ExprSubstitutionMap optimizedAggSmap_;
 
   // Conjuncts that can be evaluated while materializing the items (tuples) of
   // collection-typed slots. Maps from tuple descriptor to the conjuncts bound by that
@@ -132,10 +186,26 @@ public class HdfsScanNode extends ScanNode {
   private final Map<TupleDescriptor, List<Expr>> collectionConjuncts_ =
       Maps.newLinkedHashMap();
 
-  // Map from SlotIds to indices in PlanNodes.conjuncts_ that are eligible for
-  // dictionary filtering
-  private Map<Integer, List<Integer>> dictionaryFilterConjuncts_ =
+  // TupleDescriptors of collection slots that have an IsNotEmptyPredicate. See
+  // SelectStmt#registerIsNotEmptyPredicates.
+  // Correctness for applying min-max and dictionary filters requires that the nested
+  // collection is tested to be not empty (via the IsNotEmptyPredicate).
+  // These filters are added by analysis (see: SelectStmt#registerIsNotEmptyPredicates).
+  // While correct, they may be conservative. See the tests for parquet collection
+  // filtering for examples that could benefit from being more aggressive
+  // (yet still correct).
+  private final Set<TupleDescriptor> notEmptyCollections_ = Sets.newHashSet();
+
+  // Map from SlotDescriptor to indices in PlanNodes.conjuncts_ and
+  // collectionConjuncts_ that are eligible for dictionary filtering. Slots in the
+  // the TupleDescriptor of this scan node map to indices into PlanNodes.conjuncts_ and
+  // slots in the TupleDescriptors of nested types map to indices into
+  // collectionConjuncts_.
+  private final Map<SlotDescriptor, List<Integer>> dictionaryFilterConjuncts_ =
       Maps.newLinkedHashMap();
+
+  // Number of partitions that have the row count statistic.
+  private int numPartitionsWithNumRows_ = 0;
 
   // Indicates corrupt table stats based on the number of non-empty scan ranges and
   // numRows set to 0. Set in computeStats().
@@ -151,22 +221,24 @@ public class HdfsScanNode extends ScanNode {
   private int numFilesNoDiskIds_ = 0;
   private int numPartitionsNoDiskIds_ = 0;
 
-  private static final Configuration CONF = new Configuration();
-
-
   // List of conjuncts for min/max values of parquet::Statistics, that are used to skip
   // data when scanning Parquet files.
-  private List<Expr> minMaxConjuncts_ = Lists.newArrayList();
+  private final List<Expr> minMaxConjuncts_ = Lists.newArrayList();
 
-  // List of PlanNode conjuncts that have been transformed into conjuncts in
-  // 'minMaxConjuncts_'.
-  private List<Expr> minMaxOriginalConjuncts_ = Lists.newArrayList();
+  // Map from TupleDescriptor to list of PlanNode conjuncts that have been transformed
+  // into conjuncts in 'minMaxConjuncts_'.
+  private final Map<TupleDescriptor, List<Expr>> minMaxOriginalConjuncts_ =
+      Maps.newLinkedHashMap();
 
   // Tuple that is used to materialize statistics when scanning Parquet files. For each
   // column it can contain 0, 1, or 2 slots, depending on whether the column needs to be
   // evaluated against the min and/or the max value of the corresponding
   // parquet::Statistics.
   private TupleDescriptor minMaxTuple_;
+
+  // Slot that is used to record the Parquet metatdata for the count(*) aggregation if
+  // this scan node has the count(*) optimization enabled.
+  private SlotDescriptor countStarSlot_ = null;
 
   /**
    * Construct a node to scan given data files into tuples described by 'desc',
@@ -175,17 +247,19 @@ public class HdfsScanNode extends ScanNode {
    * class comments above for details.
    */
   public HdfsScanNode(PlanNodeId id, TupleDescriptor desc, List<Expr> conjuncts,
-      List<HdfsPartition> partitions, TableRef hdfsTblRef) {
+      List<HdfsPartition> partitions, TableRef hdfsTblRef, AggregateInfo aggInfo) {
     super(id, desc, "SCAN HDFS");
     Preconditions.checkState(desc.getTable() instanceof HdfsTable);
     tbl_ = (HdfsTable)desc.getTable();
     conjuncts_ = conjuncts;
     partitions_ = partitions;
+    sampleParams_ = hdfsTblRef.getSampleParams();
     replicaPreference_ = hdfsTblRef.getReplicaPreference();
     randomReplica_ = hdfsTblRef.getRandomReplica();
     HdfsTable hdfsTable = (HdfsTable)hdfsTblRef.getTable();
     Preconditions.checkState(tbl_ == hdfsTable);
     StringBuilder error = new StringBuilder();
+    aggInfo_ = aggInfo;
     skipHeaderLineCount_ = tbl_.parseSkipHeaderLineCount(error);
     if (error.length() > 0) {
       // Any errors should already have been caught during analysis.
@@ -203,6 +277,47 @@ public class HdfsScanNode extends ScanNode {
   }
 
   /**
+   * Adds a new slot descriptor to the tuple descriptor of this scan. The new slot will be
+   * used for storing the data extracted from the Parquet num rows statistic. Also adds an
+   * entry to 'optimizedAggSmap_' that substitutes count(*) with
+   * sum_init_zero(<new-slotref>). Returns the new slot descriptor.
+   */
+  private SlotDescriptor applyParquetCountStartOptimization(Analyzer analyzer) {
+    FunctionCallExpr countFn = new FunctionCallExpr(new FunctionName("count"),
+        FunctionParams.createStarParam());
+    countFn.analyzeNoThrow(analyzer);
+
+    // Create the sum function.
+    SlotDescriptor sd = analyzer.addSlotDescriptor(getTupleDesc());
+    sd.setType(Type.BIGINT);
+    sd.setIsMaterialized(true);
+    sd.setIsNullable(false);
+    sd.setLabel("parquet-stats: num_rows");
+    ArrayList<Expr> args = Lists.newArrayList();
+    args.add(new SlotRef(sd));
+    FunctionCallExpr sumFn = new FunctionCallExpr("sum_init_zero", args);
+    sumFn.analyzeNoThrow(analyzer);
+
+    optimizedAggSmap_ = new ExprSubstitutionMap();
+    optimizedAggSmap_.put(countFn, sumFn);
+    return sd;
+  }
+
+  /**
+   * Returns true if the Parquet count(*) optimization can be applied to the query block
+   * of this scan node.
+   */
+  private boolean canApplyParquetCountStarOptimization(Analyzer analyzer,
+      Set<HdfsFileFormat> fileFormats) {
+    if (analyzer.getNumTableRefs() != 1) return false;
+    if (aggInfo_ == null || !aggInfo_.hasCountStarOnly()) return false;
+    if (fileFormats.size() != 1) return false;
+    if (!fileFormats.contains(HdfsFileFormat.PARQUET)) return false;
+    if (!conjuncts_.isEmpty()) return false;
+    return desc_.getMaterializedSlots().isEmpty() || desc_.hasClusteringColsOnly();
+  }
+
+  /**
    * Populate collectionConjuncts_ and scanRanges_.
    */
   @Override
@@ -212,16 +327,17 @@ public class HdfsScanNode extends ScanNode {
 
     assignCollectionConjuncts(analyzer);
     computeDictionaryFilterConjuncts(analyzer);
-    computeMemLayout(analyzer);
 
-    // compute scan range locations
+    // compute scan range locations with optional sampling
     Set<HdfsFileFormat> fileFormats = computeScanRangeLocations(analyzer);
 
     // Determine backend scan node implementation to use. The optimized MT implementation
     // is currently only supported for Parquet.
     if (analyzer.getQueryOptions().isSetMt_dop() &&
         analyzer.getQueryOptions().mt_dop > 0 &&
-        fileFormats.size() == 1 && fileFormats.contains(HdfsFileFormat.PARQUET)) {
+        fileFormats.size() == 1 &&
+        (fileFormats.contains(HdfsFileFormat.PARQUET)
+          || fileFormats.contains(HdfsFileFormat.TEXT))) {
       useMtScanNode_ = true;
     } else {
       useMtScanNode_ = false;
@@ -231,7 +347,16 @@ public class HdfsScanNode extends ScanNode {
       computeMinMaxTupleAndConjuncts(analyzer);
     }
 
-    // do this at the end so it can take all conjuncts and scan ranges into account
+    if (canApplyParquetCountStarOptimization(analyzer, fileFormats)) {
+      Preconditions.checkState(desc_.getPath().destTable() != null);
+      Preconditions.checkState(collectionConjuncts_.isEmpty());
+      countStarSlot_ = applyParquetCountStartOptimization(analyzer);
+    }
+
+    computeMemLayout(analyzer);
+
+    // This is towards the end, so that it can take all conjuncts, scan ranges and mem
+    // layout into account.
     computeStats(analyzer);
 
     // TODO: do we need this?
@@ -293,10 +418,6 @@ public class HdfsScanNode extends ScanNode {
     }
   }
 
-  public boolean isPartitionedTable() {
-    return desc_.getTable().getNumClusteringCols() > 0;
-  }
-
   /**
    * Populates the collection conjuncts, materializes their required slots, and marks
    * the conjuncts as assigned, if it is correct to do so. Some conjuncts may have to
@@ -304,6 +425,7 @@ public class HdfsScanNode extends ScanNode {
    */
   private void assignCollectionConjuncts(Analyzer analyzer) {
     collectionConjuncts_.clear();
+    addNotEmptyCollections(conjuncts_);
     assignCollectionConjuncts(desc_, analyzer);
   }
 
@@ -327,11 +449,112 @@ public class HdfsScanNode extends ScanNode {
     minMaxConjuncts_.add(statsPred);
   }
 
+  private void tryComputeBinaryMinMaxPredicate(Analyzer analyzer,
+      BinaryPredicate binaryPred) {
+    // We only support slot refs on the left hand side of the predicate, a rewriting
+    // rule makes sure that all compatible exprs are rewritten into this form. Only
+    // implicit casts are supported.
+    SlotRef slotRef = binaryPred.getChild(0).unwrapSlotRef(true);
+    if (slotRef == null) return;
+
+    // This node is a table scan, so this must be a scanning slot.
+    Preconditions.checkState(slotRef.getDesc().isScanSlot());
+    // Skip the slot ref if it refers to an array's "pos" field.
+    if (slotRef.isArrayPosRef()) return;
+
+    Expr constExpr = binaryPred.getChild(1);
+    // Only constant exprs can be evaluated against parquet::Statistics. This includes
+    // LiteralExpr, but can also be an expr like "1 + 2".
+    if (!constExpr.isConstant()) return;
+    if (constExpr.isNullLiteral()) return;
+
+    BinaryPredicate.Operator op = binaryPred.getOp();
+    if (op == BinaryPredicate.Operator.LT || op == BinaryPredicate.Operator.LE ||
+        op == BinaryPredicate.Operator.GE || op == BinaryPredicate.Operator.GT) {
+      addMinMaxOriginalConjunct(slotRef.getDesc().getParent(), binaryPred);
+      buildStatsPredicate(analyzer, slotRef, binaryPred, op);
+    } else if (op == BinaryPredicate.Operator.EQ) {
+      addMinMaxOriginalConjunct(slotRef.getDesc().getParent(), binaryPred);
+      // TODO: this could be optimized for boolean columns.
+      buildStatsPredicate(analyzer, slotRef, binaryPred, BinaryPredicate.Operator.LE);
+      buildStatsPredicate(analyzer, slotRef, binaryPred, BinaryPredicate.Operator.GE);
+    }
+  }
+
+  private void tryComputeInListMinMaxPredicate(Analyzer analyzer, InPredicate inPred) {
+    // Retrieve the left side of the IN predicate. It must be a simple slot to proceed.
+    SlotRef slotRef = inPred.getBoundSlot();
+    if (slotRef == null) return;
+    // This node is a table scan, so this must be a scanning slot.
+    Preconditions.checkState(slotRef.getDesc().isScanSlot());
+    // Skip the slot ref if it refers to an array's "pos" field.
+    if (slotRef.isArrayPosRef()) return;
+    if (inPred.isNotIn()) return;
+
+    ArrayList<Expr> children = inPred.getChildren();
+    LiteralExpr min = null;
+    LiteralExpr max = null;
+    for (int i = 1; i < children.size(); ++i) {
+      Expr child = children.get(i);
+
+      // If any child is not a literal, then nothing can be done
+      if (!child.isLiteral()) return;
+      LiteralExpr literalChild = (LiteralExpr) child;
+      // If any child is NULL, then there is not a valid min/max. Nothing can be done.
+      if (literalChild instanceof NullLiteral) return;
+
+      if (min == null || literalChild.compareTo(min) < 0) min = literalChild;
+      if (max == null || literalChild.compareTo(max) > 0) max = literalChild;
+    }
+    Preconditions.checkState(min != null);
+    Preconditions.checkState(max != null);
+
+    BinaryPredicate minBound = new BinaryPredicate(BinaryPredicate.Operator.GE,
+        children.get(0).clone(), min.clone());
+    BinaryPredicate maxBound = new BinaryPredicate(BinaryPredicate.Operator.LE,
+        children.get(0).clone(), max.clone());
+
+    addMinMaxOriginalConjunct(slotRef.getDesc().getParent(), inPred);
+    buildStatsPredicate(analyzer, slotRef, minBound, minBound.getOp());
+    buildStatsPredicate(analyzer, slotRef, maxBound, maxBound.getOp());
+  }
+
+  private void addMinMaxOriginalConjunct(TupleDescriptor tupleDesc, Expr expr) {
+    List<Expr> exprs = minMaxOriginalConjuncts_.get(tupleDesc);
+    if (exprs == null) {
+      exprs = new ArrayList<Expr>();
+      minMaxOriginalConjuncts_.put(tupleDesc, exprs);
+    }
+    exprs.add(expr);
+  }
+
+  private void tryComputeMinMaxPredicate(Analyzer analyzer, Expr pred) {
+    if (pred instanceof BinaryPredicate) {
+      tryComputeBinaryMinMaxPredicate(analyzer, (BinaryPredicate) pred);
+    } else if (pred instanceof InPredicate) {
+      tryComputeInListMinMaxPredicate(analyzer, (InPredicate) pred);
+    }
+  }
+
   /**
-   * Analyzes 'conjuncts_', populates 'minMaxTuple_' with slots for statistics values, and
-   * populates 'minMaxConjuncts_' with conjuncts pointing into the 'minMaxTuple_'. Only
-   * conjuncts of the form <slot> <op> <constant> are supported, and <op> must be one of
-   * LT, LE, GE, GT, or EQ.
+   * Populates notEmptyCollections_ based on IsNotEmptyPredicates in the given conjuncts.
+   */
+  private void addNotEmptyCollections(List<Expr> conjuncts) {
+    for (Expr expr : conjuncts) {
+      if (expr instanceof IsNotEmptyPredicate) {
+        SlotRef ref = (SlotRef)((IsNotEmptyPredicate)expr).getChild(0);
+        Preconditions.checkState(ref.getDesc().getType().isComplexType());
+        Preconditions.checkState(ref.getDesc().getItemTupleDesc() != null);
+        notEmptyCollections_.add(ref.getDesc().getItemTupleDesc());
+      }
+    }
+  }
+
+  /**
+   * Analyzes 'conjuncts_' and 'collectionConjuncts_', populates 'minMaxTuple_' with slots
+   * for statistics values, and populates 'minMaxConjuncts_' with conjuncts pointing into
+   * the 'minMaxTuple_'. Only conjuncts of the form <slot> <op> <constant> are supported,
+   * and <op> must be one of LT, LE, GE, GT, or EQ.
    */
   private void computeMinMaxTupleAndConjuncts(Analyzer analyzer) throws ImpalaException{
     Preconditions.checkNotNull(desc_.getPath());
@@ -340,46 +563,21 @@ public class HdfsScanNode extends ScanNode {
     minMaxTuple_ = descTbl.createTupleDescriptor(tupleName);
     minMaxTuple_.setPath(desc_.getPath());
 
-    for (Expr pred: conjuncts_) {
-      if (!(pred instanceof BinaryPredicate)) continue;
-      BinaryPredicate binaryPred = (BinaryPredicate) pred;
+    // Adds predicates for scalar, top-level columns.
+    for (Expr pred: conjuncts_) tryComputeMinMaxPredicate(analyzer, pred);
 
-      // We only support slot refs on the left hand side of the predicate, a rewriting
-      // rule makes sure that all compatible exprs are rewritten into this form. Only
-      // implicit casts are supported.
-      SlotRef slot = binaryPred.getChild(0).unwrapSlotRef(true);
-      if (slot == null) continue;
-
-      // This node is a table scan, so this must be a scanning slot.
-      Preconditions.checkState(slot.getDesc().isScanSlot());
-      // If the column is null, then this can be a 'pos' scanning slot of a nested type.
-      if (slot.getDesc().getColumn() == null) continue;
-
-      Expr constExpr = binaryPred.getChild(1);
-      // Only constant exprs can be evaluated against parquet::Statistics. This includes
-      // LiteralExpr, but can also be an expr like "1 + 2".
-      if (!constExpr.isConstant()) continue;
-      if (constExpr.isNullLiteral()) continue;
-
-      BinaryPredicate.Operator op = binaryPred.getOp();
-      if (op == BinaryPredicate.Operator.LT || op == BinaryPredicate.Operator.LE ||
-          op == BinaryPredicate.Operator.GE || op == BinaryPredicate.Operator.GT) {
-        minMaxOriginalConjuncts_.add(pred);
-        buildStatsPredicate(analyzer, slot, binaryPred, op);
-      } else if (op == BinaryPredicate.Operator.EQ) {
-        minMaxOriginalConjuncts_.add(pred);
-        // TODO: this could be optimized for boolean columns.
-        buildStatsPredicate(analyzer, slot, binaryPred, BinaryPredicate.Operator.LE);
-        buildStatsPredicate(analyzer, slot, binaryPred, BinaryPredicate.Operator.GE);
+    // Adds predicates for collections.
+    for (Map.Entry<TupleDescriptor, List<Expr>> entry: collectionConjuncts_.entrySet()) {
+      if (notEmptyCollections_.contains(entry.getKey())) {
+        for (Expr pred: entry.getValue()) tryComputeMinMaxPredicate(analyzer, pred);
       }
-
     }
     minMaxTuple_.computeMemLayout();
   }
 
   /**
    * Recursively collects and assigns conjuncts bound by tuples materialized in a
-   * collection-typed slot.
+   * collection-typed slot. As conjuncts are seen, collect non-empty nested collections.
    *
    * Limitation: Conjuncts that must first be migrated into inline views and that cannot
    * be captured by slot binding will not be assigned here, but in an UnnestNode.
@@ -387,7 +585,7 @@ public class HdfsScanNode extends ScanNode {
    * non-SlotRef exprs in the inline-view's select list. We only capture value transfers
    * between slots, and not between arbitrary exprs.
    *
-   * TODO for 2.3: The logic for gathering conjuncts and deciding which ones should be
+   * TODO: The logic for gathering conjuncts and deciding which ones should be
    * marked as assigned needs to be clarified and consolidated in one place. The code
    * below is rather different from the code for assigning the top-level conjuncts in
    * init() although the performed tasks is conceptually identical. Refactoring the
@@ -414,9 +612,15 @@ public class HdfsScanNode extends ScanNode {
       for (Expr conjunct: collectionConjuncts) {
         if (!analyzer.evalAfterJoin(conjunct)) analyzer.markConjunctAssigned(conjunct);
       }
+
+      if (analyzer.getQueryCtx().client_request.getQuery_options().enable_expr_rewrites) {
+        Expr.optimizeConjuncts(collectionConjuncts, analyzer);
+      }
+
       if (!collectionConjuncts.isEmpty()) {
         analyzer.materializeSlots(collectionConjuncts);
         collectionConjuncts_.put(itemTupleDesc, collectionConjuncts);
+        addNotEmptyCollections(collectionConjuncts);
       }
       // Recursively look for collection-typed slots in nested tuple descriptors.
       assignCollectionConjuncts(itemTupleDesc, analyzer);
@@ -424,40 +628,68 @@ public class HdfsScanNode extends ScanNode {
   }
 
   /**
-   * Walks through conjuncts and populates dictionaryFilterConjuncts_.
+   * Adds an entry to dictionaryFilterConjuncts_ if dictionary filtering is applicable
+   * for conjunct. The dictionaryFilterConjuncts_ entry maps the conjunct's tupleId and
+   * slotId to conjunctIdx. The conjunctIdx is the offset into a list of conjuncts;
+   * either conjuncts_ (for scan node's tupleId) or collectionConjuncts_ (for nested
+   * collections).
+   */
+  private void addDictionaryFilter(Analyzer analyzer, Expr conjunct, int conjunctIdx) {
+    List<TupleId> tupleIds = Lists.newArrayList();
+    List<SlotId> slotIds = Lists.newArrayList();
+    conjunct.getIds(tupleIds, slotIds);
+    // Only single-slot conjuncts are eligible for dictionary filtering. When pruning
+    // a row-group, the conjunct must be evaluated only against a single row-group
+    // at-a-time. Expect a single slot conjunct to be associated with a single tuple-id.
+    if (slotIds.size() != 1) return;
+
+    // Check to see if this slot is a collection type. Dictionary pruning is applicable
+    // to scalar values nested in collection types, not enclosing collection types.
+    if (analyzer.getSlotDesc(slotIds.get(0)).getType().isCollectionType()) return;
+
+    // Check to see if this conjunct contains any known randomized function
+    if (conjunct.contains(Expr.IS_NONDETERMINISTIC_BUILTIN_FN_PREDICATE)) return;
+
+    // Check to see if the conjunct evaluates to true when the slot is NULL
+    // This is important for dictionary filtering. Dictionaries do not
+    // contain an entry for NULL and do not provide an indication about
+    // whether NULLs are present. A conjunct that evaluates to true on NULL
+    // cannot be evaluated purely on the dictionary.
+    try {
+      if (analyzer.isTrueWithNullSlots(conjunct)) return;
+    } catch (InternalException e) {
+      // Expr evaluation failed in the backend. Skip this conjunct since we cannot
+      // determine whether it is safe to apply it against a dictionary.
+      LOG.warn("Skipping dictionary filter because backend evaluation failed: "
+          + conjunct.toSql(), e);
+      return;
+    }
+
+    // TODO: Should there be a limit on the cost/structure of the conjunct?
+    SlotId slotId = slotIds.get(0);
+    SlotDescriptor slotKey = analyzer.getSlotDesc(slotId);
+    List<Integer> slotList = dictionaryFilterConjuncts_.get(slotKey);
+    if (slotList == null) {
+      slotList = Lists.newArrayList();
+      dictionaryFilterConjuncts_.put(slotKey, slotList);
+    }
+    slotList.add(conjunctIdx);
+  }
+
+  /**
+   * Walks through conjuncts_ and collectionConjuncts_ and populates
+   * dictionaryFilterConjuncts_.
    */
   private void computeDictionaryFilterConjuncts(Analyzer analyzer) {
-    for (int conjunct_idx = 0; conjunct_idx < conjuncts_.size(); ++conjunct_idx) {
-      Expr conjunct = conjuncts_.get(conjunct_idx);
-      List<TupleId> tupleIds = Lists.newArrayList();
-      List<SlotId> slotIds = Lists.newArrayList();
-
-      conjunct.getIds(tupleIds, slotIds);
-      Preconditions.checkState(tupleIds.size() == 1);
-      if (slotIds.size() != 1) continue;
-
-      // Check to see if this slot is a collection type. Nested types are
-      // currently not supported. For example, an IsNotEmptyPredicate cannot
-      // be evaluated at the dictionary level.
-      if (analyzer.getSlotDesc(slotIds.get(0)).getType().isCollectionType()) continue;
-
-      // Check to see if this conjunct contains any known randomized function
-      if (conjunct.contains(Expr.IS_NONDETERMINISTIC_BUILTIN_FN_PREDICATE)) continue;
-
-      // Check to see if the conjunct evaluates to true when the slot is NULL
-      // This is important for dictionary filtering. Dictionaries do not
-      // contain an entry for NULL and do not provide an indication about
-      // whether NULLs are present. A conjunct that evaluates to true on NULL
-      // cannot be evaluated purely on the dictionary.
-      if (analyzer.isTrueWithNullSlots(conjunct)) continue;
-
-      // TODO: Should there be a limit on the cost/structure of the conjunct?
-      Integer slotIdInt = slotIds.get(0).asInt();
-      if (dictionaryFilterConjuncts_.containsKey(slotIdInt)) {
-        dictionaryFilterConjuncts_.get(slotIdInt).add(conjunct_idx);
-      } else {
-        List<Integer> slotList = Lists.newArrayList(conjunct_idx);
-        dictionaryFilterConjuncts_.put(slotIdInt, slotList);
+    for (int conjunctIdx = 0; conjunctIdx < conjuncts_.size(); ++conjunctIdx) {
+      addDictionaryFilter(analyzer, conjuncts_.get(conjunctIdx), conjunctIdx);
+    }
+    for (Map.Entry<TupleDescriptor, List<Expr>> entry: collectionConjuncts_.entrySet()) {
+      if (notEmptyCollections_.contains(entry.getKey())) {
+        List<Expr> conjuncts = entry.getValue();
+        for (int conjunctIdx = 0; conjunctIdx < conjuncts.size(); ++conjunctIdx) {
+          addDictionaryFilter(analyzer, conjuncts.get(conjunctIdx), conjunctIdx);
+        }
       }
     }
   }
@@ -465,15 +697,43 @@ public class HdfsScanNode extends ScanNode {
   /**
    * Computes scan ranges (hdfs splits) plus their storage locations, including volume
    * ids, based on the given maximum number of bytes each scan range should scan.
+   * If 'sampleParams_' is not null, generates a sample and computes the scan ranges
+   * based on the sample.
    * Returns the set of file formats being scanned.
    */
   private Set<HdfsFileFormat> computeScanRangeLocations(Analyzer analyzer)
       throws ImpalaRuntimeException {
+    Map<Long, List<FileDescriptor>> sampledFiles = null;
+    if (sampleParams_ != null) {
+      long percentBytes = sampleParams_.getPercentBytes();
+      long randomSeed;
+      if (sampleParams_.hasRandomSeed()) {
+        randomSeed = sampleParams_.getRandomSeed();
+      } else {
+        randomSeed = System.currentTimeMillis();
+      }
+      // Pass a minimum sample size of 0 because users cannot set a minimum sample size
+      // for scans directly. For compute stats, a minimum sample size can be set, and
+      // the sampling percent is adjusted to reflect it.
+      sampledFiles = tbl_.getFilesSample(partitions_, percentBytes, 0, randomSeed);
+    }
+
     long maxScanRangeLength = analyzer.getQueryCtx().client_request.getQuery_options()
         .getMax_scan_range_length();
     scanRanges_ = Lists.newArrayList();
+    numPartitions_ = (sampledFiles != null) ? sampledFiles.size() : partitions_.size();
+    totalFiles_ = 0;
+    totalBytes_ = 0;
     Set<HdfsFileFormat> fileFormats = Sets.newHashSet();
     for (HdfsPartition partition: partitions_) {
+      List<FileDescriptor> fileDescs = partition.getFileDescriptors();
+      if (sampledFiles != null) {
+        // If we are sampling, check whether this partition is included in the sample.
+        fileDescs = sampledFiles.get(Long.valueOf(partition.getId()));
+        if (fileDescs == null) continue;
+      }
+
+      analyzer.getDescTbl().addReferencedPartition(tbl_, partition.getId());
       fileFormats.add(partition.getFileFormat());
       Preconditions.checkState(partition.getId() >= 0);
       // Missing disk id accounting is only done for file systems that support the notion
@@ -486,49 +746,52 @@ public class HdfsScanNode extends ScanNode {
       }
       boolean checkMissingDiskIds = FileSystemUtil.supportsStorageIds(partitionFs);
       boolean partitionMissingDiskIds = false;
-      for (HdfsPartition.FileDescriptor fileDesc: partition.getFileDescriptors()) {
+
+      totalFiles_ += fileDescs.size();
+      for (FileDescriptor fileDesc: fileDescs) {
+        totalBytes_ += fileDesc.getFileLength();
         boolean fileDescMissingDiskIds = false;
-        for (THdfsFileBlock thriftBlock: fileDesc.getFileBlocks()) {
-          HdfsPartition.FileBlock block = FileBlock.fromThrift(thriftBlock);
-          List<Integer> replicaHostIdxs = block.getReplicaHostIdxs();
-          if (replicaHostIdxs.size() == 0) {
+        for (int j = 0; j < fileDesc.getNumFileBlocks(); ++j) {
+          FbFileBlock block = fileDesc.getFbFileBlock(j);
+          int replicaHostCount = FileBlock.getNumReplicaHosts(block);
+          if (replicaHostCount == 0) {
             // we didn't get locations for this block; for now, just ignore the block
             // TODO: do something meaningful with that
             continue;
           }
           // Collect the network address and volume ID of all replicas of this block.
           List<TScanRangeLocation> locations = Lists.newArrayList();
-          for (int i = 0; i < replicaHostIdxs.size(); ++i) {
+          for (int i = 0; i < replicaHostCount; ++i) {
             TScanRangeLocation location = new TScanRangeLocation();
             // Translate from the host index (local to the HdfsTable) to network address.
-            Integer tableHostIdx = replicaHostIdxs.get(i);
+            int replicaHostIdx = FileBlock.getReplicaHostIdx(block, i);
             TNetworkAddress networkAddress =
-                partition.getTable().getHostIndex().getEntry(tableHostIdx);
+                partition.getTable().getHostIndex().getEntry(replicaHostIdx);
             Preconditions.checkNotNull(networkAddress);
             // Translate from network address to the global (to this request) host index.
             Integer globalHostIdx = analyzer.getHostIndex().getIndex(networkAddress);
             location.setHost_idx(globalHostIdx);
-            if (checkMissingDiskIds && block.getDiskId(i) == -1) {
+            if (checkMissingDiskIds && FileBlock.getDiskId(block, i) == -1) {
               ++numScanRangesNoDiskIds_;
               partitionMissingDiskIds = true;
               fileDescMissingDiskIds = true;
             }
-            location.setVolume_id(block.getDiskId(i));
-            location.setIs_cached(block.isCached(i));
+            location.setVolume_id(FileBlock.getDiskId(block, i));
+            location.setIs_cached(FileBlock.isReplicaCached(block, i));
             locations.add(location);
           }
           // create scan ranges, taking into account maxScanRangeLength
-          long currentOffset = block.getOffset();
-          long remainingLength = block.getLength();
+          long currentOffset = FileBlock.getOffset(block);
+          long remainingLength = FileBlock.getLength(block);
           while (remainingLength > 0) {
             long currentLength = remainingLength;
             if (maxScanRangeLength > 0 && remainingLength > maxScanRangeLength) {
               currentLength = maxScanRangeLength;
             }
             TScanRange scanRange = new TScanRange();
-            scanRange.setHdfs_file_split(new THdfsFileSplit(
-                fileDesc.getFileName(), currentOffset, currentLength, partition.getId(),
-                fileDesc.getFileLength(), fileDesc.getFileCompression(),
+            scanRange.setHdfs_file_split(new THdfsFileSplit(fileDesc.getFileName(),
+                currentOffset, currentLength, partition.getId(), fileDesc.getFileLength(),
+                fileDesc.getFileCompression().toThrift(),
                 fileDesc.getModificationTime()));
             TScanRangeLocationList scanRangeLocations = new TScanRangeLocationList();
             scanRangeLocations.scan_range = scanRange;
@@ -552,56 +815,62 @@ public class HdfsScanNode extends ScanNode {
   }
 
   /**
-   * Also computes totalBytes_, totalFiles_, numPartitionsMissingStats_,
-   * and sets hasCorruptTableStats_.
+   * Computes the average row size, input and output cardinalities, and estimates the
+   * number of nodes.
+   * Requires that computeScanRangeLocations() has been called.
    */
   @Override
   public void computeStats(Analyzer analyzer) {
+    Preconditions.checkNotNull(scanRanges_);
     super.computeStats(analyzer);
-    if (LOG.isTraceEnabled()) {
-      LOG.trace("collecting partitions for table " + tbl_.getName());
-    }
-    numPartitionsMissingStats_ = 0;
-    totalFiles_ = 0;
-    totalBytes_ = 0;
-    if (tbl_.getNumClusteringCols() == 0) {
-      cardinality_ = tbl_.getNumRows();
-      if (cardinality_ < -1 || (cardinality_ == 0 && tbl_.getTotalHdfsBytes() > 0)) {
-        hasCorruptTableStats_ = true;
-      }
-      if (partitions_.isEmpty()) {
-        // Nothing to scan. Definitely a cardinality of 0 even if we have no stats.
-        cardinality_ = 0;
-      } else {
-        Preconditions.checkState(partitions_.size() == 1);
-        totalFiles_ += partitions_.get(0).getFileDescriptors().size();
-        totalBytes_ += partitions_.get(0).getSize();
-      }
+    computeCardinalities();
+    computeNumNodes(analyzer, cardinality_);
+  }
+
+  /**
+   * Computes and sets the input and output cardinalities.
+   *
+   * If available, table-level row count and file bytes statistics are used for
+   * extrapolating the input cardinality (before conjuncts). The extrapolation is based
+   * on the total number of bytes to be scanned and is intended to address the following
+   * scenarios: (1) new partitions that have no stats, and (2) existing partitions which
+   * have changed since the last stats collection. When extrapolating, the per-partition
+   * row counts are ignored because we cannot determine whether the partition has changed
+   * since the last stats collection.
+   * Otherwise, the input cardinality is based on the per-partition row count stats
+   * and/or the table-level row count stats, depending on which of those are available.
+   * Adjusts the output cardinality based on the scan conjuncts and table sampling.
+   *
+   * Sets these members:
+   * extrapolatedNumRows_, inputCardinality_, cardinality_
+   */
+  private void computeCardinalities() {
+    // Choose between the extrapolated row count and the one based on stored stats.
+    extrapolatedNumRows_ = tbl_.getExtrapolatedNumRows(totalBytes_);
+    long statsNumRows = getStatsNumRows();
+    if (extrapolatedNumRows_ != -1) {
+      // The extrapolated row count is based on the 'totalBytes_' which already accounts
+      // for table sampling, so no additional adjustment for sampling is necessary.
+      cardinality_ = extrapolatedNumRows_;
     } else {
-      cardinality_ = 0;
-      boolean hasValidPartitionCardinality = false;
-      for (HdfsPartition p: partitions_) {
-        // Check for corrupt table stats
-        if (p.getNumRows() < -1  || (p.getNumRows() == 0 && p.getSize() > 0))  {
-          hasCorruptTableStats_ = true;
-        }
-        // ignore partitions with missing stats in the hope they don't matter
-        // enough to change the planning outcome
-        if (p.getNumRows() > -1) {
-          cardinality_ = addCardinalities(cardinality_, p.getNumRows());
-          hasValidPartitionCardinality = true;
-        } else {
-          ++numPartitionsMissingStats_;
-        }
-        totalFiles_ += p.getFileDescriptors().size();
-        totalBytes_ += p.getSize();
-      }
-      if (!partitions_.isEmpty() && !hasValidPartitionCardinality) {
-        // if none of the partitions knew its number of rows, we fall back on
-        // the table stats
-        cardinality_ = tbl_.getNumRows();
+      // Set the cardinality based on table or partition stats.
+      cardinality_ = statsNumRows;
+      // Adjust the cardinality based on table sampling.
+      if (sampleParams_ != null && cardinality_ != -1) {
+        double fracPercBytes = (double) sampleParams_.getPercentBytes() / 100;
+        cardinality_ = Math.round(cardinality_ * fracPercBytes);
+        cardinality_ = Math.max(cardinality_, 1);
       }
     }
+
+    // Checked after the block above to first collect information for the explain output.
+    if (totalBytes_ == 0) {
+      // Nothing to scan. Definitely a cardinality of 0.
+      inputCardinality_ = 0;
+      cardinality_ = 0;
+      return;
+    }
+
     // Adjust cardinality for all collections referenced along the tuple's path.
     if (cardinality_ != -1) {
       for (Type t: desc_.getPath().getMatchedTypes()) {
@@ -627,13 +896,48 @@ public class HdfsScanNode extends ScanNode {
     }
     cardinality_ = capAtLimit(cardinality_);
     if (LOG.isTraceEnabled()) {
-      LOG.trace("computeStats HdfsScan: cardinality_=" + Long.toString(cardinality_));
+      LOG.trace("HdfsScan: cardinality_=" + Long.toString(cardinality_));
     }
+  }
 
-    computeNumNodes(analyzer, cardinality_);
-    if (LOG.isTraceEnabled()) {
-      LOG.trace("computeStats HdfsScan: #nodes=" + Integer.toString(numNodes_));
+  /**
+   * Computes and returns the number of rows scanned based on the per-partition row count
+   * stats and/or the table-level row count stats, depending on which of those are
+   * available, and whether the table is partitioned. Partitions without stats are
+   * ignored as long as there is at least one partition with stats. Otherwise,
+   * we fall back to table-level stats even for partitioned tables.
+   *
+   * Sets these members:
+   * numPartitionsWithNumRows_, partitionNumRows_, hasCorruptTableStats_.
+   */
+  private long getStatsNumRows() {
+    numPartitionsWithNumRows_ = 0;
+    partitionNumRows_ = -1;
+    hasCorruptTableStats_ = false;
+    if (tbl_.getNumClusteringCols() > 0) {
+      for (HdfsPartition p: partitions_) {
+        // Check for corrupt partition stats
+        long partNumRows = p.getNumRows();
+        if (partNumRows < -1  || (partNumRows == 0 && p.getSize() > 0))  {
+          hasCorruptTableStats_ = true;
+        }
+        // Ignore partitions with missing stats in the hope they don't matter
+        // enough to change the planning outcome.
+        if (partNumRows > -1) {
+          if (partitionNumRows_ == -1) partitionNumRows_ = 0;
+          partitionNumRows_ = checkedAdd(partitionNumRows_, partNumRows);
+          ++numPartitionsWithNumRows_;
+        }
+      }
+      if (numPartitionsWithNumRows_ > 0) return partitionNumRows_;
     }
+    // Table is unpartitioned or the table is partitioned but no partitions have stats.
+    // Set cardinality based on table-level stats.
+    long numRows = tbl_.getNumRows();
+    if (numRows < -1 || (numRows == 0 && tbl_.getTotalHdfsBytes() > 0)) {
+      hasCorruptTableStats_ = true;
+    }
+    return numRows;
   }
 
   /**
@@ -715,27 +1019,23 @@ public class HdfsScanNode extends ScanNode {
       msg.hdfs_scan_node.setSkip_header_line_count(skipHeaderLineCount_);
     }
     msg.hdfs_scan_node.setUse_mt_scan_node(useMtScanNode_);
+    Preconditions.checkState((optimizedAggSmap_ == null) == (countStarSlot_ == null));
+    if (countStarSlot_ != null) {
+      msg.hdfs_scan_node.setParquet_count_star_slot_offset(
+          countStarSlot_.getByteOffset());
+    }
     if (!minMaxConjuncts_.isEmpty()) {
       for (Expr e: minMaxConjuncts_) {
         msg.hdfs_scan_node.addToMin_max_conjuncts(e.treeToThrift());
       }
       msg.hdfs_scan_node.setMin_max_tuple_id(minMaxTuple_.getId().asInt());
     }
-    msg.hdfs_scan_node.setDictionary_filter_conjuncts(dictionaryFilterConjuncts_);
-  }
-
-  @Override
-  protected String getDisplayLabelDetail() {
-    HdfsTable table = (HdfsTable) desc_.getTable();
-    List<String> path = Lists.newArrayList();
-    path.add(table.getDb().getName());
-    path.add(table.getName());
-    Preconditions.checkNotNull(desc_.getPath());
-    if (desc_.hasExplicitAlias()) {
-      return desc_.getPath().toString() + " " + desc_.getAlias();
-    } else {
-      return desc_.getPath().toString();
+    Map<Integer, List<Integer>> dictMap = Maps.newLinkedHashMap();
+    for (Map.Entry<SlotDescriptor, List<Integer>> entry :
+      dictionaryFilterConjuncts_.entrySet()) {
+      dictMap.put(entry.getKey().getId().asInt(), entry.getValue());
     }
+    msg.hdfs_scan_node.setDictionary_filter_conjuncts(dictMap);
   }
 
   @Override
@@ -745,21 +1045,20 @@ public class HdfsScanNode extends ScanNode {
     HdfsTable table = (HdfsTable) desc_.getTable();
     output.append(String.format("%s%s [%s", prefix, getDisplayLabel(),
         getDisplayLabelDetail()));
-    int numPartitions = partitions_.size();
     if (detailLevel.ordinal() >= TExplainLevel.EXTENDED.ordinal() &&
         fragment_.isPartitioned()) {
       output.append(", " + fragment_.getDataPartition().getExplainString());
     }
     output.append("]\n");
     if (detailLevel.ordinal() >= TExplainLevel.STANDARD.ordinal()) {
-      if (tbl_.getNumClusteringCols() == 0) numPartitions = 1;
+      if (tbl_.getNumClusteringCols() == 0) numPartitions_ = 1;
       output.append(String.format("%spartitions=%s/%s files=%s size=%s", detailPrefix,
-          numPartitions, table.getPartitions().size() - 1, totalFiles_,
+          numPartitions_, table.getPartitions().size() - 1, totalFiles_,
           PrintUtils.printBytes(totalBytes_)));
       output.append("\n");
       if (!conjuncts_.isEmpty()) {
-        output.append(
-            detailPrefix + "predicates: " + getExplainString(conjuncts_) + "\n");
+        output.append(String.format("%spredicates: %s\n", detailPrefix,
+            getExplainString(conjuncts_)));
       }
       if (!collectionConjuncts_.isEmpty()) {
         for (Map.Entry<TupleDescriptor, List<Expr>> entry:
@@ -771,45 +1070,120 @@ public class HdfsScanNode extends ScanNode {
       }
       if (!runtimeFilters_.isEmpty()) {
         output.append(detailPrefix + "runtime filters: ");
-        output.append(getRuntimeFilterExplainString(false));
+        output.append(getRuntimeFilterExplainString(false, detailLevel));
       }
     }
     if (detailLevel.ordinal() >= TExplainLevel.EXTENDED.ordinal()) {
-      output.append(getStatsExplainString(detailPrefix, detailLevel));
+      output.append(getStatsExplainString(detailPrefix));
+      output.append("\n");
+      String extrapRows = String.valueOf(extrapolatedNumRows_);
+      if (!tbl_.isStatsExtrapolationEnabled()) {
+        extrapRows = "disabled";
+      } else if (extrapolatedNumRows_ == -1) {
+        extrapRows = "unavailable";
+      }
+      output.append(String.format("%sextrapolated-rows=%s", detailPrefix, extrapRows));
       output.append("\n");
       if (numScanRangesNoDiskIds_ > 0) {
         output.append(String.format("%smissing disk ids: " +
             "partitions=%s/%s files=%s/%s scan ranges %s/%s\n", detailPrefix,
-            numPartitionsNoDiskIds_, numPartitions, numFilesNoDiskIds_,
+            numPartitionsNoDiskIds_, numPartitions_, numFilesNoDiskIds_,
             totalFiles_, numScanRangesNoDiskIds_, scanRanges_.size()));
       }
-      if (!minMaxOriginalConjuncts_.isEmpty()) {
-        output.append(detailPrefix + "parquet statistics predicates: " +
-            getExplainString(minMaxOriginalConjuncts_) + "\n");
-      }
-      if (!dictionaryFilterConjuncts_.isEmpty()) {
-        List<Integer> totalIdxList = Lists.newArrayList();
-        for (List<Integer> idxList : dictionaryFilterConjuncts_.values()) {
-          totalIdxList.addAll(idxList);
-        }
-        // Since the conjuncts are stored by the slot id, they are not necessarily
-        // in the same order as the normal conjuncts. Sort the indices so that the
-        // order matches the normal conjuncts.
-        Collections.sort(totalIdxList);
-        List<Expr> exprList = Lists.newArrayList();
-        for (Integer idx : totalIdxList) exprList.add(conjuncts_.get(idx));
-        output.append(String.format("%sparquet dictionary predicates: %s\n",
-            detailPrefix, getExplainString(exprList)));
+      // Groups the min max original conjuncts by tuple descriptor.
+      output.append(getMinMaxOriginalConjunctsExplainString(detailPrefix));
+      // Groups the dictionary filterable conjuncts by tuple descriptor.
+      output.append(getDictionaryConjunctsExplainString(detailPrefix));
+    }
+    return output.toString();
+  }
+
+  // Helper method that prints min max original conjuncts by tuple descriptor.
+  private String getMinMaxOriginalConjunctsExplainString(String prefix) {
+    StringBuilder output = new StringBuilder();
+    for (Map.Entry<TupleDescriptor, List<Expr>> entry :
+        minMaxOriginalConjuncts_.entrySet()) {
+      TupleDescriptor tupleDesc = entry.getKey();
+      List<Expr> exprs = entry.getValue();
+      if (tupleDesc == getTupleDesc()) {
+        output.append(String.format("%sparquet statistics predicates: %s\n", prefix,
+            getExplainString(exprs)));
+      } else {
+        output.append(String.format("%sparquet statistics predicates on %s: %s\n",
+            prefix, tupleDesc.getAlias(), getExplainString(exprs)));
       }
     }
     return output.toString();
   }
 
+  // Helper method that prints the dictionary filterable conjuncts by tuple descriptor.
+  private String getDictionaryConjunctsExplainString(String prefix) {
+    StringBuilder output = new StringBuilder();
+    Map<TupleDescriptor, List<Integer>> perTupleConjuncts = Maps.newLinkedHashMap();
+    for (Map.Entry<SlotDescriptor, List<Integer>> entry :
+      dictionaryFilterConjuncts_.entrySet()) {
+      SlotDescriptor slotDescriptor = entry.getKey();
+      TupleDescriptor tupleDescriptor = slotDescriptor.getParent();
+      List<Integer> indexes = perTupleConjuncts.get(tupleDescriptor);
+      if (indexes == null) {
+        indexes = Lists.newArrayList();
+        perTupleConjuncts.put(tupleDescriptor, indexes);
+      }
+      indexes.addAll(entry.getValue());
+    }
+    for (Map.Entry<TupleDescriptor, List<Integer>> entry :
+      perTupleConjuncts.entrySet()) {
+      List<Integer> totalIdxList = entry.getValue();
+      // Since the conjuncts are stored by the slot id, they are not necessarily
+      // in the same order as the normal conjuncts. Sort the indices so that the
+      // order matches the normal conjuncts.
+      Collections.sort(totalIdxList);
+      List<Expr> conjuncts;
+      TupleDescriptor tupleDescriptor = entry.getKey();
+      String tupleName = "";
+      if (tupleDescriptor == getTupleDesc()) {
+        conjuncts = conjuncts_;
+      } else {
+        conjuncts = collectionConjuncts_.get(tupleDescriptor);
+        tupleName = " on " + tupleDescriptor.getAlias();
+      }
+      Preconditions.checkNotNull(conjuncts);
+      List<Expr> exprList = Lists.newArrayList();
+      for (Integer idx : totalIdxList) {
+        Preconditions.checkState(idx.intValue() < conjuncts.size());
+        exprList.add(conjuncts.get(idx));
+      }
+      output.append(String.format("%sparquet dictionary predicates%s: %s\n",
+          prefix, tupleName, getExplainString(exprList)));
+    }
+    return output.toString();
+  }
+
   @Override
-  public void computeCosts(TQueryOptions queryOptions) {
+  protected String getTableStatsExplainString(String prefix) {
+    StringBuilder output = new StringBuilder();
+    TTableStats tblStats = desc_.getTable().getTTableStats();
+    String numRows = String.valueOf(tblStats.num_rows);
+    if (tblStats.num_rows == -1) numRows = "unavailable";
+    String totalBytes = PrintUtils.printBytes(tblStats.total_file_bytes);
+    if (tblStats.total_file_bytes == -1) totalBytes = "unavailable";
+    output.append(String.format("%stable: rows=%s size=%s",
+        prefix, numRows, totalBytes));
+    if (tbl_.getNumClusteringCols() > 0) {
+      output.append("\n");
+      String partNumRows = String.valueOf(partitionNumRows_);
+      if (partitionNumRows_ == -1) partNumRows = "unavailable";
+      output.append(String.format("%spartitions: %s/%s rows=%s",
+          prefix, numPartitionsWithNumRows_, partitions_.size(), partNumRows));
+    }
+    return output.toString();
+  }
+
+  @Override
+  public void computeNodeResourceProfile(TQueryOptions queryOptions) {
     Preconditions.checkNotNull(scanRanges_, "Cost estimation requires scan ranges.");
     if (scanRanges_.isEmpty()) {
-      perHostMemCost_ = 0;
+      nodeResourceProfile_ = ResourceProfile.noReservation(0);
       return;
     }
     Preconditions.checkState(0 < numNodes_ && numNodes_ <= scanRanges_.size());
@@ -819,9 +1193,11 @@ public class HdfsScanNode extends ScanNode {
     int perHostScanRanges;
     if (table.getMajorityFormat() == HdfsFileFormat.PARQUET) {
       // For the purpose of this estimation, the number of per-host scan ranges for
-      // Parquet files are equal to the number of non-partition columns scanned.
+      // Parquet files are equal to the number of columns read from the file. I.e.
+      // excluding partition columns and columns that are populated from file metadata.
       perHostScanRanges = 0;
       for (SlotDescriptor slot: desc_.getSlots()) {
+        if (!slot.isMaterialized() || slot == countStarSlot_) continue;
         if (slot.getColumn() == null ||
             slot.getColumn().getPosition() >= table.getNumClusteringCols()) {
           ++perHostScanRanges;
@@ -832,34 +1208,39 @@ public class HdfsScanNode extends ScanNode {
           (double) scanRanges_.size() / (double) numNodes_) * SCAN_RANGE_SKEW_FACTOR);
     }
 
-    // TODO: The total memory consumption for a particular query depends on the number
-    // of *available* cores, i.e., it depends the resource consumption of other
-    // concurrent queries. Figure out how to account for that.
-    int maxScannerThreads = Math.min(perHostScanRanges,
-        RuntimeEnv.INSTANCE.getNumCores() * THREADS_PER_CORE);
-    // Account for the max scanner threads query option.
-    if (queryOptions.isSetNum_scanner_threads() &&
-        queryOptions.getNum_scanner_threads() > 0) {
-      maxScannerThreads =
-          Math.min(maxScannerThreads, queryOptions.getNum_scanner_threads());
+    int maxScannerThreads;
+    if (queryOptions.getMt_dop() >= 1) {
+      maxScannerThreads = 1;
+    } else {
+      maxScannerThreads = Math.min(perHostScanRanges, RuntimeEnv.INSTANCE.getNumCores());
+      // Account for the max scanner threads query option.
+      if (queryOptions.isSetNum_scanner_threads() &&
+          queryOptions.getNum_scanner_threads() > 0) {
+        maxScannerThreads =
+            Math.min(maxScannerThreads, queryOptions.getNum_scanner_threads());
+      }
     }
 
     long avgScanRangeBytes = (long) Math.ceil(totalBytes_ / (double) scanRanges_.size());
     // The +1 accounts for an extra I/O buffer to read past the scan range due to a
     // trailing record spanning Hdfs blocks.
+    long readSize = BackendConfig.INSTANCE.getReadSize();
     long perThreadIoBuffers =
-        Math.min((long) Math.ceil(avgScanRangeBytes / (double) IO_MGR_BUFFER_SIZE),
+        Math.min((long) Math.ceil(avgScanRangeBytes / (double) readSize),
             MAX_IO_BUFFERS_PER_THREAD) + 1;
-    perHostMemCost_ = maxScannerThreads * perThreadIoBuffers * IO_MGR_BUFFER_SIZE;
+    long perInstanceMemEstimate = checkedMultiply(
+        checkedMultiply(maxScannerThreads, perThreadIoBuffers), readSize);
 
     // Sanity check: the tighter estimation should not exceed the per-host maximum.
     long perHostUpperBound = getPerHostMemUpperBound();
-    if (perHostMemCost_ > perHostUpperBound) {
-      LOG.warn(String.format("Per-host mem cost %s exceeded per-host upper bound %s.",
-          PrintUtils.printBytes(perHostMemCost_),
+    if (perInstanceMemEstimate > perHostUpperBound) {
+      LOG.warn(String.format("Per-instance mem cost %s exceeded per-host upper bound %s.",
+          PrintUtils.printBytes(perInstanceMemEstimate),
           PrintUtils.printBytes(perHostUpperBound)));
-      perHostMemCost_ = perHostUpperBound;
+      perInstanceMemEstimate = perHostUpperBound;
     }
+    perInstanceMemEstimate = Math.max(perInstanceMemEstimate, MIN_MEMORY_ESTIMATE);
+    nodeResourceProfile_ = ResourceProfile.noReservation(perInstanceMemEstimate);
   }
 
   /**
@@ -871,9 +1252,21 @@ public class HdfsScanNode extends ScanNode {
    */
   public static long getPerHostMemUpperBound() {
     // THREADS_PER_CORE each using a default of
-    // MAX_IO_BUFFERS_PER_THREAD * IO_MGR_BUFFER_SIZE bytes.
-    return (long) RuntimeEnv.INSTANCE.getNumCores() * (long) THREADS_PER_CORE *
-        MAX_IO_BUFFERS_PER_THREAD * IO_MGR_BUFFER_SIZE;
+    // MAX_IO_BUFFERS_PER_THREAD * read_size bytes.
+    return (long) RuntimeEnv.INSTANCE.getNumCores() * (long) MAX_THREAD_TOKENS_PER_CORE *
+        MAX_IO_BUFFERS_PER_THREAD * BackendConfig.INSTANCE.getReadSize();
+  }
+
+  public ExprSubstitutionMap getOptimizedAggSmap() { return optimizedAggSmap_; }
+
+  @Override
+  public boolean isTableMissingTableStats() {
+    if (extrapolatedNumRows_ >= 0) return false;
+    if (tbl_.getNumClusteringCols() > 0
+        && numPartitionsWithNumRows_ != partitions_.size()) {
+      return true;
+    }
+    return super.isTableMissingTableStats();
   }
 
   @Override

@@ -11,6 +11,7 @@ table_name:hbasealltypeserror, constraint:restrict_to, table_format:hbase/none/n
 table_name:hbasealltypeserrornonulls, constraint:restrict_to, table_format:hbase/none/none
 
 table_name:alltypesinsert, constraint:restrict_to, table_format:text/none/none
+table_name:stringpartitionkey, constraint:restrict_to, table_format:text/none/none
 table_name:alltypesnopart_insert, constraint:restrict_to, table_format:text/none/none
 table_name:insert_overwrite_nopart, constraint:restrict_to, table_format:text/none/none
 table_name:insert_overwrite_partitioned, constraint:restrict_to, table_format:text/none/none
@@ -51,6 +52,7 @@ table_name:bad_column_metadata, constraint:restrict_to, table_format:parquet/non
 table_name:lineitem_multiblock, constraint:restrict_to, table_format:parquet/none/none
 table_name:lineitem_sixblocks, constraint:restrict_to, table_format:parquet/none/none
 table_name:lineitem_multiblock_one_row_group, constraint:restrict_to, table_format:parquet/none/none
+table_name:customer_multiblock, constraint:restrict_to, table_format:parquet/none/none
 
 # TODO: Support Avro. Data loading currently fails for Avro because complex types
 # cannot be converted to the corresponding Avro types yet.
@@ -130,6 +132,8 @@ table_name:decimal_tbl, constraint:restrict_to, table_format:text/none/none
 table_name:decimal_tiny, constraint:restrict_to, table_format:text/none/none
 table_name:decimal_tbl, constraint:restrict_to, table_format:parquet/none/none
 table_name:decimal_tiny, constraint:restrict_to, table_format:parquet/none/none
+table_name:decimal_tbl, constraint:restrict_to, table_format:kudu/none/none
+table_name:decimal_tiny, constraint:restrict_to, table_format:kudu/none/none
 
 table_name:avro_decimal_tbl, constraint:restrict_to, table_format:avro/snap/block
 
@@ -184,11 +188,17 @@ table_name:tinyinttable, constraint:only, table_format:kudu/none/none
 table_name:zipcode_incomes, constraint:only, table_format:kudu/none/none
 table_name:nulltable, constraint:only, table_format:kudu/none/none
 table_name:nullescapedtable, constraint:only, table_format:kudu/none/none
+table_name:decimal_tbl, constraint:only, table_format:kudu/none/none
+table_name:decimal_tiny, constraint:only, table_format:kudu/none/none
 
 # Skipping header lines is only effective with text tables
 table_name:table_with_header, constraint:restrict_to, table_format:text/none/none
 table_name:table_with_header_2, constraint:restrict_to, table_format:text/none/none
 table_name:table_with_header_insert, constraint:restrict_to, table_format:text/none/none
+# We also test that skipping header lines works on compressed tables (IMPALA-5287)
+table_name:table_with_header, constraint:restrict_to, table_format:text/gzip/block
+table_name:table_with_header_2, constraint:restrict_to, table_format:text/gzip/block
+table_name:table_with_header_insert, constraint:restrict_to, table_format:text/gzip/block
 # Inserting into parquet tables should not be affected by the 'skip.header.line.count'
 # property, so we test parquet format as well.
 table_name:table_with_header_insert, constraint:restrict_to, table_format:parquet/none/none

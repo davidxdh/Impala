@@ -19,6 +19,7 @@
 #include "runtime/row-batch.h"
 #include "util/string-parser.h"
 #include "runtime/string-value.inline.h"
+#include "runtime/tuple.h"
 
 #include "common/names.h"
 
@@ -33,11 +34,9 @@ using namespace impala;
 // This function takes more arguments than are strictly necessary (they could be
 // computed inside this function) but this is done to minimize the clang dependencies,
 // specifically, calling function on the scan node.
-int HdfsScanner::WriteAlignedTuples(MemPool* pool, TupleRow* tuple_row, int row_size,
+int HdfsScanner::WriteAlignedTuples(MemPool* pool, TupleRow* tuple_row,
     FieldLocation* fields, int num_tuples, int max_added_tuples,
-    int slots_per_tuple, int row_idx_start) {
-
-  DCHECK(scan_node_->HasRowBatchQueue());
+    int slots_per_tuple, int row_idx_start, bool copy_strings) {
   DCHECK(tuple_ != NULL);
   uint8_t* tuple_row_mem = reinterpret_cast<uint8_t*>(tuple_row);
   uint8_t* tuple_mem = reinterpret_cast<uint8_t*>(tuple_);
@@ -55,9 +54,16 @@ int HdfsScanner::WriteAlignedTuples(MemPool* pool, TupleRow* tuple_row, int row_
     // function.
     if (WriteCompleteTuple(pool, fields, tuple, tuple_row, template_tuple_,
           error, &error_in_row)) {
+      if (copy_strings) {
+        if (UNLIKELY(!tuple->CopyStrings("HdfsScanner::WriteAlignedTuples()",
+              state_, string_slot_offsets_.data(), string_slot_offsets_.size(), pool,
+              &parse_status_))) {
+          return -1;
+        }
+      }
       ++tuples_returned;
-      tuple_mem += tuple_byte_size_;
-      tuple_row_mem += row_size;
+      tuple_mem += tuple_byte_size();
+      tuple_row_mem += sizeof(Tuple*);
       tuple = reinterpret_cast<Tuple*>(tuple_mem);
       tuple_row = reinterpret_cast<TupleRow*>(tuple_row_mem);
     }
@@ -78,44 +84,83 @@ int HdfsScanner::WriteAlignedTuples(MemPool* pool, TupleRow* tuple_row, int row_
   return tuples_returned;
 }
 
-ExprContext* HdfsScanner::GetConjunctCtx(int idx) const {
-  return (*scanner_conjunct_ctxs_)[idx];
+ScalarExprEvaluator* HdfsScanner::GetConjunctEval(int idx) const {
+  return (*conjunct_evals_)[idx];
+}
+
+void StringToDecimalSymbolDummy() {
+  // Force linker to to link the object file containing these functions.
+  StringToDecimal4(nullptr, 0, 0, 0, false, nullptr);
+  StringToDecimal8(nullptr, 0, 0, 0, false, nullptr);
+  StringToDecimal16(nullptr, 0, 0, 0, false, nullptr);
 }
 
 // Define the string parsing functions for llvm.  Stamp out the templated functions
 #ifdef IR_COMPILE
+using ParseResult = StringParser::ParseResult;
 extern "C"
-bool IrStringToBool(const char* s, int len, StringParser::ParseResult* result) {
+bool IrStringToBool(const char* s, int len, ParseResult* result) {
   return StringParser::StringToBool(s, len, result);
 }
 
-int8_t IrStringToInt8(const char* s, int len, StringParser::ParseResult* result) {
+extern "C"
+int8_t IrStringToInt8(const char* s, int len, ParseResult* result) {
   return StringParser::StringToInt<int8_t>(s, len, result);
 }
 
 extern "C"
-int16_t IrStringToInt16(const char* s, int len, StringParser::ParseResult* result) {
+int16_t IrStringToInt16(const char* s, int len, ParseResult* result) {
   return StringParser::StringToInt<int16_t>(s, len, result);
 }
 
 extern "C"
-int32_t IrStringToInt32(const char* s, int len, StringParser::ParseResult* result) {
+int32_t IrStringToInt32(const char* s, int len, ParseResult* result) {
   return StringParser::StringToInt<int32_t>(s, len, result);
 }
 
 extern "C"
-int64_t IrStringToInt64(const char* s, int len, StringParser::ParseResult* result) {
+int64_t IrStringToInt64(const char* s, int len, ParseResult* result) {
   return StringParser::StringToInt<int64_t>(s, len, result);
 }
 
 extern "C"
-float IrStringToFloat(const char* s, int len, StringParser::ParseResult* result) {
+float IrStringToFloat(const char* s, int len, ParseResult* result) {
   return StringParser::StringToFloat<float>(s, len, result);
 }
 
 extern "C"
-double IrStringToDouble(const char* s, int len, StringParser::ParseResult* result) {
+double IrStringToDouble(const char* s, int len, ParseResult* result) {
   return StringParser::StringToFloat<double>(s, len, result);
+}
+
+extern "C"
+void IrStringToTimestamp(TimestampValue* out, const char* s, int len,
+    ParseResult* result) {
+  *out = StringParser::StringToTimestamp(s, len, result);
+}
+
+extern "C"
+Decimal4Value IrStringToDecimal4(const char* s, int len, int type_precision,
+    int type_scale, ParseResult* result)  {
+  auto ret = StringToDecimal4(s, len, type_precision, type_scale, false, result);
+  if (*result != ParseResult::PARSE_SUCCESS) *result = ParseResult::PARSE_FAILURE;
+  return ret;
+}
+
+extern "C"
+Decimal8Value IrStringToDecimal8(const char* s, int len, int type_precision,
+    int type_scale, ParseResult* result)  {
+  auto ret = StringToDecimal8(s, len, type_precision, type_scale, false, result);
+  if (*result != ParseResult::PARSE_SUCCESS) *result = ParseResult::PARSE_FAILURE;
+  return ret;
+}
+
+extern "C"
+Decimal16Value IrStringToDecimal16(const char* s, int len, int type_precision,
+    int type_scale, ParseResult* result)  {
+  auto ret = StringToDecimal16(s, len, type_precision, type_scale, false, result);
+  if (*result != ParseResult::PARSE_SUCCESS) *result = ParseResult::PARSE_FAILURE;
+  return ret;
 }
 
 extern "C"

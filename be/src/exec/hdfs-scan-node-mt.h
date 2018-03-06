@@ -40,16 +40,17 @@ class HdfsScanNodeMt : public HdfsScanNodeBase {
   HdfsScanNodeMt(ObjectPool* pool, const TPlanNode& tnode, const DescriptorTbl& descs);
   ~HdfsScanNodeMt();
 
-  virtual Status Prepare(RuntimeState* state);
-  virtual Status Open(RuntimeState* state);
-  virtual Status GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos);
+  virtual Status Prepare(RuntimeState* state) WARN_UNUSED_RESULT;
+  virtual Status Open(RuntimeState* state) WARN_UNUSED_RESULT;
+  virtual Status GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos)
+      WARN_UNUSED_RESULT;
   virtual void Close(RuntimeState* state);
 
   virtual bool HasRowBatchQueue() const { return false; }
 
  private:
   /// Current scan range and corresponding scanner.
-  DiskIoMgr::ScanRange* scan_range_;
+  io::ScanRange* scan_range_;
   boost::scoped_ptr<ScannerContext> scanner_ctx_;
   boost::scoped_ptr<HdfsScanner> scanner_;
 };

@@ -17,9 +17,8 @@
 
 package org.apache.impala.analysis;
 
-import org.junit.Test;
-
 import org.apache.impala.testutil.TestUtils;
+import org.junit.Test;
 
 public class AnalyzeUpsertStmtTest extends AnalyzerTest {
   @Test
@@ -63,9 +62,6 @@ public class AnalyzeUpsertStmtTest extends AnalyzerTest {
     // Hint
     AnalyzesOk("upsert into table functional_kudu.testtbl [clustered] select * from " +
         "functional_kudu.testtbl");
-    // Incorrect hint, results in warning
-    AnalyzesOk("upsert into table functional_kudu.testtbl [badhint] select * from " +
-        "functional_kudu.testtbl", "INSERT hint not recognized: badhint");
 
     // Key columns missing from permutation
     AnalysisError("upsert into functional_kudu.testtbl(zip) values(1)",
@@ -104,7 +100,8 @@ public class AnalyzeUpsertStmtTest extends AnalyzerTest {
         "UPSERT is only supported for Kudu tables");
     // Unknown target DB
     AnalysisError("upsert into UNKNOWNDB.testtbl select * " +
-        "from functional.alltypesnopart", "Database does not exist: UNKNOWNDB");
+        "from functional.alltypesnopart",
+        "Database does not exist: UNKNOWNDB");
     // WITH-clause tables cannot be upserted into
     AnalysisError("with t1 as (select 'a' x) upsert into t1 values('b' x)",
         "Table does not exist: default.t1");

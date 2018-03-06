@@ -17,14 +17,15 @@
 
 import getpass
 import pytest
+import re
 import time
 
 from test_ddl_base import TestDdlBase
 from tests.common.impala_test_suite import LOG
 from tests.common.parametrize import UniqueDatabase
-from tests.common.skip import SkipIf, SkipIfLocal, SkipIfOldAggsJoins
+from tests.common.skip import SkipIf, SkipIfADLS, SkipIfLocal
 from tests.common.test_dimensions import create_single_exec_option_dimension
-from tests.util.filesystem_utils import WAREHOUSE, IS_HDFS, IS_LOCAL, IS_S3
+from tests.util.filesystem_utils import WAREHOUSE, IS_HDFS, IS_S3, IS_ADLS
 
 # Validates DDL statements (create, drop)
 class TestDdlStatements(TestDdlBase):
@@ -53,11 +54,13 @@ class TestDdlStatements(TestDdlBase):
         format(getpass.getuser(), unique_database))
     # Drop the table (with purge) and make sure it doesn't exist in trash
     self.client.execute("drop table {0}.t2 purge".format(unique_database))
-    if not IS_S3:
+    if not IS_S3 and not IS_ADLS:
       # In S3, deletes are eventual. So even though we dropped the table, the files
-      # belonging to this table will still be visible for some unbounded time. This
+      # belonging to this table may still be visible for some unbounded time. This
       # happens only with PURGE. A regular DROP TABLE is just a copy of files which is
       # consistent.
+      # The ADLS Python client is not strongly consistent, so these files may still be
+      # visible after a DROP. (Remove after IMPALA-5335 is resolved)
       assert not self.filesystem_client.exists("test-warehouse/{0}.db/t2/".\
           format(unique_database))
       assert not self.filesystem_client.exists("test-warehouse/{0}.db/t2/t2.txt".\
@@ -82,6 +85,7 @@ class TestDdlStatements(TestDdlBase):
     self.filesystem_client.delete_file_dir(
         "test-warehouse/{0}.db/data_t3".format(unique_database), recursive=True)
 
+  @SkipIfADLS.eventually_consistent
   @SkipIfLocal.hdfs_client
   def test_drop_cleans_hdfs_dirs(self, unique_database):
     self.client.execute('use default')
@@ -129,6 +133,7 @@ class TestDdlStatements(TestDdlBase):
     # Re-create database to make unique_database teardown succeed.
     self._create_db(unique_database)
 
+  @SkipIfADLS.eventually_consistent
   @SkipIfLocal.hdfs_client
   def test_truncate_cleans_hdfs_files(self, unique_database):
     # Verify the db directory exists
@@ -192,7 +197,6 @@ class TestDdlStatements(TestDdlBase):
   # supported if old joins and aggs are enabled. Since we do not get any meaningful
   # additional coverage by running a DDL test under the old aggs and joins, it can be
   # skipped.
-  @SkipIfOldAggsJoins.nested_types
   @UniqueDatabase.parametrize(sync_ddl=True)
   def test_create_table(self, vector, unique_database):
     vector.get_value('exec_option')['abort_on_error'] = False
@@ -291,11 +295,13 @@ class TestDdlStatements(TestDdlBase):
     # Drop the partition (with purge) and make sure it doesn't exist in trash
     self.client.execute("alter table {0}.t1 drop partition(j=2) purge".\
         format(unique_database));
-    if not IS_S3:
+    if not IS_S3 and not IS_ADLS:
       # In S3, deletes are eventual. So even though we dropped the partition, the files
-      # belonging to this partition will still be visible for some unbounded time. This
+      # belonging to this partition may still be visible for some unbounded time. This
       # happens only with PURGE. A regular DROP TABLE is just a copy of files which is
       # consistent.
+      # The ADLS Python client is not strongly consistent, so these files may still be
+      # visible after a DROP. (Remove after IMPALA-5335 is resolved)
       assert not self.filesystem_client.exists("test-warehouse/{0}.db/t1/j=2/j2.txt".\
           format(unique_database))
       assert not self.filesystem_client.exists("test-warehouse/{0}.db/t1/j=2".\
@@ -312,6 +318,48 @@ class TestDdlStatements(TestDdlBase):
     vector.get_value('exec_option')['abort_on_error'] = False
     self.run_test_case('QueryTest/views-ddl', vector, use_db=unique_database,
         multiple_impalad=self._use_multiple_impalad(vector))
+
+  @UniqueDatabase.parametrize()
+  def test_view_hints(self, vector, unique_database):
+    # Test that plan hints are stored in the view's comment field; this should work
+    # regardless of how Hive formats the output.  Getting this to work with the
+    # automated test case runner is rather difficult, so verify directly.  There
+    # should be two # of each join hint, one for the original text, one for the expanded
+    self.client.execute("""
+        create view {0}.hints_test as
+        select /* +straight_join */ a.* from functional.alltypestiny a
+        inner join /* +broadcast */ functional.alltypes b on a.id = b.id
+        inner join /* +shuffle */ functional.alltypessmall c on b.id = c.id
+        """.format(unique_database))
+    results = self.execute_query("describe formatted %s.hints_test" % unique_database)
+    sj, bc, shuf = 0,0,0
+    for row in results.data:
+        sj += '-- +straight_join' in row
+        bc += '-- +broadcast' in row
+        shuf += '-- +shuffle' in row
+    assert sj == 2
+    assert bc == 2
+    assert shuf == 2
+
+    # Test querying the hinted view.
+    results = self.execute_query("select count(*) from %s.hints_test" % unique_database)
+    assert results.success
+    assert len(results.data) == 1
+    assert results.data[0] == '8'
+
+    # Test the plan to make sure hints were applied correctly
+    plan = self.execute_query("explain select * from %s.hints_test" % unique_database,
+        query_options={'explain_level':0})
+    assert """PLAN-ROOT SINK
+08:EXCHANGE [UNPARTITIONED]
+04:HASH JOIN [INNER JOIN, PARTITIONED]
+|--07:EXCHANGE [HASH(c.id)]
+|  02:SCAN HDFS [functional.alltypessmall c]
+06:EXCHANGE [HASH(b.id)]
+03:HASH JOIN [INNER JOIN, BROADCAST]
+|--05:EXCHANGE [BROADCAST]
+|  01:SCAN HDFS [functional.alltypes b]
+00:SCAN HDFS [functional.alltypestiny a]""" in '\n'.join(plan.data)
 
   @UniqueDatabase.parametrize(sync_ddl=True)
   def test_functions_ddl(self, vector, unique_database):
@@ -360,6 +408,26 @@ class TestDdlStatements(TestDdlBase):
     self.client.execute(
         "insert into table {0} partition(j=1, s='1') select 1".format(fq_tbl_name))
     assert '1' == self.execute_scalar("select count(*) from {0}".format(fq_tbl_name))
+
+  def test_alter_table_create_many_partitions(self, vector, unique_database):
+    """
+    Checks that creating more partitions than the MAX_PARTITION_UPDATES_PER_RPC
+    batch size works, in that it creates all the underlying partitions.
+    """
+    self.client.execute(
+        "create table {0}.t(i int) partitioned by (p int)".format(unique_database))
+    MAX_PARTITION_UPDATES_PER_RPC = 500
+    alter_stmt = "alter table {0}.t add ".format(unique_database) + " ".join(
+        "partition(p=%d)" % (i,) for i in xrange(MAX_PARTITION_UPDATES_PER_RPC + 2))
+    self.client.execute(alter_stmt)
+    partitions = self.client.execute("show partitions {0}.t".format(unique_database))
+    # Show partitions will contain partition HDFS paths, which we expect to contain
+    # "p=val" subdirectories for each partition. The regexp finds all the "p=[0-9]*"
+    # paths, converts them to integers, and checks that wehave all the ones we
+    # expect.
+    PARTITION_RE = re.compile("p=([0-9]+)")
+    assert map(int, PARTITION_RE.findall(str(partitions))) == \
+        range(MAX_PARTITION_UPDATES_PER_RPC + 2)
 
   def test_create_alter_tbl_properties(self, vector, unique_database):
     fq_tbl_name = unique_database + ".test_alter_tbl"

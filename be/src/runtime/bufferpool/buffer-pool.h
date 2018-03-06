@@ -20,11 +20,13 @@
 
 #include <stdint.h>
 #include <string>
+#include <vector>
 #include <boost/scoped_ptr.hpp>
 #include <boost/thread/locks.hpp>
 
 #include "common/atomic.h"
 #include "common/compiler-util.h"
+#include "common/object-pool.h"
 #include "common/status.h"
 #include "gutil/macros.h"
 #include "runtime/tmp-file-mgr.h"
@@ -35,9 +37,9 @@
 
 namespace impala {
 
-class BufferAllocator;
 class ReservationTracker;
 class RuntimeProfile;
+class SystemAllocator;
 
 /// A buffer pool that manages memory buffers for all queries in an Impala daemon.
 /// The buffer pool enforces buffer reservations, limits, and implements policies
@@ -51,14 +53,11 @@ class RuntimeProfile;
 ///
 /// All buffer pool operations are in the context of a registered buffer pool client.
 /// A buffer pool client should be created for every allocator of buffers at the level
-/// of granularity required for reporting and enforcement of reservations, e.g. an exec
-/// node. The client tracks buffer reservations via its ReservationTracker and also
+/// of granularity required for reporting and enforcement of reservations, e.g. an
+/// operator. The client tracks buffer reservations via its ReservationTracker and also
 /// includes info that is helpful for debugging (e.g. the operator that is associated
 /// with the buffer). Unless otherwise noted, it is not safe to invoke concurrent buffer
 /// pool operations for the same client.
-///
-/// TODO:
-/// * Decide on, document, and enforce upper limits on page size.
 ///
 /// Pages, Buffers and Pinning
 /// ==========================
@@ -84,7 +83,7 @@ class RuntimeProfile;
 /// buffers or pin pages summing up to n bytes. Reservations are both necessary and
 /// sufficient for a client to allocate buffers or pin pages: the operations succeed
 /// unless a "system error" such as a disk write error is encountered that prevents
-/// unpinned pages from being  to disk.
+/// unpinned pages from being written to disk.
 ///
 /// More memory may be reserved than is used, e.g. if a client is not using its full
 /// reservation. In such cases, the buffer pool can use the free buffers in any way,
@@ -98,9 +97,9 @@ class RuntimeProfile;
 /// page or buffer in the buffer pool. Handles are "open" if they are associated with a
 /// page or buffer. An open PageHandle is obtained by creating a page. PageHandles are
 /// closed by calling BufferPool::DestroyPage(). An open BufferHandle is obtained by
-/// allocating a buffer or extracting a BufferHandle from a PageHandle. A page's buffer
-/// can also be accessed through the PageHandle. The handle destructors check for
-/// resource leaks, e.g. an open handle that would result in a buffer leak.
+/// allocating a buffer or extracting a BufferHandle from a PageHandle. The buffer of a
+/// pinned page can also be accessed through the PageHandle. The handle destructors check
+/// for resource leaks, e.g. an open handle that would result in a buffer leak.
 ///
 /// Pin Counting of Page Handles:
 /// ----------------------------------
@@ -134,44 +133,56 @@ class RuntimeProfile;
 /// * Once the operator needs the page's contents again and has sufficient unused
 ///   reservation, it can call Pin(), which brings the page's contents back into memory,
 ///   perhaps in a different buffer. Therefore the operator must fix up any pointers into
-///   the previous buffer.
-/// * If the operator is done with the page, it can call FreeBuffer() to destroy the
+///   the previous buffer. Pin() executes asynchronously - the caller only blocks waiting
+///   for read I/O if it calls GetBuffer() or ExtractBuffer() while the read is in
+///   flight.
+/// * If the operator is done with the page, it can call DestroyPage() to destroy the
 ///   handle and release resources, or call ExtractBuffer() to extract the buffer.
 ///
 /// Synchronization
 /// ===============
 /// The data structures in the buffer pool itself are thread-safe. Client-owned data
 /// structures - Client, PageHandle and BufferHandle - are not protected from concurrent
-/// access by the buffer pool: clients must ensure that they do not invoke concurrent
-/// operations with the same Client, PageHandle or BufferHandle.
+/// accesses. Clients must ensure that they do not invoke concurrent operations with the
+/// same Client, PageHandle or BufferHandle.
 class BufferPool : public CacheLineAligned {
  public:
+  class BufferAllocator;
   class BufferHandle;
   class ClientHandle;
-  class Client;
   class PageHandle;
+  class SubReservation;
 
   /// Constructs a new buffer pool.
   /// 'min_buffer_len': the minimum buffer length for the pool. Must be a power of two.
   /// 'buffer_bytes_limit': the maximum physical memory in bytes that can be used by the
   ///     buffer pool. If 'buffer_bytes_limit' is not a multiple of 'min_buffer_len', the
   ///     remainder will not be usable.
-  BufferPool(int64_t min_buffer_len, int64_t buffer_bytes_limit);
+  /// 'clean_page_bytes_limit': the maximum bytes of clean pages that will be retained by the
+  ///     buffer pool.
+  BufferPool(int64_t min_buffer_len, int64_t buffer_bytes_limit,
+      int64_t clean_page_bytes_limit);
   ~BufferPool();
 
   /// Register a client. Returns an error status and does not register the client if the
   /// arguments are invalid. 'name' is an arbitrary name used to identify the client in
-  /// any errors messages or logging. Counters for this client are added to the (non-NULL)
-  /// 'profile'. 'client' is the client to register. 'client' should not already be
-  /// registered. If 'file_group' is non-NULL, it is used to allocate scratch space to
-  /// write unpinned pages to disk. If it is NULL, unpinning of pages is not allowed for
-  /// this client.
-  Status RegisterClient(const std::string& name, ReservationTracker* reservation,
-      TmpFileMgr::FileGroup* file_group, RuntimeProfile* profile,
+  /// any errors messages or logging. If 'file_group' is non-NULL, it is used to allocate
+  /// scratch space to write unpinned pages to disk. If it is NULL, unpinning of pages is
+  /// not allowed for this client. Counters for this client are added to the (non-NULL)
+  /// 'profile'. 'client' is the client to register. 'client' must not already be
+  /// registered.
+  ///
+  /// The client's reservation is created as a child of 'parent_reservation' with limit
+  /// 'reservation_limit' and associated with MemTracker 'mem_tracker'. The initial
+  /// reservation is 0 bytes.
+  Status RegisterClient(const std::string& name, TmpFileMgr::FileGroup* file_group,
+      ReservationTracker* parent_reservation, MemTracker* mem_tracker,
+      int64_t reservation_limit, RuntimeProfile* profile,
       ClientHandle* client) WARN_UNUSED_RESULT;
 
   /// Deregister 'client' if it is registered. All pages must be destroyed and buffers
-  /// must be freed for the client before calling this. Idempotent.
+  /// must be freed for the client before calling this. Releases any reservation that
+  /// belongs to the client. Idempotent.
   void DeregisterClient(ClientHandle* client);
 
   /// Create a new page of 'len' bytes with pin count 1. 'len' must be a page length
@@ -179,15 +190,19 @@ class BufferPool : public CacheLineAligned {
   /// sufficient unused reservation to pin the new page (otherwise it will DCHECK).
   /// CreatePage() only fails when a system error prevents the buffer pool from fulfilling
   /// the reservation.
-  /// On success, the handle is mapped to the new page.
-  Status CreatePage(
-      ClientHandle* client, int64_t len, PageHandle* handle) WARN_UNUSED_RESULT;
+  /// On success, the handle is mapped to the new page and 'buffer', if non-NULL, is set
+  /// to the page's buffer.
+  Status CreatePage(ClientHandle* client, int64_t len, PageHandle* handle,
+      const BufferHandle** buffer = nullptr) WARN_UNUSED_RESULT;
 
   /// Increment the pin count of 'handle'. After Pin() the underlying page will
-  /// be mapped to a buffer, which will be accessible through 'handle'. Uses
-  /// reservation from 'client'. The caller is responsible for ensuring it has enough
-  /// unused reservation before calling Pin() (otherwise it will DCHECK). Pin() only
-  /// fails when a system error prevents the buffer pool from fulfilling the reservation.
+  /// be mapped to a buffer, which will be accessible through 'handle'. If the data
+  /// was evicted from memory, it will be read back into memory asynchronously.
+  /// Attempting to access the buffer with ExtractBuffer() or handle.GetBuffer() will
+  /// block until the data is in memory. The caller is responsible for ensuring it has
+  /// enough unused reservation before calling Pin() (otherwise it will DCHECK). Pin()
+  /// only fails when a system error prevents the buffer pool from fulfilling the
+  /// reservation or if an I/O error is encountered reading back data from disk.
   /// 'handle' must be open.
   Status Pin(ClientHandle* client, PageHandle* handle) WARN_UNUSED_RESULT;
 
@@ -209,20 +224,39 @@ class BufferPool : public CacheLineAligned {
   /// Extracts buffer from a pinned page. After this returns, the page referenced by
   /// 'page_handle' will be destroyed and 'buffer_handle' will reference the buffer from
   /// 'page_handle'. This may decrease reservation usage of 'client' if the page was
-  /// pinned multiple times via 'page_handle'.
-  void ExtractBuffer(
-      ClientHandle* client, PageHandle* page_handle, BufferHandle* buffer_handle);
+  /// pinned multiple times via 'page_handle'. May return an error if 'page_handle' was
+  /// unpinned earlier with no subsequent GetBuffer() call and a read error is
+  /// encountered while bringing the page back into memory.
+  Status ExtractBuffer(ClientHandle* client, PageHandle* page_handle,
+      BufferHandle* buffer_handle) WARN_UNUSED_RESULT;
 
   /// Allocates a new buffer of 'len' bytes. Uses reservation from 'client'. The caller
   /// is responsible for ensuring it has enough unused reservation before calling
   /// AllocateBuffer() (otherwise it will DCHECK). AllocateBuffer() only fails when
   /// a system error prevents the buffer pool from fulfilling the reservation.
+  /// Safe to call concurrently with any other operations for 'client', except for
+  /// operations on the same 'handle'.
   Status AllocateBuffer(
       ClientHandle* client, int64_t len, BufferHandle* handle) WARN_UNUSED_RESULT;
 
-  /// If 'handle' is open, close 'handle', free the buffer and and decrease the
-  /// reservation usage from 'client'. Idempotent. Safe to call concurrently with
-  /// any other operations for 'client'.
+  /// Like AllocateBuffer(), except used when the client may not have the reservation
+  /// to allocate the buffer. Tries to increase reservation on the behalf of the client
+  /// if needed to allocate the buffer. If the reservation isn't available, 'handle'
+  /// isn't opened and OK is returned. If an unexpected error occurs, an error is
+  /// returned and any reservation increase remains in effect. Safe to call concurrently
+  /// with any other operations for 'client', except for operations on the same 'handle'.
+  ///
+  /// This function is a transitional mechanism for components to allocate memory from
+  /// the buffer pool without implementing the reservation accounting required to operate
+  /// within a predetermined memory constraint. Wherever possible, clients should reserve
+  /// memory ahead of time and allocate out of that instead of relying on this "best
+  /// effort" interface.
+  Status AllocateUnreservedBuffer(
+      ClientHandle* client, int64_t len, BufferHandle* handle) WARN_UNUSED_RESULT;
+
+  /// If 'handle' is open, close 'handle', free the buffer and decrease the reservation
+  /// usage from 'client'. Idempotent. Safe to call concurrently with other operations
+  /// for 'client', except for operations on the same 'handle'.
   void FreeBuffer(ClientHandle* client, BufferHandle* handle);
 
   /// Transfer ownership of buffer from 'src_client' to 'dst_client' and move the
@@ -230,82 +264,66 @@ class BufferPool : public CacheLineAligned {
   /// decreases reservation usage in 'src_client'. 'src' must be open and 'dst' must be
   /// closed before calling. 'src'/'dst' and 'src_client'/'dst_client' must be different.
   /// After a successful call, 'src' is closed and 'dst' is open. Safe to call
-  /// concurrently with any other operations for 'src_client'.
+  /// concurrently with any other operations for 'src_client', except for operations
+  /// on the same handles.
   Status TransferBuffer(ClientHandle* src_client, BufferHandle* src,
       ClientHandle* dst_client, BufferHandle* dst) WARN_UNUSED_RESULT;
+
+  /// Try to release at least 'bytes_to_free' bytes of memory to the system allocator.
+  /// TODO: once IMPALA-4834 is done and all large allocations are served from the buffer
+  /// pool, this may not be necessary.
+  void ReleaseMemory(int64_t bytes_to_free);
+
+  /// Called periodically by a maintenance thread to release unused memory back to the
+  /// system allocator.
+  void Maintenance();
 
   /// Print a debug string with the state of the buffer pool.
   std::string DebugString();
 
   int64_t min_buffer_len() const { return min_buffer_len_; }
-  int64_t buffer_bytes_limit() const { return buffer_bytes_limit_; }
+  int64_t GetSystemBytesLimit() const;
+  int64_t GetSystemBytesAllocated() const;
+
+  /// Return the limit on bytes of clean pages in the pool.
+  int64_t GetCleanPageBytesLimit() const;
+
+  /// Return the total number of clean pages in the pool.
+  int64_t GetNumCleanPages() const;
+
+  /// Return the total bytes of clean pages in the pool.
+  int64_t GetCleanPageBytes() const;
+
+  /// Return the total number of free buffers in the pool.
+  int64_t GetNumFreeBuffers() const;
+
+  /// Return the total bytes of free buffers in the pool.
+  int64_t GetFreeBufferBytes() const;
+
+  /// Generous upper bounds on page and buffer size and the number of different
+  /// power-of-two buffer sizes.
+  static constexpr int LOG_MAX_BUFFER_BYTES = 48;
+  static constexpr int64_t MAX_BUFFER_BYTES = 1L << LOG_MAX_BUFFER_BYTES;
+
+ protected:
+  friend class BufferPoolTest;
+  /// Test helper: get a reference to the allocator.
+  BufferAllocator* allocator() { return allocator_.get(); }
 
  private:
   DISALLOW_COPY_AND_ASSIGN(BufferPool);
+  class Client;
+  class FreeBufferArena;
+  class PageList;
   struct Page;
-  /// Allocate a buffer of length 'len'. Assumes that the client's reservation has already
-  /// been consumed for the buffer. Returns an error if the pool is unable to fulfill the
-  /// reservation. This function may acquire 'clean_pages_lock_' and Page::lock so
-  /// no locks lower in the lock acquisition order (see buffer-pool-internal.h) should be
-  /// held by the caller.
-  Status AllocateBufferInternal(
-      ClientHandle* client, int64_t len, BufferHandle* buffer) WARN_UNUSED_RESULT;
 
-  /// Frees 'buffer', which must be open before calling. Closes 'buffer' and updates
-  /// internal state but does not release to any reservation.
-  void FreeBufferInternal(BufferHandle* buffer);
-
-  /// Decrease 'buffer_bytes_remaining_' by up to 'len', down to a minimum of 0.
-  /// Returns the amount it was decreased by.
-  int64_t DecreaseBufferBytesRemaining(int64_t max_decrease);
-
-  /// Adds a clean page 'page' to the global clean pages list, unless the page is in the
-  /// process of being cleaned up. Caller must hold the page's client's lock via
-  /// 'client_lock' so that moving the page between a client list and the global free
-  /// page list is atomic. Caller must not hold 'clean_pages_lock_' or any Page::lock.
-  void AddCleanPage(const boost::unique_lock<boost::mutex>& client_lock, Page* page);
-
-  /// Removes a clean page 'page' from the global clean pages list, if present. Returns
-  /// true if it was present. Caller must hold the page's client's lock via
-  /// 'client_lock' so that moving the page between list is atomic and there is not a
-  /// window so that moving the page between a client list and the global free page list
-  /// is atomic. Caller must not hold 'clean_pages_lock_' or any Page::lock.
-  bool RemoveCleanPage(const boost::unique_lock<boost::mutex>& client_lock, Page* page);
-
-  /// Evict at least 'bytes_to_evict' bytes of clean pages and free the associated
-  /// buffers with 'allocator_'. Any bytes freed in excess of 'bytes_to_evict' are
-  /// added to 'buffer_bytes_remaining_.'
-  ///
-  /// Returns an error and adds any freed bytes to 'buffer_bytes_remaining_' if not
-  /// enough bytes could be evicted. This will only happen if there is an internal
-  /// bug: if all clients write out enough dirty pages to stay within their reservation,
-  /// then there should always be enough clean pages.
-  Status EvictCleanPages(int64_t bytes_to_evict);
-
-  /// Allocator for allocating and freeing all buffer memory.
+  /// Allocator for allocating and freeing all buffer memory and managing lists of free
+  /// buffers and clean pages.
   boost::scoped_ptr<BufferAllocator> allocator_;
 
   /// The minimum length of a buffer in bytes. All buffers and pages are a power-of-two
   /// multiple of this length. This is always a power of two.
   const int64_t min_buffer_len_;
-
-  /// The maximum physical memory in bytes that can be used for buffers.
-  const int64_t buffer_bytes_limit_;
-
-  /// The remaining number of bytes of 'buffer_bytes_limit_' that can be used for
-  /// allocating new buffers. Must be updated atomically before a new buffer is
-  /// allocated or after an existing buffer is freed.
-  /// TODO: reconsider this to avoid all threads contending on this one value.
-  AtomicInt64 buffer_bytes_remaining_;
-
-  /// Unpinned pages that have had their contents written to disk. These pages can be
-  /// evicted to allocate a buffer for any client. Pages are evicted in FIFO order,
-  /// so that pages are evicted in approximately the same order that the clients wrote
-  /// them to disk. 'clean_pages_lock_' protects 'clean_pages_'.
-  /// TODO: consider breaking up by page size
-  /// TODO: consider breaking up by core/NUMA node to improve locality
-  alignas(CACHE_LINE_SIZE) SpinLock clean_pages_lock_;
-  InternalList<Page> clean_pages_;
 };
 
 /// External representation of a client of the BufferPool. Clients are used for
@@ -316,25 +334,94 @@ class BufferPool : public CacheLineAligned {
 /// Client methods or BufferPool methods with the Client as an argument is not supported.
 class BufferPool::ClientHandle {
  public:
-  ClientHandle() : reservation_(NULL) {}
+  ClientHandle() : impl_(NULL) {}
   /// Client must be deregistered.
   ~ClientHandle() { DCHECK(!is_registered()); }
 
-  bool is_registered() const { return reservation_ != NULL; }
-  ReservationTracker* reservation() { return reservation_; }
+  /// Request to increase reservation for this client by 'bytes' by calling
+  /// ReservationTracker::IncreaseReservation(). Returns true if the reservation was
+  /// successfully increased.
+  bool IncreaseReservation(int64_t bytes) WARN_UNUSED_RESULT;
+
+  /// Tries to ensure that 'bytes' of unused reservation is available for this client
+  /// to use by calling ReservationTracker::IncreaseReservationToFit(). Returns true
+  /// if successful, after which 'bytes' can be used.
+  bool IncreaseReservationToFit(int64_t bytes) WARN_UNUSED_RESULT;
+
+  /// Try to decrease this client's reservation down to a minimum of 'target_bytes' by
+  /// releasing unused reservation to ancestor ReservationTrackers, all the way up to
+  /// the root of the ReservationTracker tree. May block waiting for unpinned pages to
+  /// be flushed. This client's reservation must be at least 'target_bytes' before
+  /// calling this method. May fail if decreasing the reservation requires flushing
+  /// unpinned pages to disk and a write to disk fails.
+  Status DecreaseReservationTo(int64_t target_bytes) WARN_UNUSED_RESULT;
+
+  /// Move some of this client's reservation to the SubReservation. 'bytes' of unused
+  /// reservation must be available in this tracker.
+  void SaveReservation(SubReservation* dst, int64_t bytes);
+
+  /// Move some of src's reservation to this client. 'bytes' of unused reservation must be
+  /// available in 'src'.
+  void RestoreReservation(SubReservation* src, int64_t bytes);
+
+  /// Accessors for this client's reservation corresponding to the identically-named
+  /// methods in ReservationTracker.
+  int64_t GetReservation() const;
+  int64_t GetUsedReservation() const;
+  int64_t GetUnusedReservation() const;
+
+  /// Try to transfer 'bytes' of reservation from 'src' to this client using
+  /// ReservationTracker::TransferReservationTo().
+  bool TransferReservationFrom(ReservationTracker* src, int64_t bytes);
+
+  /// Transfer 'bytes' of reservation from this client to 'dst' using
+  /// ReservationTracker::TransferReservationTo().
+  bool TransferReservationTo(ReservationTracker* dst, int64_t bytes);
+
+  /// Call SetDebugDenyIncreaseReservation() on this client's ReservationTracker.
+  void SetDebugDenyIncreaseReservation(double probability);
+
+  bool is_registered() const { return impl_ != NULL; }
+
+  /// Return true if there are any unpinned pages for this client.
+  bool has_unpinned_pages() const;
 
   std::string DebugString() const;
 
  private:
   friend class BufferPool;
+  friend class BufferPoolTest;
+  friend class SubReservation;
   DISALLOW_COPY_AND_ASSIGN(ClientHandle);
 
-  /// The reservation tracker for the client. NULL means the client isn't registered.
-  /// All pages pinned by the client count as usage against 'reservation_'.
-  ReservationTracker* reservation_;
-
-  /// Internal state for the client. Owned by BufferPool.
+  /// Internal state for the client. NULL means the client isn't registered.
+  /// Owned by BufferPool.
   Client* impl_;
+};
+
+/// Helper class that allows dividing up a client's reservation into separate buckets.
+class BufferPool::SubReservation {
+ public:
+  SubReservation(ClientHandle* client);
+  ~SubReservation();
+
+  /// Returns the amount of reservation stored in this sub-reservation.
+  int64_t GetReservation() const;
+
+  /// Releases the sub-reservation to the client's tracker. Must be called before
+  /// destruction.
+  void Close();
+
+  bool is_closed() const { return tracker_ == nullptr; }
+
+ private:
+  friend class BufferPool::ClientHandle;
+  DISALLOW_COPY_AND_ASSIGN(SubReservation);
+
+  /// Child of the client's tracker used to track the sub-reservation. Usage is not
+  /// tracked against this tracker - instead the reservation is always transferred back
+  /// to the client's tracker before use.
+  boost::scoped_ptr<ReservationTracker> tracker_;
 };
 
 /// A handle to a buffer allocated from the buffer pool. Each BufferHandle should only
@@ -342,15 +429,16 @@ class BufferPool::ClientHandle {
 /// BufferPool methods with the BufferHandle as an argument is not supported.
 class BufferPool::BufferHandle {
  public:
-  BufferHandle();
+  BufferHandle() { Reset(); }
   ~BufferHandle() { DCHECK(!is_open()); }
 
-  /// Allow move construction of handles, to support std::move().
-  BufferHandle(BufferHandle&& src);
+  /// Allow move construction of handles to support std::move(). Inline to make moving
+  /// efficient.
+  inline BufferHandle(BufferHandle&& src);
 
-  /// Allow move assignment of handles, to support STL classes like std::vector.
-  /// Destination must be uninitialized.
-  BufferHandle& operator=(BufferHandle&& src);
+  /// Allow move assignment of handles to support STL classes like std::vector.
+  /// Destination must be uninitialized. Inline to make moving efficient.
+  inline BufferHandle& operator=(BufferHandle&& src);
 
   bool is_open() const { return data_ != NULL; }
   int64_t len() const {
@@ -367,18 +455,28 @@ class BufferPool::BufferHandle {
 
   std::string DebugString() const;
 
+  /// Poison the memory associated with this handle. If ASAN is not enabled, this is a
+  /// no-op.
+  void Poison() { ASAN_POISON_MEMORY_REGION(data(), len()); }
+
+  /// Unpoison the memory associated with this handle. If ASAN is not enabled, this is a
+  /// no-op.
+  void Unpoison() { ASAN_UNPOISON_MEMORY_REGION(data(), len()); }
+
  private:
   DISALLOW_COPY_AND_ASSIGN(BufferHandle);
   friend class BufferPool;
+  friend class SystemAllocator;
 
   /// Internal helper to set the handle to an opened state.
-  void Open(const ClientHandle* client, uint8_t* data, int64_t len);
+  void Open(uint8_t* data, int64_t len, int home_core);
 
-  /// Internal helper to reset the handle to an unopened state.
-  void Reset();
+  /// Internal helper to reset the handle to an unopened state. Inlined to make moving
+  /// efficient.
+  inline void Reset();
 
   /// The client the buffer handle belongs to, used to validate that the correct client
-  /// is provided in BufferPool method calls.
+  /// is provided in BufferPool method calls. Set to NULL if the buffer is in a free list.
   const ClientHandle* client_;
 
   /// Pointer to the start of the buffer. Non-NULL if open, NULL if closed.
@@ -386,6 +484,10 @@ class BufferPool::BufferHandle {
 
   /// Length of the buffer in bytes.
   int64_t len_;
+
+  /// The CPU core that the buffer was allocated from - used to determine which arena
+  /// it will be added to.
+  int home_core_;
 };
 
 /// The handle for a page used by clients of the BufferPool. Each PageHandle should
@@ -407,19 +509,15 @@ class BufferPool::PageHandle {
   bool is_pinned() const { return pin_count() > 0; }
   int pin_count() const;
   int64_t len() const;
-  /// Get a pointer to the start of the page's buffer. Only valid to call if the page
-  /// is pinned.
-  uint8_t* data() const { return buffer_handle()->data(); }
 
-  /// Convenience function to get the memory range for the page's buffer. Only valid to
-  /// call if the page is pinned.
-  MemRange mem_range() const { return buffer_handle()->mem_range(); }
-
-  /// Return a pointer to the page's buffer handle. Only valid to call if the page is
-  /// pinned via this handle. Only const accessors of the returned handle can be used:
-  /// it is invalid to call FreeBuffer() or TransferBuffer() on it or to otherwise modify
-  /// the handle.
-  const BufferHandle* buffer_handle() const;
+  /// Get a reference to the page's buffer handle. Only valid to call if the page is
+  /// pinned. If the page was previously unpinned and the read I/O for the data is still
+  /// in flight, this can block waiting. Returns an error if an error was encountered
+  /// reading the data back, which can only happen if Unpin() was called on the page
+  /// since the last call to GetBuffer(). Only const accessors of the returned handle can
+  /// be used: it is invalid to call FreeBuffer() or TransferBuffer() on it or to
+  /// otherwise modify the handle.
+  Status GetBuffer(const BufferHandle** buffer_handle) const WARN_UNUSED_RESULT;
 
   std::string DebugString() const;
 
@@ -427,7 +525,7 @@ class BufferPool::PageHandle {
   DISALLOW_COPY_AND_ASSIGN(PageHandle);
   friend class BufferPool;
   friend class BufferPoolTest;
-  friend class Page;
+  friend struct Page;
 
   /// Internal helper to open the handle for the given page.
   void Open(Page* page, ClientHandle* client);
@@ -438,10 +536,33 @@ class BufferPool::PageHandle {
   /// The internal page structure. NULL if the handle is not open.
   Page* page_;
 
-  /// The client the page handle belongs to, used to validate that the correct client
-  /// is being used.
-  const ClientHandle* client_;
+  /// The client the page handle belongs to.
+  ClientHandle* client_;
 };
+
+inline BufferPool::BufferHandle::BufferHandle(BufferHandle&& src) {
+  Reset();
+  *this = std::move(src);
+}
+
+inline BufferPool::BufferHandle& BufferPool::BufferHandle::operator=(
+    BufferHandle&& src) {
+  DCHECK(!is_open());
+  // Copy over all members then close src.
+  client_ = src.client_;
+  data_ = src.data_;
+  len_ = src.len_;
+  home_core_ = src.home_core_;
+  src.Reset();
+  return *this;
+}
+
+inline void BufferPool::BufferHandle::Reset() {
+  client_ = NULL;
+  data_ = NULL;
+  len_ = -1;
+  home_core_ = -1;
+}
 }
 
 #endif

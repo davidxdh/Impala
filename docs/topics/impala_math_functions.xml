@@ -859,6 +859,77 @@ select mod(9.9,3.0);
 
       </dlentry>
 
+      <dlentry id="murmur_hash" rev="IMPALA-3651 2.12.0">
+
+        <dt rev="2.12.0">
+          <codeph>murmur_hash(type v)</codeph>
+        </dt>
+
+        <dd rev="2.12.0">
+          <indexterm audience="hidden">murmur_hash() function</indexterm>
+          <b>Purpose:</b> Returns a consistent 64-bit value derived from the input argument, for convenience of
+          implementing <xref keyref="MurmurHash"> MurmurHash2</xref> non-cryptographic hash function.
+          <p>
+            <b>Return type:</b> <codeph>BIGINT</codeph>
+          </p>
+          <p conref="../shared/impala_common.xml#common/usage_notes_blurb"/>
+          <p>
+            You might use the return value in an application where you perform load balancing, bucketing, or some
+            other technique to divide processing or storage. This function provides a good performance for all kinds
+            of keys such as number, ascii string and UTF-8. It can be recommended as general-purpose hashing function.
+          </p>
+          <p>
+            Regarding comparison of murmur_hash with fnv_hash, murmur_hash is based on Murmur2 hash algorithm and fnv_hash
+            function is based on FNV-1a hash algorithm. Murmur2 and FNV-1a can show very good randomness and performance
+            compared with well known other hash algorithms, but Murmur2 slightly show better randomness and performance than FNV-1a.
+            See <xref keyref="hash_functions1">[1]</xref><xref keyref="hash_functions2">[2]</xref><xref keyref="hash_functions1">[3]</xref> for details.
+          </p>
+          <p>
+            Similar input values of different types could produce different hash values, for example the same
+            numeric value represented as <codeph>SMALLINT</codeph> or <codeph>BIGINT</codeph>,
+            <codeph>FLOAT</codeph> or <codeph>DOUBLE</codeph>, or <codeph>DECIMAL(5,2)</codeph> or
+            <codeph>DECIMAL(20,5)</codeph>.
+          </p>
+          <p conref="../shared/impala_common.xml#common/example_blurb"/>
+<codeblock>[localhost:21000] &gt; create table h (x int, s string);
+[localhost:21000] &gt; insert into h values (0, 'hello'), (1,'world'), (1234567890,'antidisestablishmentarianism');
+[localhost:21000] &gt; select x, murmur_hash(x) from h;
++------------+----------------------+
+| x          | murmur_hash(x)       |
++------------+----------------------+
+| 0          | 6960269033020761575  |
+| 1          | -780611581681153783  |
+| 1234567890 | -5754914572385924334 |
++------------+----------------------+
+[localhost:21000] &gt; select s, murmur_hash(s) from h;
++------------------------------+----------------------+
+| s                            | murmur_hash(s)       |
++------------------------------+----------------------+
+| hello                        | 2191231550387646743  |
+| world                        | 5568329560871645431  |
+| antidisestablishmentarianism | -2261804666958489663 |
++------------------------------+----------------------+ </codeblock>
+          <p>
+            For short argument values, the high-order bits of the result have relatively higher entropy than fnv_hash:
+          </p>
+<codeblock>[localhost:21000] &gt; create table b (x boolean);
+[localhost:21000] &gt; insert into b values (true), (true), (false), (false);
+[localhost:21000] &gt; select x, murmur_hash(x) from b;
++-------+----------------------+
+| x     | murmur_hash(x)       |
++-------+---------------------++
+| true  | -5720937396023583481 |
+| true  | -5720937396023583481 |
+| false | 6351753276682545529  |
+| false | 6351753276682545529  |
++-------+--------------------+-+</codeblock>
+          <p>
+            <b>Added in:</b> Impala 2.12.0
+          </p>
+        </dd>
+
+      </dlentry>
+
       <dlentry rev="1.4.0" id="negative">
 
         <dt rev="2.0.1">
@@ -1327,63 +1398,204 @@ select x, unix_timestamp(now()), rand(unix_timestamp(now()))
 
         <dt rev="2.3.0">
           <codeph>truncate(double_or_decimal a[, digits_to_leave])</codeph>,
-          <ph id="dtrunc"><codeph>dtrunc(double_or_decimal a[, digits_to_leave])</codeph></ph>
+          <ph id="dtrunc"><codeph>dtrunc(double_or_decimal a[, digits_to_leave])</codeph></ph>,
+          <ph rev="2.10.0 IMPALA-5529" id="trunc_number"><codeph>trunc(double_or_decimal a[, digits_to_leave])</codeph></ph>
         </dt>
 
         <dd rev="2.3.0">
           <indexterm audience="hidden">truncate() function</indexterm>
           <indexterm audience="hidden">dtrunc() function</indexterm>
+          <indexterm audience="hidden">trunc() function</indexterm>
           <b>Purpose:</b> Removes some or all fractional digits from a numeric value.
-          With no argument, removes all fractional digits, leaving an integer value.
-          The optional argument specifies the number of fractional digits to include
-          in the return value, and only applies with the argument type is <codeph>DECIMAL</codeph>.
-          <codeph>truncate()</codeph> and <codeph>dtrunc()</codeph> are aliases for the same function.
+          <p>
+            <b>Arguments:</b>
+            With a single floating-point argument, removes all fractional digits, leaving an
+            integer value. The optional second argument specifies the number of fractional digits
+            to include in the return value, and only applies when the argument type is
+            <codeph>DECIMAL</codeph>. A second argument of 0 truncates to a whole integer value.
+            A second argument of negative N sets N digits to 0 on the left side of the decimal
+          </p>
+          <p rev="2.10.0 IMPALA-5529">
+            <b>Scale argument:</b> The scale argument applies only when truncating
+            <codeph>DECIMAL</codeph> values. It is an integer specifying how many
+            significant digits to leave to the right of the decimal point.
+            A scale argument of 0 truncates to a whole integer value. A scale
+            argument of negative N sets N digits to 0 on the left side of the decimal
+            point.
+          </p>
+          <p>
+            <codeph>truncate()</codeph>, <codeph>dtrunc()</codeph>,
+            <ph rev="2.10.0 IMPALA-5529">and <codeph>trunc()</codeph></ph> are aliases for the
+            same function.
+          </p>
           <p>
             <b>Return type:</b> <codeph>decimal</codeph> for <codeph>DECIMAL</codeph> arguments;
             <codeph>bigint</codeph> for <codeph>DOUBLE</codeph> arguments
           </p>
+          <p>
+            <b>Added in:</b> The <codeph>trunc()</codeph> alias was added in
+            <keyword keyref="impala210_full"/>.
+          </p>
+          <p conref="../shared/impala_common.xml#common/usage_notes_blurb"/>
+          <p rev="2.10.0 IMPALA-5529">
+            You can also pass a <codeph>DOUBLE</codeph> argument, or <codeph>DECIMAL</codeph>
+            argument with optional scale, to the <codeph>dtrunc()</codeph> or
+            <codeph>truncate</codeph> functions. Using the <codeph>trunc()</codeph>
+            function for numeric values is common with other industry-standard database
+            systems, so you might find such <codeph>trunc()</codeph> calls in code that you
+            are porting to Impala.
+          </p>
+          <p>
+            The <codeph>trunc()</codeph> function also has a signature that applies to
+            <codeph>TIMESTAMP</codeph> values. See <xref keyref="datetime_functions"/>
+            for details.
+          </p>
           <p conref="../shared/impala_common.xml#common/example_blurb"/>
-<codeblock>select truncate(3.45)
+          <p>
+            The following examples demonstrate the <codeph>truncate()</codeph>
+            and <codeph>dtrunc()</codeph> signatures for this function:
+          </p>
+<codeblock>select truncate(3.45);
 +----------------+
 | truncate(3.45) |
 +----------------+
 | 3              |
 +----------------+
 
-select truncate(-3.45)
+select truncate(-3.45);
 +-----------------+
 | truncate(-3.45) |
 +-----------------+
 | -3              |
 +-----------------+
 
-select truncate(3.456,1)
+select truncate(3.456,1);
 +--------------------+
 | truncate(3.456, 1) |
 +--------------------+
 | 3.4                |
 +--------------------+
 
-select dtrunc(3.456,1)
+select dtrunc(3.456,1);
 +------------------+
 | dtrunc(3.456, 1) |
 +------------------+
 | 3.4              |
 +------------------+
 
-select truncate(3.456,2)
+select truncate(3.456,2);
 +--------------------+
 | truncate(3.456, 2) |
 +--------------------+
 | 3.45               |
 +--------------------+
 
-select truncate(3.456,7)
+select truncate(3.456,7);
 +--------------------+
 | truncate(3.456, 7) |
 +--------------------+
 | 3.4560000          |
 +--------------------+
+</codeblock>
+          <p rev="2.10.0 IMPALA-5529">
+            The following examples demonstrate using <codeph>trunc()</codeph> with
+            <codeph>DECIMAL</codeph> or <codeph>DOUBLE</codeph> values, and with
+            an optional scale argument for <codeph>DECIMAL</codeph> values.
+            (The behavior is the same for the <codeph>truncate()</codeph> and
+            <codeph>dtrunc()</codeph> aliases also.)
+          </p>
+<codeblock rev="2.10.0 IMPALA-5529">
+create table t1 (d decimal(20,7));
+
+-- By default, no digits to the right of the decimal point.
+insert into t1 values (1.1), (2.22), (3.333), (4.4444), (5.55555);
+select trunc(d) from t1 order by d;
++----------+
+| trunc(d) |
++----------+
+| 1        |
+| 2        |
+| 3        |
+| 4        |
+| 5        |
++----------+
+
+-- 1 digit to the right of the decimal point.
+select trunc(d,1) from t1 order by d;
++-------------+
+| trunc(d, 1) |
++-------------+
+| 1.1         |
+| 2.2         |
+| 3.3         |
+| 4.4         |
+| 5.5         |
++-------------+
+
+-- 2 digits to the right of the decimal point,
+-- including trailing zeroes if needed.
+select trunc(d,2) from t1 order by d;
++-------------+
+| trunc(d, 2) |
++-------------+
+| 1.10        |
+| 2.22        |
+| 3.33        |
+| 4.44        |
+| 5.55        |
++-------------+
+
+insert into t1 values (9999.9999), (8888.8888);
+
+-- Negative scale truncates digits to the left
+-- of the decimal point.
+select trunc(d,-2) from t1 where d > 100 order by d;
++--------------+
+| trunc(d, -2) |
++--------------+
+| 8800         |
+| 9900         |
++--------------+
+
+-- The scale of the result is adjusted to match the
+-- scale argument.
+select trunc(d,2),
+  precision(trunc(d,2)) as p,
+  scale(trunc(d,2)) as s
+from t1 order by d;
++-------------+----+---+
+| trunc(d, 2) | p  | s |
++-------------+----+---+
+| 1.10        | 15 | 2 |
+| 2.22        | 15 | 2 |
+| 3.33        | 15 | 2 |
+| 4.44        | 15 | 2 |
+| 5.55        | 15 | 2 |
+| 8888.88     | 15 | 2 |
+| 9999.99     | 15 | 2 |
++-------------+----+---+
+</codeblock>
+
+<codeblock rev="2.10.0 IMPALA-5529">
+create table dbl (d double);
+
+insert into dbl values
+  (1.1), (2.22), (3.333), (4.4444), (5.55555),
+  (8888.8888), (9999.9999);
+
+-- With double values, there is no optional scale argument.
+select trunc(d) from dbl order by d;
++----------+
+| trunc(d) |
++----------+
+| 1        |
+| 2        |
+| 3        |
+| 4        |
+| 5        |
+| 8888     |
+| 9999     |
++----------+
 </codeblock>
         </dd>
 

@@ -46,7 +46,6 @@ StringVal IncrementNdvFinalize(FunctionContext* ctx, const StringVal& src) {
   StringVal result_str(ctx, src.len);
   if (UNLIKELY(result_str.is_null)) return result_str;
   memcpy(result_str.ptr, src.ptr, src.len);
-  ctx->Free(src.ptr);
   return result_str;
 }
 
@@ -166,8 +165,7 @@ struct PerColumnStats {
   // avg_width contain valid values.
   void Finalize() {
     ndv_estimate = AggregateFunctions::HllFinalEstimate(
-        reinterpret_cast<const uint8_t*>(intermediate_ndv.data()),
-        intermediate_ndv.size());
+        reinterpret_cast<const uint8_t*>(intermediate_ndv.data()));
     avg_width = num_rows == 0 ? 0 : avg_width / num_rows;
   }
 

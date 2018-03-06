@@ -90,6 +90,7 @@ under the License.
     [, ...]
   )
   [PARTITIONED BY (<varname>col_name</varname> <varname>data_type</varname> [COMMENT '<varname>col_comment</varname>'], ...)]
+  <ph rev="2.9.0 IMPALA-4166">[SORT BY ([<varname>column</varname> [, <varname>column</varname> ...]])]</ph>
   [COMMENT '<varname>table_comment</varname>']
   [WITH SERDEPROPERTIES ('<varname>key1</varname>'='<varname>value1</varname>', '<varname>key2</varname>'='<varname>value2</varname>', ...)]
   [
@@ -106,10 +107,11 @@ under the License.
 
 <codeblock>CREATE [EXTERNAL] TABLE [IF NOT EXISTS] <varname>db_name</varname>.]<varname>table_name</varname>
   <ph rev="2.5.0">[PARTITIONED BY (<varname>col_name</varname>[, ...])]</ph>
+  <ph rev="2.9.0 IMPALA-4166">[SORT BY ([<varname>column</varname> [, <varname>column</varname> ...]])]</ph>
   [COMMENT '<varname>table_comment</varname>']
   [WITH SERDEPROPERTIES ('<varname>key1</varname>'='<varname>value1</varname>', '<varname>key2</varname>'='<varname>value2</varname>', ...)]
   [
-   [ROW FORMAT <varname>row_format</varname>] <ph rev="CDH-41501">[STORED AS <varname>ctas_file_format</varname>]</ph>
+   [ROW FORMAT <varname>row_format</varname>] <ph rev="">[STORED AS <varname>ctas_file_format</varname>]</ph>
   ]
   [LOCATION '<varname>hdfs_path</varname>']
   [TBLPROPERTIES ('<varname>key1</varname>'='<varname>value1</varname>', '<varname>key2</varname>'='<varname>value2</varname>', ...)]
@@ -153,7 +155,7 @@ file_format:
   | SEQUENCEFILE
   | RCFILE
 
-<ph rev="CDH-41501">ctas_file_format:
+<ph rev="">ctas_file_format:
     PARQUET
   | TEXTFILE</ph>
 </codeblock>
@@ -164,6 +166,7 @@ file_format:
 
 <codeblock>CREATE [EXTERNAL] TABLE [IF NOT EXISTS] [<varname>db_name</varname>.]<varname>table_name</varname>
   LIKE PARQUET '<varname>hdfs_path_of_parquet_file</varname>'
+  <ph rev="2.9.0 IMPALA-4166">[SORT BY ([<varname>column</varname> [, <varname>column</varname> ...]])]</ph>
   [COMMENT '<varname>table_comment</varname>']
   [PARTITIONED BY (<varname>col_name</varname> <varname>data_type</varname> [COMMENT '<varname>col_comment</varname>'], ...)]
   [WITH SERDEPROPERTIES ('<varname>key1</varname>'='<varname>value1</varname>', '<varname>key2</varname>'='<varname>value2</varname>', ...)]
@@ -191,7 +194,7 @@ data_type:
     [, ...]
     [PRIMARY KEY (<varname>col_name</varname>[, ...])]
   )
-  <ph rev="kudu">[PARTITION BY <varname>kudu_partition_clause</varname></ph>
+  <ph rev="kudu">[PARTITION BY <varname>kudu_partition_clause</varname>]</ph>
   [COMMENT '<varname>table_comment</varname>']
   STORED AS KUDU
   [TBLPROPERTIES ('<varname>key1</varname>'='<varname>value1</varname>', '<varname>key2</varname>'='<varname>value2</varname>', ...)]
@@ -212,7 +215,7 @@ data_type:
     <p rev="kudu IMPALA-3719">
       <b>kudu_partition_clause:</b>
 <codeblock rev="kudu">
-kudu_partition_clause ::= PARTITION BY [<varname>hash_clause</varname>] [, <varname>range_clause</varname> [ , <varname>range_clause</varname> ] ]
+kudu_partition_clause ::= [<varname>hash_clause</varname>] [, <varname>range_clause</varname> [ , <varname>range_clause</varname> ] ]
 
 hash_clause ::=
   HASH [ (<varname>pk_col</varname> [, ...]) ]
@@ -248,7 +251,7 @@ range_comparison_operator ::= { &lt; | &lt;= }
 
 <codeblock rev="kudu">CREATE TABLE [IF NOT EXISTS] <varname>db_name</varname>.]<varname>table_name</varname>
   [PRIMARY KEY (<varname>col_name</varname>[, ...])]
-  [PARTITION BY <varname>kudu_partition_clause</varname>
+  [PARTITION BY <varname>kudu_partition_clause</varname>]
   [COMMENT '<varname>table_comment</varname>']
   STORED AS KUDU
   [TBLPROPERTIES ('<varname>key1</varname>'='<varname>value1</varname>', '<varname>key2</varname>'='<varname>value2</varname>', ...)]
@@ -364,6 +367,14 @@ AS
         tables. See the <codeph>PARTITION BY</codeph> clause, rather than <codeph>PARTITIONED
         BY</codeph>, for Kudu tables.
       </p>
+      <p rev="IMPALA-5546">
+        In <keyword keyref="impala210_full"/> and higher, the <codeph>PARTITION BY</codeph>
+        clause is optional for Kudu tables. If the clause is omitted, Impala automatically
+        constructs a single partition that is not connected to any column. Because such a
+        table cannot take advantage of Kudu features for parallelized queries and
+        query optimizations, omitting the <codeph>PARTITION BY</codeph> clause is only
+        appropriate for small lookup tables.
+      </p>
     </note>
 
     <p rev="2.5.0">
@@ -375,6 +386,83 @@ AS
       SELECT</codeph> syntax variation.
     </p>
 
+    <p rev="2.9.0 IMPALA-4166">
+      <b>Sorted tables (SORT BY clause):</b>
+    </p>
+
+    <p rev="2.9.0 IMPALA-4166">
+      The optional <codeph>SORT BY</codeph> clause lets you specify zero or more columns
+      that are sorted in the data files created by each Impala <codeph>INSERT</codeph> or
+      <codeph>CREATE TABLE AS SELECT</codeph> operation. Creating data files that are
+      sorted is most useful for Parquet tables, where the metadata stored inside each file includes
+      the minimum and maximum values for each column in the file. (The statistics apply to each row group
+      within the file; for simplicity, Impala writes a single row group in each file.) Grouping
+      data values together in relatively narrow ranges within each data file makes it possible
+      for Impala to quickly skip over data files that do not contain value ranges indicated in
+      the <codeph>WHERE</codeph> clause of a query, and can improve the effectiveness
+      of Parquet encoding and compression.
+    </p>
+
+    <p rev="2.9.0 IMPALA-4166">
+      This clause is not applicable for Kudu tables or HBase tables. Although it works
+      for other HDFS file formats besides Parquet, the more efficient layout is most
+      evident with Parquet tables, because each Parquet data file includes statistics
+      about the data values in that file.
+    </p>
+
+    <p rev="2.9.0 IMPALA-4166">
+      The <codeph>SORT BY</codeph> columns cannot include any partition key columns
+      for a partitioned table, because those column values are not represented in
+      the underlying data files.
+    </p>
+
+    <p rev="2.9.0 IMPALA-4166">
+      Because data files can arrive in Impala tables by mechanisms that do not respect
+      the <codeph>SORT BY</codeph> clause, such as <codeph>LOAD DATA</codeph> or ETL
+      tools that create HDFS files, Impala does not guarantee or rely on the data being
+      sorted. The sorting aspect is only used to create a more efficient layout for
+      Parquet files generated by Impala, which helps to optimize the processing of
+      those Parquet files during Impala queries. During an <codeph>INSERT</codeph>
+      or <codeph>CREATE TABLE AS SELECT</codeph> operation, the sorting occurs
+      when the <codeph>SORT BY</codeph> clause applies to the destination table
+      for the data, regardless of whether the source table has a <codeph>SORT BY</codeph>
+      clause.
+    </p>
+
+    <p rev="2.9.0 IMPALA-4166">
+      For example, when creating a table intended to contain census data, you might define
+      sort columns such as last name and state. If a data file in this table contains a
+      narrow range of last names, for example from <codeph>Smith</codeph> to <codeph>Smythe</codeph>,
+      Impala can quickly detect that this data file contains no matches for a <codeph>WHERE</codeph>
+      clause such as <codeph>WHERE last_name = 'Jones'</codeph> and avoid reading the entire file.
+    </p>
+
+<codeblock rev="2.9.0 IMPALA-4166">CREATE TABLE census_data (last_name STRING, first_name STRING, state STRING, address STRING)
+  SORT BY (last_name, state)
+  STORED AS PARQUET;
+</codeblock>
+
+    <p rev="2.9.0 IMPALA-4166">
+      Likewise, if an existing table contains data without any sort order, you can reorganize
+      the data in a more efficient way by using <codeph>INSERT</codeph> or
+      <codeph>CREATE TABLE AS SELECT</codeph> to copy that data into a new table with a
+      <codeph>SORT BY</codeph> clause:
+    </p>
+
+<codeblock rev="2.9.0 IMPALA-4166">CREATE TABLE sorted_census_data
+  SORT BY (last_name, state)
+  STORED AS PARQUET
+  AS SELECT last_name, first_name, state, address
+    FROM unsorted_census_data;
+</codeblock>
+
+    <p rev="2.9.0 IMPALA-4166">
+      The metadata for the <codeph>SORT BY</codeph> clause is stored in the <codeph>TBLPROPERTIES</codeph>
+      fields for the table. Other SQL engines that can interoperate with Impala tables, such as Hive
+      and Spark SQL, do not recognize this property when inserting into a table that has a <codeph>SORT BY</codeph>
+      clause.
+    </p>
+
     <p rev="kudu" conref="../shared/impala_common.xml#common/kudu_blurb"/>
 
     <p rev="kudu">
@@ -382,16 +470,24 @@ AS
       partitioning mechanisms, the syntax associated with the <codeph>STORED AS KUDU</codeph>
       clause is shown separately in the above syntax descriptions. Kudu tables have their own
       syntax for <codeph>CREATE TABLE</codeph>, <codeph>CREATE EXTERNAL TABLE</codeph>, and
-      <codeph>CREATE TABLE AS SELECT</codeph>. All internal Kudu tables require a
-      <codeph>PARTITION BY</codeph> clause, different than the <codeph>PARTITIONED BY</codeph>
-      clause for HDFS-backed tables.
+      <codeph>CREATE TABLE AS SELECT</codeph>. <ph rev="IMPALA-2256">Prior to <keyword keyref="impala210_full"/>,
+      all internal Kudu tables require a <codeph>PARTITION BY</codeph> clause, different than
+      the <codeph>PARTITIONED BY</codeph> clause for HDFS-backed tables.</ph>
     </p>
 
     <p>
       Here are some examples of creating empty Kudu tables:
     </p>
 
-<codeblock><![CDATA[
+<codeblock>
+<ph rev="IMPALA-2256">-- Single partition. Only for <keyword keyref="impala210_full"/> and higher.
+-- Only suitable for small lookup tables.
+CREATE TABLE kudu_no_partition_by_clause
+  (
+    id bigint PRIMARY KEY, s STRING, b BOOLEAN
+  )
+  STORED AS KUDU;</ph>
+
 -- Single-column primary key.
 CREATE TABLE kudu_t1 (id BIGINT PRIMARY key, s STRING, b BOOLEAN)
   PARTITION BY HASH (id) PARTITIONS 20 STORED AS KUDU;
@@ -400,7 +496,7 @@ CREATE TABLE kudu_t1 (id BIGINT PRIMARY key, s STRING, b BOOLEAN)
 CREATE TABLE kudu_t2 (id BIGINT, s STRING, b BOOLEAN, PRIMARY KEY (id,s))
   PARTITION BY HASH (s) PARTITIONS 30 STORED AS KUDU;
 
--- Meaningful primary key column is good for range partitioning.
+<![CDATA[-- Meaningful primary key column is good for range partitioning.
 CREATE TABLE kudu_t3 (id BIGINT, year INT, s STRING,
     b BOOLEAN, PRIMARY KEY (id,year))
   PARTITION BY HASH (id) PARTITIONS 20,
@@ -438,10 +534,6 @@ CREATE TABLE ctas_t1
   AS SELECT id, s FROM kudu_t1;
 ]]>
 </codeblock>
-
-<!-- This clause restriction and other syntax nuances come from this blog post:
-     http://blog.cloudera.com/blog/2015/11/how-to-use-impala-with-kudu/
-     which has some details and examples not found in the actual Kudu docs. -->
 
     <p rev="kudu">
       The following <codeph>CREATE TABLE</codeph> clauses are not supported for Kudu tables:
@@ -1159,7 +1251,7 @@ ERROR: AnalysisException: Partition column name mismatch: year != month
       the data files in S3.
     </p>
 
-    <p rev="2.6.0 CDH-39913 IMPALA-1878">
+    <p rev="2.6.0 IMPALA-1878">
       In <keyword keyref="impala26_full"/> and higher, you can use this special
       <codeph>LOCATION</codeph> syntax as part of a <codeph>CREATE TABLE AS SELECT</codeph>
       statement.
@@ -1190,7 +1282,7 @@ ERROR: AnalysisException: Partition column name mismatch: year != month
 
     <p conref="../shared/impala_common.xml#common/permissions_blurb"/>
 
-    <p rev="CDH-19187">
+    <p rev="">
       The user ID that the <cmdname>impalad</cmdname> daemon runs under, typically the
       <codeph>impala</codeph> user, must have both execute and write permission for the database
       directory where the table is being created.

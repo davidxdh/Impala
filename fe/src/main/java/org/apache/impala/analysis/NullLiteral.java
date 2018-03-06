@@ -28,7 +28,6 @@ public class NullLiteral extends LiteralExpr {
 
   public NullLiteral() {
     type_ = Type.NULL;
-    evalCost_ = LITERAL_COST;
   }
 
   /**
@@ -46,12 +45,6 @@ public class NullLiteral extends LiteralExpr {
     l.analyzeNoThrow(null);
     l.uncheckedCastTo(type);
     return l;
-  }
-
-  @Override
-  public boolean equals(Object obj) {
-    if (!super.equals(obj)) return false;
-    return obj instanceof NullLiteral;
   }
 
   @Override

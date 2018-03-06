@@ -19,10 +19,11 @@
 #ifndef IMPALA_UTIL_RUNTIME_PROFILE_COUNTERS_H
 #define IMPALA_UTIL_RUNTIME_PROFILE_COUNTERS_H
 
+#include <algorithm>
 #include <boost/scoped_ptr.hpp>
 #include <boost/unordered_map.hpp>
-#include <sys/time.h>
 #include <sys/resource.h>
+#include <sys/time.h>
 
 #include "common/atomic.h"
 #include "common/logging.h"
@@ -48,6 +49,8 @@ namespace impala {
   #define ADD_TIMER(profile, name) (profile)->AddCounter(name, TUnit::TIME_NS)
   #define ADD_SUMMARY_STATS_TIMER(profile, name) \
       (profile)->AddSummaryStatsCounter(name, TUnit::TIME_NS)
+  #define ADD_SUMMARY_STATS_COUNTER(profile, name, unit) \
+      (profile)->AddSummaryStatsCounter(name, unit)
   #define ADD_CHILD_TIMER(profile, name, parent) \
       (profile)->AddCounter(name, TUnit::TIME_NS, parent)
   #define SCOPED_TIMER(c) \
@@ -275,11 +278,10 @@ class RuntimeProfile::ThreadCounters {
   Counter* involuntary_context_switches_;
 };
 
-/// An EventSequence captures a sequence of events (each added by
-/// calling MarkEvent). Each event has a text label, and a time
-/// (measured relative to the moment Start() was called as t=0). It is
-/// useful for tracking the evolution of some serial process, such as
-/// the query lifecycle.
+/// An EventSequence captures a sequence of events (each added by calling MarkEvent()).
+/// Each event has a text label and a time (measured relative to the moment Start() was
+/// called as t=0, or to the parameter 'when' passed to Start(int64_t when)). It is useful
+/// for tracking the evolution of some serial process, such as the query lifecycle.
 class RuntimeProfile::EventSequence {
  public:
   EventSequence() { }
@@ -296,12 +298,23 @@ class RuntimeProfile::EventSequence {
   /// Starts the timer without resetting it.
   void Start() { sw_.Start(); }
 
+  /// Starts the timer. All events will be recorded as if the timer had been started at
+  /// 'start_time_ns', which must have been obtained by calling MonotonicStopWatch::Now().
+  void Start(int64_t start_time_ns) {
+    offset_ = MonotonicStopWatch::Now() - start_time_ns;
+    // TODO: IMPALA-4631: Occasionally we see MonotonicStopWatch::Now() return
+    // (start_time_ns - 1), even though 'start_time_ns' was obtained using
+    // MonotonicStopWatch::Now().
+    DCHECK_GE(offset_, -1);
+    sw_.Start();
+  }
+
   /// Stores an event in sequence with the given label and the current time
   /// (relative to the first time Start() was called) as the timestamp.
-  void MarkEvent(const std::string& label) {
-    Event event = make_pair(label, sw_.ElapsedTime());
+  void MarkEvent(std::string label) {
+    Event event = make_pair(move(label), sw_.ElapsedTime() + offset_);
     boost::lock_guard<SpinLock> event_lock(lock_);
-    events_.push_back(event);
+    events_.emplace_back(move(event));
   }
 
   int64_t ElapsedTime() { return sw_.ElapsedTime(); }
@@ -309,28 +322,58 @@ class RuntimeProfile::EventSequence {
   /// An Event is a <label, timestamp> pair.
   typedef std::pair<std::string, int64_t> Event;
 
-  /// An EventList is a sequence of Events, in increasing timestamp order.
+  /// An EventList is a sequence of Events.
   typedef std::vector<Event> EventList;
 
-  /// Copies the member events_ into the supplied vector 'events'.
-  /// The supplied vector 'events' is cleared before this.
+  /// Returns a copy of 'events_' in the supplied vector 'events', sorted by their
+  /// timestamps. The supplied vector 'events' is cleared before this.
   void GetEvents(std::vector<Event>* events) {
     events->clear();
     boost::lock_guard<SpinLock> event_lock(lock_);
+    /// It's possible that MarkEvent() logs concurrent events out of sequence so we sort
+    /// the events each time we are here.
+    SortEvents();
     events->insert(events->end(), events_.begin(), events_.end());
   }
 
-  void ToThrift(TEventSequence* seq) const;
+  /// Adds all events from the input parameters that are newer than the last member of
+  /// 'events_'. The caller must make sure that 'timestamps' is sorted. Does not adjust
+  /// added timestamps by 'offset_'.
+  void AddNewerEvents(
+      const std::vector<int64_t>& timestamps, const std::vector<std::string>& labels) {
+    DCHECK_EQ(timestamps.size(), labels.size());
+    DCHECK(std::is_sorted(timestamps.begin(), timestamps.end()));
+    boost::lock_guard<SpinLock> event_lock(lock_);
+    int64_t last_timestamp = events_.back().second;
+    for (int64_t i = 0; i < timestamps.size(); ++i) {
+      if (timestamps[i] <= last_timestamp) continue;
+      events_.push_back(make_pair(labels[i], timestamps[i]));
+    }
+  }
+
+  void ToThrift(TEventSequence* seq);
 
  private:
+  /// Sorts events by their timestamp. Caller must hold lock_.
+  void SortEvents() {
+    std::sort(events_.begin(), events_.end(),
+        [](Event const &event1, Event const &event2) {
+        return event1.second < event2.second;
+      });
+  }
+
   /// Protect access to events_.
   SpinLock lock_;
 
-  /// Stored in increasing time order.
+  /// Sequence of events. Due to a race in MarkEvent() these are not necessarily ordered.
   EventList events_;
 
   /// Timer which allows events to be timestamped when they are recorded.
   MonotonicStopWatch sw_;
+
+  /// Constant offset that gets added to each event's timestamp. This allows to
+  /// synchronize events captured in multiple threads to a common starting point.
+  int64_t offset_ = 0;
 };
 
 typedef StreamingSampler<int64_t, 64> StreamingCounterSampler;

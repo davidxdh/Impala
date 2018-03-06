@@ -19,13 +19,12 @@ package org.apache.impala.analysis;
 
 import static org.junit.Assert.fail;
 
-import org.junit.Ignore;
-import org.junit.Test;
-
-import org.apache.impala.authorization.AuthorizationConfig;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.FrontendTestBase;
 import org.apache.impala.testutil.TestUtils;
+import org.junit.Ignore;
+import org.junit.Test;
+
 import com.google.common.base.Preconditions;
 
 // TODO: Expand this test, in particular, because view creation relies
@@ -67,22 +66,6 @@ public class ToSqlTest extends FrontendTestBase {
     }
   }
 
-  private static AnalysisContext.AnalysisResult analyze(String query, String defaultDb) {
-    try {
-      AnalysisContext analysisCtx = new AnalysisContext(catalog_,
-          TestUtils.createQueryContext(defaultDb, System.getProperty("user.name")),
-          AuthorizationConfig.createAuthDisabledConfig());
-      analysisCtx.analyze(query);
-      AnalysisContext.AnalysisResult analysisResult = analysisCtx.getAnalysisResult();
-      Preconditions.checkNotNull(analysisResult.getStmt());
-      return analysisResult;
-    } catch (Exception e) {
-      e.printStackTrace();
-      fail("Failed to analyze query: " + query + "\n" + e.getMessage());
-    }
-    return null;
-  }
-
   private void testToSql(String query, String expected) {
     testToSql(query, System.getProperty("user.name"), expected);
   }
@@ -92,17 +75,18 @@ public class ToSqlTest extends FrontendTestBase {
   }
 
   private void testToSql(String query, String defaultDb, String expected,
-      boolean ignore_whitespace) {
+      boolean ignoreWhitespace) {
     String actual = null;
     try {
-      ParseNode node = AnalyzesOk(query, createAnalyzer(defaultDb));
+      ParseNode node = AnalyzesOk(query, createAnalysisCtx(defaultDb));
       actual = node.toSql();
-      if (ignore_whitespace) {
+      if (ignoreWhitespace) {
         // Transform whitespace to single space.
         actual = actual.replace('\n', ' ').replaceAll(" +", " ").trim();
       }
       if (!actual.equals(expected)) {
-        String msg = "Expected: " + expected + "\n  Actual: " + actual + "\n";
+        String msg = "\n<<< Expected(length:" + expected.length() + "): [" + expected
+          + "]\n>>> Actual(length:" + actual.length() + "): [" + actual + "]\n";
         System.err.println(msg);
         fail(msg);
       }
@@ -111,7 +95,7 @@ public class ToSqlTest extends FrontendTestBase {
       fail("Failed to analyze query: " + query + "\n" + e.getMessage());
     }
     // Parse and analyze the resulting SQL to ensure its validity.
-    AnalyzesOk(actual, createAnalyzer(defaultDb));
+    AnalyzesOk(actual, createAnalysisCtx(defaultDb));
   }
 
   private void runTestTemplate(String sql, String expectedSql, String[]... testDims) {
@@ -150,7 +134,7 @@ public class ToSqlTest extends FrontendTestBase {
     Preconditions.checkState(query.contains("$TBL"));
     String uqQuery = query.replace("$TBL", tbl.getTbl());
     testToSql(uqQuery, tbl.getDb(), expectedSql);
-    AnalyzesOk(uqQuery, createAnalyzer(tbl.getDb()));
+    AnalyzesOk(uqQuery, createAnalysisCtx(tbl.getDb()));
     String fqQuery = query.replace("$TBL", tbl.toString());
     testToSql(fqQuery, expectedSql);
   }
@@ -296,22 +280,82 @@ public class ToSqlTest extends FrontendTestBase {
 
   @Test
   public void TestCreateTable() throws AnalysisException {
-    testToSql("create table p (a int) partitioned by (day string) " +
+    testToSql("create table p (a int) partitioned by (day string) sort by (a) " +
         "comment 'This is a test'",
         "default",
         "CREATE TABLE default.p ( a INT ) PARTITIONED BY ( day STRING ) " +
-        "COMMENT 'This is a test' STORED AS TEXTFILE", true);
+        "SORT BY ( a ) COMMENT 'This is a test' STORED AS TEXTFILE" , true);
+    // Table with SORT BY clause.
+    testToSql("create table p (a int, b int) partitioned by (day string) sort by (a ,b) ",
+        "default",
+        "CREATE TABLE default.p ( a INT, b INT ) PARTITIONED BY ( day STRING ) " +
+        "SORT BY ( a, b ) STORED AS TEXTFILE" , true);
+    // Kudu table with a TIMESTAMP column default value
+    testToSql("create table p (a bigint primary key, b timestamp default '1987-05-19') " +
+        "partition by hash(a) partitions 3 stored as kudu " +
+        "tblproperties ('kudu.master_addresses'='foo')",
+        "default",
+        "CREATE TABLE default.p ( a BIGINT PRIMARY KEY, b TIMESTAMP " +
+        "DEFAULT '1987-05-19' ) PARTITION BY HASH (a) PARTITIONS 3 " +
+        "STORED AS KUDU TBLPROPERTIES ('kudu.master_addresses'='foo', " +
+        "'storage_handler'='com.cloudera.kudu.hive.KuduStorageHandler')", true);
   }
 
   @Test
   public void TestCreateTableAsSelect() throws AnalysisException {
     // Partitioned table.
     testToSql("create table p partitioned by (int_col) as " +
-        "select double_col, int_col from functional.alltypes",
-        "default",
+        "select double_col, int_col from functional.alltypes", "default",
         "CREATE TABLE default.p PARTITIONED BY ( int_col ) STORED AS " +
         "TEXTFILE AS SELECT double_col, int_col FROM functional.alltypes",
         true);
+    // Table with a comment.
+    testToSql("create table p partitioned by (int_col) comment 'This is a test' as " +
+        "select double_col, int_col from functional.alltypes", "default",
+        "CREATE TABLE default.p PARTITIONED BY ( int_col ) COMMENT 'This is a test' " +
+        "STORED AS TEXTFILE AS SELECT double_col, int_col FROM functional.alltypes",
+        true);
+    // Table with SORT BY clause.
+    testToSql("create table p partitioned by (int_col) sort by (string_col) as " +
+        "select double_col, string_col, int_col from functional.alltypes", "default",
+        "CREATE TABLE default.p PARTITIONED BY ( int_col ) SORT BY ( string_col ) " +
+        "STORED AS TEXTFILE AS SELECT double_col, string_col, int_col FROM " +
+        "functional.alltypes", true);
+    // Kudu table with multiple partition params
+    testToSql("create table p primary key (a,b) partition by hash(a) partitions 3, " +
+        "range (b) (partition value = 1) stored as kudu " +
+        "tblproperties ('kudu.master_addresses'='foo') as select int_col a, bigint_col " +
+        "b from functional.alltypes",
+        "default",
+        "CREATE TABLE default.p PRIMARY KEY (a, b) PARTITION BY HASH (a) PARTITIONS 3, " +
+        "RANGE (b) (PARTITION VALUE = 1) STORED AS KUDU TBLPROPERTIES " +
+        "('kudu.master_addresses'='foo', " +
+        "'storage_handler'='com.cloudera.kudu.hive.KuduStorageHandler') AS " +
+        "SELECT int_col a, bigint_col b FROM functional.alltypes", true);
+  }
+
+  @Test
+  public void TestCreateTableLike() throws AnalysisException {
+    testToSql("create table p like functional.alltypes", "default",
+        "CREATE TABLE p LIKE functional.alltypes");
+    // Table with sort columns.
+    testToSql("create table p sort by (id) like functional.alltypes", "default",
+        "CREATE TABLE p SORT BY (id) LIKE functional.alltypes");
+  }
+
+  @Test
+  public void TestCreateTableLikeFile() throws AnalysisException {
+    testToSql("create table if not exists p like parquet " +
+        "'/test-warehouse/schemas/alltypestiny.parquet'", "default",
+        "CREATE TABLE IF NOT EXISTS default.p LIKE PARQUET " +
+        "'hdfs://localhost:20500/test-warehouse/schemas/alltypestiny.parquet' " +
+        "STORED AS TEXTFILE", true);
+    // Table with sort columns.
+    testToSql("create table if not exists p like parquet " +
+        "'/test-warehouse/schemas/alltypestiny.parquet' sort by (int_col, id)", "default",
+        "CREATE TABLE IF NOT EXISTS default.p LIKE PARQUET " +
+        "'hdfs://localhost:20500/test-warehouse/schemas/alltypestiny.parquet' " +
+        "SORT BY ( int_col, id ) STORED AS TEXTFILE", true);
   }
 
   @Test
@@ -401,6 +445,22 @@ public class ToSqlTest extends FrontendTestBase {
         "SELECT `1 + 10`, `trim('abc')` FROM (SELECT 1 + 10, trim('abc')) t");
   }
 
+  @Test
+  public void normalizeStringLiteralTest() {
+    testToSql("select \"'\"", "SELECT '\\''");
+    testToSql("select \"\\'\"", "SELECT '\\''");
+    testToSql("select \"\\\\'\"", "SELECT '\\\\\\''");
+    testToSql("select '\"'", "SELECT '\"'");
+    testToSql("select '\\\"'", "SELECT '\"'");
+    testToSql("select '\\''", "SELECT '\\''");
+    testToSql("select '\\\\\\''", "SELECT '\\\\\\''");
+    testToSql("select regexp_replace(string_col, \"\\\\'\", \"'\") from " +
+        "functional.alltypes", "SELECT regexp_replace(string_col, '\\\\\\'', '\\'') " +
+        "FROM functional.alltypes");
+    testToSql("select * from functional.alltypes where '123' = \"123\"",
+        "SELECT * FROM functional.alltypes WHERE '123' = '123'");
+  }
+
   // Test the toSql() output of the where clause.
   @Test
   public void whereTest() {
@@ -439,6 +499,46 @@ public class ToSqlTest extends FrontendTestBase {
         joinTypes_, joinConditions_);
   }
 
+  private void planHintsTestForInsertAndUpsert(String prefix, String suffix) {
+    for (InsertStmt.HintLocation loc: InsertStmt.HintLocation.values()) {
+      // Insert hint.
+      testToSql(InjectInsertHint(
+            "insert%s into functional.alltypes(int_col, bool_col) " +
+            "partition(year, month)%s" +
+            "select int_col, bool_col, year, month from functional.alltypes",
+          String.format(" %snoshuffle%s", prefix, suffix), loc),
+          InjectInsertHint("INSERT%s INTO TABLE functional.alltypes(int_col, " +
+            "bool_col) PARTITION (year, month)%s " +
+            "SELECT int_col, bool_col, year, month FROM functional.alltypes",
+            " \n-- +noshuffle\n", loc));
+      testToSql(InjectInsertHint(
+            "insert%s into functional.alltypes(int_col, bool_col) " +
+            "partition(year, month)%s" +
+            "select int_col, bool_col, year, month from functional.alltypes",
+          String.format(" %sshuffle,clustered%s", prefix, suffix), loc),
+          InjectInsertHint("INSERT%s INTO TABLE functional.alltypes(int_col, " +
+            "bool_col) PARTITION (year, month)%s " +
+            "SELECT int_col, bool_col, year, month FROM functional.alltypes",
+            " \n-- +shuffle,clustered\n", loc));
+
+      // Upsert hint.
+      testToSql(InjectInsertHint(
+            "upsert%s into functional_kudu.alltypes(id, int_col)%s" +
+            "select id, int_col from functional_kudu.alltypes",
+          String.format(" %snoshuffle%s", prefix, suffix), loc),
+          InjectInsertHint("UPSERT%s INTO TABLE functional_kudu.alltypes(id, int_col)" +
+            "%s SELECT id, int_col FROM functional_kudu.alltypes",
+            " \n-- +noshuffle\n", loc));
+      testToSql(InjectInsertHint(
+            "upsert%s into functional_kudu.alltypes(id, int_col)%s" +
+            "select id, int_col from functional_kudu.alltypes",
+          String.format(" %sshuffle,clustered%s", prefix, suffix), loc),
+          InjectInsertHint("UPSERT%s INTO TABLE functional_kudu.alltypes(id, int_col)" +
+            "%s SELECT id, int_col FROM functional_kudu.alltypes",
+            " \n-- +shuffle,clustered\n", loc));
+    }
+  }
+
   /**
    * Tests that the toSql() of plan hints use the end-of-line commented hint style
    * (for view compatibility with Hive) regardless of what style was used in the
@@ -446,14 +546,12 @@ public class ToSqlTest extends FrontendTestBase {
    */
   @Test
   public void planHintsTest() {
-    String[][] hintStyles = new String[][] {
-        new String[] { "/* +", "*/" }, // traditional commented hint
-        new String[] { "\n-- +", "\n" }, // eol commented hint
-        new String[] { "[", "]" } // legacy style
-    };
-    for (String[] hintStyle: hintStyles) {
+    for (String[] hintStyle: hintStyles_) {
       String prefix = hintStyle[0];
       String suffix = hintStyle[1];
+
+      // Hint in Insert/Upsert.
+      planHintsTestForInsertAndUpsert(prefix, suffix);
 
       // Join hint.
       testToSql(String.format(
@@ -462,34 +560,24 @@ public class ToSqlTest extends FrontendTestBase {
           "SELECT * FROM functional.alltypes a INNER JOIN \n-- +broadcast\n " +
           "functional.alltypes b ON a.id = b.id");
 
-      // Insert hint.
-      testToSql(String.format(
-          "insert into functional.alltypes(int_col, bool_col) " +
-          "partition(year, month) %snoshuffle,sortby(int_col)%s " +
-          "select int_col, bool_col, year, month from functional.alltypes",
-          prefix, suffix),
-          "INSERT INTO TABLE functional.alltypes(int_col, bool_col) " +
-              "PARTITION (year, month) \n-- +noshuffle,sortby(int_col)\n " +
-          "SELECT int_col, bool_col, year, month FROM functional.alltypes");
-
       // Table hint
       testToSql(String.format(
-          "select * from functional.alltypes at %sschedule_random_replica%s", prefix,
+          "select * from functional.alltypes atp %sschedule_random_replica%s", prefix,
           suffix),
-          "SELECT * FROM functional.alltypes at \n-- +schedule_random_replica\n");
+          "SELECT * FROM functional.alltypes atp\n-- +schedule_random_replica\n");
       testToSql(String.format(
           "select * from functional.alltypes %sschedule_random_replica%s", prefix,
           suffix),
-          "SELECT * FROM functional.alltypes \n-- +schedule_random_replica\n");
+          "SELECT * FROM functional.alltypes\n-- +schedule_random_replica\n");
       testToSql(String.format(
           "select * from functional.alltypes %sschedule_random_replica," +
           "schedule_disk_local%s", prefix, suffix),
-          "SELECT * FROM functional.alltypes \n-- +schedule_random_replica," +
+          "SELECT * FROM functional.alltypes\n-- +schedule_random_replica," +
           "schedule_disk_local\n");
       testToSql(String.format(
-          "select c1 from (select at.tinyint_col as c1 from functional.alltypes at " +
+          "select c1 from (select atp.tinyint_col as c1 from functional.alltypes atp " +
           "%sschedule_random_replica%s) s1", prefix, suffix),
-          "SELECT c1 FROM (SELECT at.tinyint_col c1 FROM functional.alltypes at \n-- +" +
+          "SELECT c1 FROM (SELECT atp.tinyint_col c1 FROM functional.alltypes atp\n-- +" +
           "schedule_random_replica\n) s1");
 
       // Select-list hint. The legacy-style hint has no prefix and suffix.
@@ -1096,6 +1184,11 @@ public class ToSqlTest extends FrontendTestBase {
           + "rows between unbounded preceding and current row) from functional.alltypes",
         "SELECT sum(int_col) OVER (PARTITION BY id ORDER BY tinyint_col ASC ROWS "
           + "BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM functional.alltypes");
+    testToSql(
+        "select last_value(tinyint_col ignore nulls) over (order by tinyint_col) "
+          + "from functional.alltypesagg",
+        "SELECT last_value(tinyint_col IGNORE NULLS) OVER (ORDER BY tinyint_col ASC) "
+          + "FROM functional.alltypesagg");
   }
 
   /**
@@ -1179,6 +1272,16 @@ public class ToSqlTest extends FrontendTestBase {
     // IsNullPredicate.
     testToSql("select 5 is null, (5 is null), 10 is not null, (10 is not null)",
         "SELECT 5 IS NULL, (5 IS NULL), 10 IS NOT NULL, (10 IS NOT NULL)");
+    // Boolean test expression (expanded to istrue/false).
+    testToSql("select (true is true)", "SELECT (istrue(TRUE))");
+    testToSql("select (true is not true)", "SELECT (isnottrue(TRUE))");
+    testToSql("select (true is false)", "SELECT (isfalse(TRUE))");
+    testToSql("select (true is unknown)", "SELECT (TRUE IS NULL)");
+    testToSql("select (true is not unknown)", "SELECT (TRUE IS NOT NULL)");
+    testToSql("select not(true is true)", "SELECT NOT (istrue(TRUE))");
+    testToSql("select (false is false)", "SELECT (isfalse(FALSE))");
+    testToSql("select (null is unknown)", "SELECT (NULL IS NULL)");
+    testToSql("select (1 > 1 is true is unknown)", "SELECT (istrue(1 > 1) IS NULL)");
     // LikePredicate.
     testToSql("select 'a' LIKE '%b.', ('a' LIKE '%b.'), " +
         "'a' ILIKE '%b.', ('a' ILIKE '%b.'), " +
@@ -1240,5 +1343,45 @@ public class ToSqlTest extends FrontendTestBase {
     testToSql("set a = 1", "SET a='1'");
     testToSql("set `a b` = \"x y\"", "SET `a b`='x y'");
     testToSql("set", "SET");
+  }
+
+  @Test
+  public void testTableSample() {
+    testToSql("select * from functional.alltypes tablesample system(10)",
+        "SELECT * FROM functional.alltypes TABLESAMPLE SYSTEM(10)");
+    testToSql(
+        "select * from functional.alltypes tablesample system(10) repeatable(20)",
+        "SELECT * FROM functional.alltypes TABLESAMPLE SYSTEM(10) REPEATABLE(20)");
+    testToSql(
+        "select * from functional.alltypes a " +
+        "tablesample system(10) /* +schedule_random */",
+        "SELECT * FROM functional.alltypes a " +
+        "TABLESAMPLE SYSTEM(10)\n-- +schedule_random\n");
+    testToSql(
+        "with t as (select * from functional.alltypes tablesample system(5)) " +
+        "select * from t",
+        "WITH t AS (SELECT * FROM functional.alltypes TABLESAMPLE SYSTEM(5)) " +
+        "SELECT * FROM t");
+  }
+
+  /**
+   * Tests invalidate statements are output correctly.
+   */
+  @Test
+  public void testInvalidate() {
+    testToSql("INVALIDATE METADATA", "INVALIDATE METADATA");
+    testToSql("INVALIDATE METADATA functional.alltypes",
+        "INVALIDATE METADATA functional.alltypes");
+  }
+
+  /**
+   * Tests refresh statements are output correctly.
+   */
+  @Test
+  public void testRefresh() {
+    testToSql("REFRESH functional.alltypes", "REFRESH functional.alltypes");
+    testToSql("REFRESH functional.alltypes PARTITION (year=2009, month=1)",
+        "REFRESH functional.alltypes PARTITION (year=2009, month=1)");
+    testToSql("REFRESH FUNCTIONS functional", "REFRESH FUNCTIONS functional");
   }
 }

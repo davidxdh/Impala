@@ -126,8 +126,8 @@ show table stats parquet_snappy;
       <p>
         If you use the Hive-based methods of gathering statistics, see
         <xref href="https://cwiki.apache.org/confluence/display/Hive/StatsDev" scope="external" format="html">the
-        Hive wiki</xref> for information about the required configuration on the Hive side. <ph rev="upstream">Cloudera</ph> recommends
-        using the Impala <codeph>COMPUTE STATS</codeph> statement to avoid potential configuration and scalability
+        Hive wiki</xref> for information about the required configuration on the Hive side. Where practical,
+        use the Impala <codeph>COMPUTE STATS</codeph> statement to avoid potential configuration and scalability
         issues with the statistics-gathering process.
       </p>
 
@@ -140,8 +140,6 @@ show table stats parquet_snappy;
     <title id="column_stats">Overview of Column Statistics</title>
 
     <conbody>
-
-<!-- Cloudera+Hive background information: http://blog.cloudera.com/blog/2012/08/column-statistics-in-hive/ -->
 
       <p>
         The Impala query planner can make use of statistics about individual columns when that metadata is
@@ -204,7 +202,6 @@ show column stats parquet_snappy;
           the Impala <codeph>COMPUTE STATS</codeph> statement, both table and column statistics are automatically
           gathered at the same time, for all columns in the table.
         </p>
-        <p conref="../shared/impala_common.xml#common/decimal_no_stats"/>
       </note>
 
       <note conref="../shared/impala_common.xml#common/compute_stats_nulls"/>
@@ -357,15 +354,6 @@ show column stats year_month_day;
 +-----------+---------+------------------+--------+----------+-------------------+
 </codeblock>
 
-      <note>
-        Partitioned tables can grow so large that scanning the entire table, as the <codeph>COMPUTE STATS</codeph>
-        statement does, is impractical just to update the statistics for a new partition. The standard
-        <codeph>COMPUTE STATS</codeph> statement might take hours, or even days. That situation is where you switch
-        to using incremental statistics, a feature available in <keyword keyref="impala21_full"/> and higher.
-        See <xref href="impala_perf_stats.xml#perf_stats_incremental"/> for details about this feature
-        and the <codeph>COMPUTE INCREMENTAL STATS</codeph> syntax.
-      </note>
-
       <p conref="../shared/impala_common.xml#common/hive_column_stats_caveat"/>
     </conbody>
   </concept>
@@ -390,6 +378,12 @@ show column stats year_month_day;
         entire table each time.
       </p>
 
+      <note type="important">
+        <p conref="../shared/impala_common.xml#common/cs_or_cis"/>
+        <p conref="../shared/impala_common.xml#common/incremental_stats_after_full"/>
+        <p conref="../shared/impala_common.xml#common/incremental_stats_caveats"/>
+      </note>
+
       <p>
         You can also compute or drop statistics for a single partition by including a <codeph>PARTITION</codeph>
         clause in the <codeph>COMPUTE INCREMENTAL STATS</codeph> or <codeph>DROP INCREMENTAL STATS</codeph>
@@ -403,9 +397,9 @@ show column stats year_month_day;
       <ul>
         <li>
           <p>
-            If you have an existing partitioned table for which you have already computed statistics, issuing
-            <codeph>COMPUTE INCREMENTAL STATS</codeph> without a partition clause causes Impala to rescan the
-            entire table. Once the incremental statistics are computed, any future <codeph>COMPUTE INCREMENTAL
+            If you have a partitioned table for which you have already run a regular <codeph>COMPUTE STATS</codeph>
+            statement, issuing <codeph>COMPUTE INCREMENTAL STATS</codeph> without a partition clause causes Impala
+            to rescan the entire table. Once the incremental statistics are computed, any future <codeph>COMPUTE INCREMENTAL
             STATS</codeph> statements only scan any new partitions and any partitions where you performed
             <codeph>DROP INCREMENTAL STATS</codeph>.
           </p>
@@ -551,7 +545,7 @@ show column stats year_month_day;
 
       <p rev="2.0.1">
 <!-- Additional info as a result of IMPALA-1420 -->
-<!-- Keep checking if https://issues.apache.org/jira/browse/HIVE-8648 ever gets fixed and when that fix makes it into a CDH release. -->
+<!-- Keep checking if https://issues.apache.org/jira/browse/HIVE-8648 ever gets fixed and when that fix makes it into an Impala release. -->
         For your very largest tables, you might find that <codeph>COMPUTE STATS</codeph> or even <codeph>COMPUTE INCREMENTAL STATS</codeph>
         take so long to scan the data that it is impractical to use them regularly. In such a case, after adding a partition or inserting new data,
         you can update just the number of rows property through an <codeph>ALTER TABLE</codeph> statement.

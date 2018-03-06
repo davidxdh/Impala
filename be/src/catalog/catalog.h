@@ -27,6 +27,8 @@
 
 namespace impala {
 
+class CatalogServer;
+
 /// The Catalog is a proxy for the Java-side JniCatalog class. The interface is a set of
 /// wrapper functions for methods called over JNI.
 class Catalog {
@@ -56,12 +58,13 @@ class Catalog {
   /// Status object with information on the error will be returned.
   Status GetCatalogVersion(long* version);
 
-  /// Gets all Catalog objects and the metadata that is applicable for the given request.
-  /// Always returns all object names that exist in the Catalog, but allows for extended
-  /// metadata for objects that were modified after the specified version.
-  /// Returns OK if the operation was successful, otherwise a Status object with
-  /// information on the error will be returned.
-  Status GetAllCatalogObjects(long from_version, TGetAllCatalogObjectsResponse* resp);
+  /// Retrieves the catalog objects that were added/modified/deleted since version
+  /// 'from_version'. Returns OK if the operation was successful, otherwise a Status
+  /// object with information on the error will be returned. 'caller' is a pointer to
+  /// the caller CatalogServer object. caller->AddTopicUpdate() will be repeatedly
+  /// called by the frontend.
+  Status GetCatalogDelta(CatalogServer* caller, int64_t from_version,
+      TGetCatalogDeltaResponse* resp);
 
   /// Gets the Thrift representation of a Catalog object. The request is a TCatalogObject
   /// which has the desired TCatalogObjectType and name properly set.
@@ -74,7 +77,7 @@ class Catalog {
   /// match the pattern string. Patterns are "p1|p2|p3" where | denotes choice,
   /// and each pN may contain wildcards denoted by '*' which match all strings.
   /// TODO: GetDbs() and GetTableNames() can probably be scrapped in favor of
-  /// GetAllCatalogObjects(). Consider removing them and moving everything to use
+  /// GetCatalogDelta(). Consider removing them and moving everything to use
   /// that.
   Status GetDbs(const std::string* pattern, TGetDbsResult* dbs);
 
@@ -85,6 +88,15 @@ class Catalog {
   /// and each pN may contain wildcards denoted by '*' which match all strings.
   Status GetTableNames(const std::string& db, const std::string* pattern,
       TGetTablesResult* table_names);
+
+  /// Returns the collected metrics of a table. The response contains a
+  /// pretty-printed string representation of table metrics.
+  Status GetTableMetrics(const std::string& db, const std::string& tbl,
+      std::string* metrics);
+
+  /// Returns the current catalog usage that includes the most frequently accessed
+  /// tables as well as the tables with the highest memory requirements.
+  Status GetCatalogUsage(TGetCatalogUsageResponse* response);
 
   /// Gets all functions in the catalog matching the parameters in the given
   /// TFunctionsRequest.
@@ -109,10 +121,12 @@ class Catalog {
   jmethodID exec_ddl_id_;  // JniCatalog.execDdl()
   jmethodID reset_metadata_id_;  // JniCatalog.resetMetdata()
   jmethodID get_catalog_object_id_;  // JniCatalog.getCatalogObject()
-  jmethodID get_catalog_objects_id_;  // JniCatalog.getCatalogObjects()
+  jmethodID get_catalog_delta_id_;  // JniCatalog.getCatalogDelta()
   jmethodID get_catalog_version_id_;  // JniCatalog.getCatalogVersion()
+  jmethodID get_catalog_usage_id_; // JniCatalog.getCatalogUsage()
   jmethodID get_dbs_id_; // JniCatalog.getDbs()
   jmethodID get_table_names_id_; // JniCatalog.getTableNames()
+  jmethodID get_table_metrics_id_; // JniCatalog.getTableMetrics()
   jmethodID get_functions_id_; // JniCatalog.getFunctions()
   jmethodID prioritize_load_id_; // JniCatalog.prioritizeLoad()
   jmethodID sentry_admin_check_id_; // JniCatalog.checkUserSentryAdmin()

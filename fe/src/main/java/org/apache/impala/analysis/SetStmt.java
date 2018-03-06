@@ -18,6 +18,7 @@
 package org.apache.impala.analysis;
 
 import org.apache.impala.thrift.TSetQueryOptionRequest;
+
 import com.google.common.base.Preconditions;
 
 /**
@@ -26,6 +27,7 @@ import com.google.common.base.Preconditions;
 public class SetStmt extends StatementBase {
   private final String key_;
   private final String value_;
+  private final boolean isSetAll_;
 
   // This key is deprecated in Impala 2.0; COMPRESSION_CODEC_KEY replaces this
   private static final String DEPRECATED_PARQUET_CODEC_KEY = "PARQUET_COMPRESSION_CODEC";
@@ -39,16 +41,21 @@ public class SetStmt extends StatementBase {
     return key;
   }
 
-  public SetStmt(String key, String value) {
+  public SetStmt(String key, String value, boolean isSetAll) {
     Preconditions.checkArgument((key == null) == (value == null));
     Preconditions.checkArgument(key == null || !key.isEmpty());
+    Preconditions.checkArgument(!isSetAll || (key == null && value == null) );
     key_ = key;
     value_ = value;
+    isSetAll_ = isSetAll;
   }
 
   @Override
   public String toSql() {
-    if (key_ == null) return "SET";
+    if (key_ == null) {
+      if (isSetAll_) return "SET ALL";
+      return "SET";
+    }
     Preconditions.checkNotNull(value_);
     return "SET " + ToSqlUtils.getIdentSql(key_) + "='" + value_ + "'";
   }
@@ -64,6 +71,7 @@ public class SetStmt extends StatementBase {
       request.setKey(resolveThriftKey(key_));
       request.setValue(value_);
     }
+    if (isSetAll_) request.setIs_set_all(true);
     return request;
   }
 }

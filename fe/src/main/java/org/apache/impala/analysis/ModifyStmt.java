@@ -33,7 +33,6 @@ import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.Pair;
 import org.apache.impala.planner.DataSink;
 import org.apache.impala.rewrite.ExprRewriter;
-import org.slf4j.LoggerFactory;
 
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
@@ -98,6 +97,20 @@ public abstract class ModifyStmt extends StatementBase {
     wherePredicate_ = wherePredicate;
   }
 
+  @Override
+  public void collectTableRefs(List<TableRef> tblRefs) {
+    tblRefs.add(new TableRef(targetTablePath_, null));
+    fromClause_.collectTableRefs(tblRefs);
+    if (wherePredicate_ != null) {
+      // Collect TableRefs in WHERE-clause subqueries.
+      List<Subquery> subqueries = Lists.newArrayList();
+      wherePredicate_.collect(Subquery.class, subqueries);
+      for (Subquery sq : subqueries) {
+        sq.getStatement().collectTableRefs(tblRefs);
+      }
+    }
+  }
+
   /**
    * The analysis of the ModifyStmt proceeds as follows: First, the FROM clause is
    * analyzed and the targetTablePath is verified to be a valid alias into the FROM
@@ -144,9 +157,9 @@ public abstract class ModifyStmt extends StatementBase {
     }
     table_ = (KuduTable) dstTbl;
 
-    // Make sure that the user is allowed to modify the target table, since no
-    // UPDATE / DELETE privilege exists, we reuse the INSERT one.
-    analyzer.registerAuthAndAuditEvent(dstTbl, Privilege.INSERT);
+    // Make sure that the user is allowed to modify the target table. Use ALL because no
+    // UPDATE / DELETE privilege exists yet (IMPALA-3840).
+    analyzer.registerAuthAndAuditEvent(dstTbl, Privilege.ALL);
 
     // Validates the assignments_ and creates the sourceStmt_.
     if (sourceStmt_ == null) createSourceStmt(analyzer);
@@ -232,11 +245,17 @@ public abstract class ModifyStmt extends StatementBase {
 
     // Assignments are only used in the context of updates.
     for (Pair<SlotRef, Expr> valueAssignment : assignments_) {
-      Expr rhsExpr = valueAssignment.second;
-      rhsExpr.analyze(analyzer);
-
       SlotRef lhsSlotRef = valueAssignment.first;
       lhsSlotRef.analyze(analyzer);
+
+      Expr rhsExpr = valueAssignment.second;
+      // No subqueries for rhs expression
+      if (rhsExpr.contains(Subquery.class)) {
+        throw new AnalysisException(
+            format("Subqueries are not supported as update expressions for column '%s'",
+                lhsSlotRef.toSql()));
+      }
+      rhsExpr.analyze(analyzer);
 
       // Correct target table
       if (!lhsSlotRef.isBoundByTupleIds(targetTableRef_.getId().asList())) {
@@ -244,13 +263,6 @@ public abstract class ModifyStmt extends StatementBase {
             format("Left-hand side column '%s' in assignment expression '%s=%s' does not "
                 + "belong to target table '%s'", lhsSlotRef.toSql(), lhsSlotRef.toSql(),
                 rhsExpr.toSql(), targetTableRef_.getDesc().getTable().getFullName()));
-      }
-
-      // No subqueries for rhs expression
-      if (rhsExpr.contains(Subquery.class)) {
-        throw new AnalysisException(
-            format("Subqueries are not supported as update expressions for column '%s'",
-                lhsSlotRef.toSql()));
       }
 
       Column c = lhsSlotRef.getResolvedPath().destColumn();

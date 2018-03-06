@@ -17,17 +17,22 @@
 
 #include "runtime/runtime-filter-bank.h"
 
-#include "common/names.h"
 #include "gen-cpp/ImpalaInternalService_types.h"
-#include "gutil/bits.h"
 #include "gutil/strings/substitute.h"
 #include "runtime/client-cache.h"
 #include "runtime/exec-env.h"
 #include "runtime/backend-client.h"
+#include "runtime/bufferpool/reservation-tracker.h"
+#include "runtime/initial-reservations.h"
 #include "runtime/mem-tracker.h"
+#include "runtime/query-state.h"
 #include "runtime/runtime-filter.inline.h"
 #include "service/impala-server.h"
+#include "util/bit-util.h"
 #include "util/bloom-filter.h"
+#include "util/min-max-filter.h"
+
+#include "common/names.h"
 
 using namespace impala;
 using namespace boost;
@@ -39,47 +44,44 @@ DEFINE_double(max_filter_error_rate, 0.75, "(Advanced) The maximum probability o
 const int64_t RuntimeFilterBank::MIN_BLOOM_FILTER_SIZE;
 const int64_t RuntimeFilterBank::MAX_BLOOM_FILTER_SIZE;
 
-RuntimeFilterBank::RuntimeFilterBank(const TQueryCtx& query_ctx, RuntimeState* state)
-    : state_(state), closed_(false) {
-  memory_allocated_ =
+RuntimeFilterBank::RuntimeFilterBank(const TQueryCtx& query_ctx, RuntimeState* state,
+    long total_filter_mem_required)
+  : state_(state),
+    filter_mem_tracker_(
+        new MemTracker(-1, "Runtime Filter Bank", state->instance_mem_tracker(), false)),
+    mem_pool_(filter_mem_tracker_.get()),
+    closed_(false),
+    total_bloom_filter_mem_required_(total_filter_mem_required) {
+  bloom_memory_allocated_ =
       state->runtime_profile()->AddCounter("BloomFilterBytes", TUnit::BYTES);
+}
 
-  // Clamp bloom filter size down to the limits {MIN,MAX}_BLOOM_FILTER_SIZE
-  max_filter_size_ = query_ctx.client_request.query_options.runtime_filter_max_size;
-  max_filter_size_ = max<int64_t>(max_filter_size_, MIN_BLOOM_FILTER_SIZE);
-  max_filter_size_ =
-      BitUtil::RoundUpToPowerOfTwo(min<int64_t>(max_filter_size_, MAX_BLOOM_FILTER_SIZE));
-
-  min_filter_size_ = query_ctx.client_request.query_options.runtime_filter_min_size;
-  min_filter_size_ = max<int64_t>(min_filter_size_, MIN_BLOOM_FILTER_SIZE);
-  min_filter_size_ =
-      BitUtil::RoundUpToPowerOfTwo(min<int64_t>(min_filter_size_, MAX_BLOOM_FILTER_SIZE));
-
-  // Make sure that min <= max
-  min_filter_size_ = min<int64_t>(min_filter_size_, max_filter_size_);
-
-  DCHECK_GT(min_filter_size_, 0);
-  DCHECK_GT(max_filter_size_, 0);
-
-  default_filter_size_ = query_ctx.client_request.query_options.runtime_bloom_filter_size;
-  default_filter_size_ = max<int64_t>(default_filter_size_, min_filter_size_);
-  default_filter_size_ =
-      BitUtil::RoundUpToPowerOfTwo(min<int64_t>(default_filter_size_, max_filter_size_));
-
-  filter_mem_tracker_.reset(
-      new MemTracker(-1, "Runtime Filter Bank", state->instance_mem_tracker(), false));
+Status RuntimeFilterBank::ClaimBufferReservation() {
+  DCHECK(!buffer_pool_client_.is_registered());
+  string filter_bank_name = Substitute(
+      "RuntimeFilterBank (Fragment Id: $0)", PrintId(state_->fragment_instance_id()));
+  RETURN_IF_ERROR(state_->exec_env()->buffer_pool()->RegisterClient(filter_bank_name,
+      state_->query_state()->file_group(), state_->instance_buffer_reservation(),
+      filter_mem_tracker_.get(), total_bloom_filter_mem_required_,
+      state_->runtime_profile(), &buffer_pool_client_));
+  VLOG_FILE << filter_bank_name << " claiming reservation "
+            << total_bloom_filter_mem_required_;
+  state_->query_state()->initial_reservations()->Claim(
+      &buffer_pool_client_, total_bloom_filter_mem_required_);
+  return Status::OK();
 }
 
 RuntimeFilter* RuntimeFilterBank::RegisterFilter(const TRuntimeFilterDesc& filter_desc,
     bool is_producer) {
-  RuntimeFilter* ret = obj_pool_.Add(
-      new RuntimeFilter(filter_desc, GetFilterSizeForNdv(filter_desc.ndv_estimate)));
+  RuntimeFilter* ret = nullptr;
   lock_guard<mutex> l(runtime_filter_lock_);
   if (is_producer) {
     DCHECK(produced_filters_.find(filter_desc.filter_id) == produced_filters_.end());
+    ret = obj_pool_.Add(new RuntimeFilter(filter_desc, filter_desc.filter_size_bytes));
     produced_filters_[filter_desc.filter_id] = ret;
   } else {
     if (consumed_filters_.find(filter_desc.filter_id) == consumed_filters_.end()) {
+      ret = obj_pool_.Add(new RuntimeFilter(filter_desc, filter_desc.filter_size_bytes));
       consumed_filters_[filter_desc.filter_id] = ret;
       VLOG_QUERY << "registered consumer filter " << filter_desc.filter_id;
     } else {
@@ -114,27 +116,28 @@ void SendFilterToCoordinator(TNetworkAddress address, TUpdateFilterParams params
 
 }
 
-void RuntimeFilterBank::UpdateFilterFromLocal(int32_t filter_id,
-    BloomFilter* bloom_filter) {
+void RuntimeFilterBank::UpdateFilterFromLocal(
+    int32_t filter_id, BloomFilter* bloom_filter, MinMaxFilter* min_max_filter) {
   DCHECK_NE(state_->query_options().runtime_filter_mode, TRuntimeFilterMode::OFF)
       << "Should not be calling UpdateFilterFromLocal() if filtering is disabled";
   TUpdateFilterParams params;
   // A runtime filter may have both local and remote targets.
   bool has_local_target = false;
   bool has_remote_target = false;
+  TRuntimeFilterType::type type;
   {
     lock_guard<mutex> l(runtime_filter_lock_);
     RuntimeFilterMap::iterator it = produced_filters_.find(filter_id);
     DCHECK(it != produced_filters_.end()) << "Tried to update unregistered filter: "
                                           << filter_id;
-    it->second->SetBloomFilter(bloom_filter);
+    it->second->SetFilter(bloom_filter, min_max_filter);
     has_local_target = it->second->filter_desc().has_local_targets;
     has_remote_target = it->second->filter_desc().has_remote_targets;
+    type = it->second->filter_desc().type;
   }
 
   if (has_local_target) {
-    // Do a short circuit publication by pushing the same BloomFilter to the consumer
-    // side.
+    // Do a short circuit publication by pushing the same filter to the consumer side.
     RuntimeFilter* filter;
     {
       lock_guard<mutex> l(runtime_filter_lock_);
@@ -142,7 +145,7 @@ void RuntimeFilterBank::UpdateFilterFromLocal(int32_t filter_id,
       if (it == consumed_filters_.end()) return;
       filter = it->second;
     }
-    filter->SetBloomFilter(bloom_filter);
+    filter->SetFilter(bloom_filter, min_max_filter);
     state_->runtime_profile()->AddInfoString(
         Substitute("Filter $0 arrival", filter_id),
         PrettyPrinter::Print(filter->arrival_delay(), TUnit::TIME_MS));
@@ -150,9 +153,16 @@ void RuntimeFilterBank::UpdateFilterFromLocal(int32_t filter_id,
 
   if (has_remote_target
       && state_->query_options().runtime_filter_mode == TRuntimeFilterMode::GLOBAL) {
-    BloomFilter::ToThrift(bloom_filter, &params.bloom_filter);
-    params.filter_id = filter_id;
-    params.query_id = state_->query_id();
+    params.__set_filter_id(filter_id);
+    params.__set_query_id(state_->query_id());
+    if (type == TRuntimeFilterType::BLOOM) {
+      BloomFilter::ToThrift(bloom_filter, &params.bloom_filter);
+      params.__isset.bloom_filter = true;
+    } else {
+      DCHECK(type == TRuntimeFilterType::MIN_MAX);
+      min_max_filter->ToThrift(&params.min_max_filter);
+      params.__isset.min_max_filter = true;
+    }
 
     ExecEnv::GetInstance()->rpc_pool()->Offer(bind<void>(
         SendFilterToCoordinator, state_->query_ctx().coord_address, params,
@@ -160,71 +170,104 @@ void RuntimeFilterBank::UpdateFilterFromLocal(int32_t filter_id,
   }
 }
 
-void RuntimeFilterBank::PublishGlobalFilter(int32_t filter_id,
-    const TBloomFilter& thrift_filter) {
+void RuntimeFilterBank::PublishGlobalFilter(const TPublishFilterParams& params) {
   lock_guard<mutex> l(runtime_filter_lock_);
   if (closed_) return;
-  RuntimeFilterMap::iterator it = consumed_filters_.find(filter_id);
+  RuntimeFilterMap::iterator it = consumed_filters_.find(params.filter_id);
   DCHECK(it != consumed_filters_.end()) << "Tried to publish unregistered filter: "
-                                        << filter_id;
-  if (thrift_filter.always_true) {
-    it->second->SetBloomFilter(BloomFilter::ALWAYS_TRUE_FILTER);
-  } else {
-    int64_t required_space =
-        BloomFilter::GetExpectedHeapSpaceUsed(thrift_filter.log_heap_space);
-    // Silently fail to publish the filter (replacing it with a 0-byte complete one) if
-    // there's not enough memory for it.
-    if (!filter_mem_tracker_->TryConsume(required_space)) {
-      VLOG_QUERY << "No memory for global filter: " << filter_id
-                 << " (fragment instance: " << state_->fragment_instance_id() << ")";
-      it->second->SetBloomFilter(BloomFilter::ALWAYS_TRUE_FILTER);
+                                        << params.filter_id;
+
+  BloomFilter* bloom_filter = nullptr;
+  MinMaxFilter* min_max_filter = nullptr;
+  if (it->second->is_bloom_filter()) {
+    DCHECK(params.__isset.bloom_filter);
+    if (params.bloom_filter.always_true) {
+      bloom_filter = BloomFilter::ALWAYS_TRUE_FILTER;
     } else {
-      BloomFilter* bloom_filter = obj_pool_.Add(new BloomFilter(thrift_filter));
-      DCHECK_EQ(required_space, bloom_filter->GetHeapSpaceUsed());
-      memory_allocated_->Add(bloom_filter->GetHeapSpaceUsed());
-      it->second->SetBloomFilter(bloom_filter);
+      int64_t required_space =
+          BloomFilter::GetExpectedMemoryUsed(params.bloom_filter.log_bufferpool_space);
+      DCHECK_GE(buffer_pool_client_.GetUnusedReservation(), required_space)
+          << "BufferPool Client should have enough reservation to fulfill bloom filter "
+             "allocation";
+      bloom_filter = obj_pool_.Add(new BloomFilter(&buffer_pool_client_));
+      Status status = bloom_filter->Init(params.bloom_filter);
+      if (!status.ok()) {
+        LOG(ERROR) << "Unable to allocate memory for bloom filter: "
+                   << status.GetDetail();
+        bloom_filter = BloomFilter::ALWAYS_TRUE_FILTER;
+      } else {
+        bloom_filters_.push_back(bloom_filter);
+        DCHECK_EQ(required_space, bloom_filter->GetBufferPoolSpaceUsed());
+        bloom_memory_allocated_->Add(bloom_filter->GetBufferPoolSpaceUsed());
+      }
     }
+  } else {
+    DCHECK(it->second->is_min_max_filter());
+    DCHECK(params.__isset.min_max_filter);
+    min_max_filter = MinMaxFilter::Create(
+        params.min_max_filter, it->second->type(), &obj_pool_, &mem_pool_);
   }
-  state_->runtime_profile()->AddInfoString(Substitute("Filter $0 arrival", filter_id),
+  it->second->SetFilter(bloom_filter, min_max_filter);
+  state_->runtime_profile()->AddInfoString(
+      Substitute("Filter $0 arrival", params.filter_id),
       PrettyPrinter::Print(it->second->arrival_delay(), TUnit::TIME_MS));
 }
 
 BloomFilter* RuntimeFilterBank::AllocateScratchBloomFilter(int32_t filter_id) {
   lock_guard<mutex> l(runtime_filter_lock_);
-  if (closed_) return NULL;
+  if (closed_) return nullptr;
 
   RuntimeFilterMap::iterator it = produced_filters_.find(filter_id);
   DCHECK(it != produced_filters_.end()) << "Filter ID " << filter_id << " not registered";
 
   // Track required space
-  int64_t log_filter_size = Bits::Log2Ceiling64(it->second->filter_size());
-  int64_t required_space = BloomFilter::GetExpectedHeapSpaceUsed(log_filter_size);
-  if (!filter_mem_tracker_->TryConsume(required_space)) return NULL;
-  BloomFilter* bloom_filter = obj_pool_.Add(new BloomFilter(log_filter_size));
-  DCHECK_EQ(required_space, bloom_filter->GetHeapSpaceUsed());
-  memory_allocated_->Add(bloom_filter->GetHeapSpaceUsed());
+  int64_t log_filter_size = BitUtil::Log2Ceiling64(it->second->filter_size());
+  int64_t required_space = BloomFilter::GetExpectedMemoryUsed(log_filter_size);
+  DCHECK_GE(buffer_pool_client_.GetUnusedReservation(), required_space)
+      << "BufferPool Client should have enough reservation to fulfill bloom filter "
+         "allocation";
+  BloomFilter* bloom_filter = obj_pool_.Add(new BloomFilter(&buffer_pool_client_));
+  Status status = bloom_filter->Init(log_filter_size);
+  if (!status.ok()) {
+    LOG(ERROR) << "Unable to allocate memory for bloom filter: " << status.GetDetail();
+    return nullptr;
+  }
+  bloom_filters_.push_back(bloom_filter);
+  DCHECK_EQ(required_space, bloom_filter->GetBufferPoolSpaceUsed());
+  bloom_memory_allocated_->Add(bloom_filter->GetBufferPoolSpaceUsed());
   return bloom_filter;
 }
 
-int64_t RuntimeFilterBank::GetFilterSizeForNdv(int64_t ndv) {
-  if (ndv == -1) return default_filter_size_;
-  int64_t required_space =
-      1LL << BloomFilter::MinLogSpace(ndv, FLAGS_max_filter_error_rate);
-  required_space = max<int64_t>(required_space, min_filter_size_);
-  required_space = min<int64_t>(required_space, max_filter_size_);
-  return required_space;
+MinMaxFilter* RuntimeFilterBank::AllocateScratchMinMaxFilter(
+    int32_t filter_id, ColumnType type) {
+  lock_guard<mutex> l(runtime_filter_lock_);
+  if (closed_) return nullptr;
+
+  RuntimeFilterMap::iterator it = produced_filters_.find(filter_id);
+  DCHECK(it != produced_filters_.end()) << "Filter ID " << filter_id << " not registered";
+
+  return MinMaxFilter::Create(type, &obj_pool_, &mem_pool_);
 }
 
 bool RuntimeFilterBank::FpRateTooHigh(int64_t filter_size, int64_t observed_ndv) {
   double fpp =
-      BloomFilter::FalsePositiveProb(observed_ndv, Bits::Log2Ceiling64(filter_size));
+      BloomFilter::FalsePositiveProb(observed_ndv, BitUtil::Log2Ceiling64(filter_size));
   return fpp > FLAGS_max_filter_error_rate;
 }
 
 void RuntimeFilterBank::Close() {
   lock_guard<mutex> l(runtime_filter_lock_);
   closed_ = true;
+  for (BloomFilter* filter : bloom_filters_) filter->Close();
   obj_pool_.Clear();
-  filter_mem_tracker_->Release(memory_allocated_->value());
-  filter_mem_tracker_->UnregisterFromParent();
+  mem_pool_.FreeAll();
+  if (buffer_pool_client_.is_registered()) {
+    VLOG_FILE << "RuntimeFilterBank (Fragment Id: " << state_->fragment_instance_id()
+              << ") returning reservation " << total_bloom_filter_mem_required_;
+    state_->query_state()->initial_reservations()->Return(
+        &buffer_pool_client_, total_bloom_filter_mem_required_);
+    state_->exec_env()->buffer_pool()->DeregisterClient(&buffer_pool_client_);
+  }
+  DCHECK_EQ(filter_mem_tracker_->consumption(), 0);
+  filter_mem_tracker_->Close();
 }

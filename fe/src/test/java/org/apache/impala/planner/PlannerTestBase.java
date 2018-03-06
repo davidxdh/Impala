@@ -19,9 +19,9 @@ package org.apache.impala.planner;
 
 import static org.junit.Assert.fail;
 
-import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -36,6 +36,7 @@ import org.apache.commons.lang.exception.ExceptionUtils;
 import org.apache.hadoop.fs.Path;
 import org.apache.impala.analysis.ColumnLineageGraph;
 import org.apache.impala.analysis.DescriptorTable;
+import org.apache.impala.catalog.Catalog;
 import org.apache.impala.catalog.CatalogException;
 import org.apache.impala.common.FrontendTestBase;
 import org.apache.impala.common.ImpalaException;
@@ -73,6 +74,7 @@ import org.apache.kudu.client.KuduClient;
 import org.apache.kudu.client.KuduScanToken;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
+import org.junit.Before;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -85,8 +87,9 @@ import com.google.common.collect.Sets;
 public class PlannerTestBase extends FrontendTestBase {
   private final static Logger LOG = LoggerFactory.getLogger(PlannerTest.class);
   private final static boolean GENERATE_OUTPUT_FILE = true;
-  private final String testDir_ = "functional-planner/queries/PlannerTest";
-  private final String outDir_ = "/tmp/PlannerTest/";
+  private final java.nio.file.Path testDir_ = Paths.get("functional-planner", "queries",
+      "PlannerTest");
+  private static java.nio.file.Path outDir_;
   private static KuduClient kuduClient_;
 
   // Map from plan ID (TPlanNodeId) to the plan node with that ID.
@@ -98,10 +101,6 @@ public class PlannerTestBase extends FrontendTestBase {
 
   @BeforeClass
   public static void setUp() throws Exception {
-    // Use 8 cores for resource estimation.
-    RuntimeEnv.INSTANCE.setNumCores(8);
-    // Set test env to control the explain level.
-    RuntimeEnv.INSTANCE.setTestEnv(true);
     // Mimic the 3 node test mini-cluster.
     TUpdateMembershipRequest updateReq = new TUpdateMembershipRequest();
     updateReq.setIp_addresses(Sets.newHashSet("127.0.0.1"));
@@ -112,6 +111,19 @@ public class PlannerTestBase extends FrontendTestBase {
     if (RuntimeEnv.INSTANCE.isKuduSupported()) {
       kuduClient_ = new KuduClient.KuduClientBuilder("127.0.0.1:7051").build();
     }
+    String logDir = System.getenv("IMPALA_FE_TEST_LOGS_DIR");
+    if (logDir == null) logDir = "/tmp";
+    outDir_ = Paths.get(logDir, "PlannerTest");
+  }
+
+  @Before
+  public void setUpTest() throws Exception {
+    // Reset the RuntimeEnv - individual tests may change it.
+    RuntimeEnv.INSTANCE.reset();
+    // Use 8 cores for resource estimation.
+    RuntimeEnv.INSTANCE.setNumCores(8);
+    // Set test env to control the explain level.
+    RuntimeEnv.INSTANCE.setTestEnv(true);
   }
 
   @AfterClass
@@ -141,8 +153,8 @@ public class PlannerTestBase extends FrontendTestBase {
         }
       }
     }
-    if (execRequest.isSetDesc_tbl()) {
-      TDescriptorTable descTbl = execRequest.desc_tbl;
+    if (execRequest.query_ctx.isSetDesc_tbl()) {
+      TDescriptorTable descTbl = execRequest.query_ctx.desc_tbl;
       for (TTupleDescriptor tupleDesc: descTbl.tupleDescriptors) {
         tupleMap_.put(tupleDesc.id, tupleDesc);
       }
@@ -222,8 +234,9 @@ public class PlannerTestBase extends FrontendTestBase {
     boolean first = true;
     // Iterate through all partitions of the descriptor table and verify all partitions
     // are referenced.
-    if (execRequest.isSetDesc_tbl() && execRequest.desc_tbl.isSetTableDescriptors()) {
-      for (TTableDescriptor tableDesc: execRequest.desc_tbl.tableDescriptors) {
+    if (execRequest.query_ctx.isSetDesc_tbl()
+        && execRequest.query_ctx.desc_tbl.isSetTableDescriptors()) {
+      for (TTableDescriptor tableDesc: execRequest.query_ctx.desc_tbl.tableDescriptors) {
         // All partitions of insertTableId are okay.
         if (tableDesc.getId() == insertTableId) continue;
         if (!tableDesc.isSetHdfsTable()) continue;
@@ -390,34 +403,32 @@ public class PlannerTestBase extends FrontendTestBase {
    * of 'testCase'.
    */
   private void runTestCase(TestCase testCase, StringBuilder errorLog,
-      StringBuilder actualOutput, String dbName, TQueryOptions options)
+      StringBuilder actualOutput, String dbName, boolean ignoreExplainHeader)
       throws CatalogException {
-    if (options == null) {
-      options = defaultQueryOptions();
-    } else {
-      options = mergeQueryOptions(defaultQueryOptions(), options);
-    }
-
     String query = testCase.getQuery();
     LOG.info("running query " + query);
     if (query.isEmpty()) {
       throw new IllegalStateException("Cannot plan empty query in line: " +
           testCase.getStartingLineNum());
     }
+    // Set up the query context. Note that we need to deep copy it before planning each
+    // time since planning modifies it.
     TQueryCtx queryCtx = TestUtils.createQueryContext(
         dbName, System.getProperty("user.name"));
-    queryCtx.client_request.query_options = options;
+    queryCtx.client_request.query_options = testCase.getOptions();
     // Test single node plan, scan range locations, and column lineage.
-    TExecRequest singleNodeExecRequest =
-        testPlan(testCase, Section.PLAN, queryCtx, errorLog, actualOutput);
+    TExecRequest singleNodeExecRequest = testPlan(testCase, Section.PLAN, queryCtx.deepCopy(),
+        ignoreExplainHeader, errorLog, actualOutput);
     validateTableIds(singleNodeExecRequest);
     checkScanRangeLocations(testCase, singleNodeExecRequest, errorLog, actualOutput);
     checkColumnLineage(testCase, singleNodeExecRequest, errorLog, actualOutput);
     checkLimitCardinality(query, singleNodeExecRequest, errorLog);
     // Test distributed plan.
-    testPlan(testCase, Section.DISTRIBUTEDPLAN, queryCtx, errorLog, actualOutput);
+    testPlan(testCase, Section.DISTRIBUTEDPLAN, queryCtx.deepCopy(), ignoreExplainHeader,
+        errorLog, actualOutput);
     // test parallel plans
-    testPlan(testCase, Section.PARALLELPLANS, queryCtx, errorLog, actualOutput);
+    testPlan(testCase, Section.PARALLELPLANS, queryCtx.deepCopy(), ignoreExplainHeader,
+        errorLog, actualOutput);
   }
 
   /**
@@ -428,8 +439,8 @@ public class PlannerTestBase extends FrontendTestBase {
     if (request == null || !request.isSetQuery_exec_request()) return;
     TQueryExecRequest execRequest = request.query_exec_request;
     HashSet<Integer> seenTableIds = Sets.newHashSet();
-    if (execRequest.isSetDesc_tbl()) {
-      TDescriptorTable descTbl = execRequest.desc_tbl;
+    if (execRequest.query_ctx.isSetDesc_tbl()) {
+      TDescriptorTable descTbl = execRequest.query_ctx.desc_tbl;
       if (descTbl.isSetTableDescriptors()) {
         for (TTableDescriptor tableDesc: descTbl.tableDescriptors) {
           if (seenTableIds.contains(tableDesc.id)) {
@@ -471,19 +482,26 @@ public class PlannerTestBase extends FrontendTestBase {
    *
    * Returns the produced exec request or null if there was an error generating
    * the plan.
+   *
+   * If ignoreExplainHeader is true, the explain header with warnings and resource
+   * estimates is stripped out.
    */
   private TExecRequest testPlan(TestCase testCase, Section section,
-      TQueryCtx queryCtx, StringBuilder errorLog, StringBuilder actualOutput) {
+      TQueryCtx queryCtx, boolean ignoreExplainHeader,
+      StringBuilder errorLog, StringBuilder actualOutput) {
     String query = testCase.getQuery();
     queryCtx.client_request.setStmt(query);
+    TQueryOptions queryOptions = queryCtx.client_request.getQuery_options();
     if (section == Section.PLAN) {
-      queryCtx.client_request.getQuery_options().setNum_nodes(1);
+      queryOptions.setNum_nodes(1);
     } else {
       // for distributed and parallel execution we want to run on all available nodes
-      queryCtx.client_request.getQuery_options().setNum_nodes(
+      queryOptions.setNum_nodes(
           ImpalaInternalServiceConstants.NUM_NODES_ALL);
     }
-    if (section == Section.PARALLELPLANS) {
+    if (section == Section.PARALLELPLANS
+        && (!queryOptions.isSetMt_dop() || queryOptions.getMt_dop() == 0)) {
+      // Set mt_dop to force production of parallel plans.
       queryCtx.client_request.query_options.setMt_dop(2);
     }
     ArrayList<String> expectedPlan = testCase.getSectionContents(section);
@@ -507,7 +525,8 @@ public class PlannerTestBase extends FrontendTestBase {
     // Failed to produce an exec request.
     if (execRequest == null) return null;
 
-    String explainStr = removeExplainHeader(explainBuilder.toString());
+    String explainStr = explainBuilder.toString();
+    if (ignoreExplainHeader) explainStr = removeExplainHeader(explainStr);
     actualOutput.append(explainStr);
     LOG.info(section.toString() + ":" + explainStr);
     if (expectedErrorMsg != null) {
@@ -647,6 +666,45 @@ public class PlannerTestBase extends FrontendTestBase {
     }
   }
 
+  /**
+   * This function plans the given query and fails if the estimated cardinalities are
+   * not within the specified bounds [min, max].
+   */
+  protected void checkCardinality(String query, long min, long max)
+        throws ImpalaException {
+    TQueryCtx queryCtx = TestUtils.createQueryContext(Catalog.DEFAULT_DB,
+        System.getProperty("user.name"));
+    queryCtx.client_request.setStmt(query);
+    StringBuilder explainBuilder = new StringBuilder();
+    TExecRequest execRequest = frontend_.createExecRequest(queryCtx, explainBuilder);
+
+    if (!execRequest.isSetQuery_exec_request()
+        || execRequest.query_exec_request == null
+        || execRequest.query_exec_request.plan_exec_info == null) {
+      return;
+    }
+    for (TPlanExecInfo execInfo : execRequest.query_exec_request.plan_exec_info) {
+      for (TPlanFragment planFragment : execInfo.fragments) {
+        if (!planFragment.isSetPlan() || planFragment.plan == null) continue;
+        for (TPlanNode node : planFragment.plan.nodes) {
+          if (node.estimated_stats == null) {
+            fail("Query: " + query + " has no estimated statistics");
+          }
+          long cardinality = node.estimated_stats.cardinality;
+          if (cardinality < min || cardinality > max) {
+            StringBuilder errorLog = new StringBuilder();
+            errorLog.append("Query: " + query + "\n");
+            errorLog.append(
+                "Expected cardinality estimate between " + min + " and " + max + "\n");
+            errorLog.append("Actual cardinality estimate: " + cardinality + "\n");
+            errorLog.append("In node id " + node.node_id + "\n");
+            fail(errorLog.toString());
+          }
+        }
+      }
+    }
+  }
+
   private void checkColumnLineage(TestCase testCase, TExecRequest execRequest,
       StringBuilder errorLog, StringBuilder actualOutput) {
     String query = testCase.getQuery();
@@ -702,12 +760,23 @@ public class PlannerTestBase extends FrontendTestBase {
   }
 
   protected void runPlannerTestFile(String testFile, TQueryOptions options) {
-    runPlannerTestFile(testFile, "default", options);
+    runPlannerTestFile(testFile, options, true);
   }
 
-  private void runPlannerTestFile(String testFile, String dbName, TQueryOptions options) {
-    String fileName = testDir_ + "/" + testFile + ".test";
-    TestFileParser queryFileParser = new TestFileParser(fileName);
+  protected void runPlannerTestFile(String testFile, TQueryOptions options,
+      boolean ignoreExplainHeader) {
+    runPlannerTestFile(testFile, "default", options, ignoreExplainHeader);
+  }
+
+  private void runPlannerTestFile(String testFile, String dbName, TQueryOptions options,
+      boolean ignoreExplainHeader) {
+    String fileName = testDir_.resolve(testFile + ".test").toString();
+    if (options == null) {
+      options = defaultQueryOptions();
+    } else {
+      options = mergeQueryOptions(defaultQueryOptions(), options);
+    }
+    TestFileParser queryFileParser = new TestFileParser(fileName, options);
     StringBuilder actualOutput = new StringBuilder();
 
     queryFileParser.parseFile();
@@ -715,8 +784,15 @@ public class PlannerTestBase extends FrontendTestBase {
     for (TestCase testCase : queryFileParser.getTestCases()) {
       actualOutput.append(testCase.getSectionAsString(Section.QUERY, true, "\n"));
       actualOutput.append("\n");
+      String queryOptionsSection = testCase.getSectionAsString(
+          Section.QUERYOPTIONS, true, "\n");
+      if (queryOptionsSection != null && !queryOptionsSection.isEmpty()) {
+        actualOutput.append("---- QUERYOPTIONS\n");
+        actualOutput.append(queryOptionsSection);
+        actualOutput.append("\n");
+      }
       try {
-        runTestCase(testCase, errorLog, actualOutput, dbName, options);
+        runTestCase(testCase, errorLog, actualOutput, dbName, ignoreExplainHeader);
       } catch (CatalogException e) {
         errorLog.append(String.format("Failed to plan query\n%s\n%s",
             testCase.getQuery(), e.getMessage()));
@@ -727,9 +803,8 @@ public class PlannerTestBase extends FrontendTestBase {
     // Create the actual output file
     if (GENERATE_OUTPUT_FILE) {
       try {
-        File outDirFile = new File(outDir_);
-        outDirFile.mkdirs();
-        FileWriter fw = new FileWriter(outDir_ + testFile + ".test");
+        outDir_.toFile().mkdirs();
+        FileWriter fw = new FileWriter(outDir_.resolve(testFile + ".test").toFile());
         fw.write(actualOutput.toString());
         fw.close();
       } catch (IOException e) {
@@ -743,10 +818,10 @@ public class PlannerTestBase extends FrontendTestBase {
   }
 
   protected void runPlannerTestFile(String testFile) {
-    runPlannerTestFile(testFile, "default", null);
+    runPlannerTestFile(testFile, "default", null, true);
   }
 
   protected void runPlannerTestFile(String testFile, String dbName) {
-    runPlannerTestFile(testFile, dbName, null);
+    runPlannerTestFile(testFile, dbName, null, true);
   }
 }

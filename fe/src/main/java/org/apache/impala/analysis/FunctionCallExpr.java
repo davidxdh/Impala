@@ -51,7 +51,7 @@ public class FunctionCallExpr extends Expr {
   // feeding into this Merge(). This is stored so that we can access the types of the
   // original input argument exprs. Note that the nullness affects the behaviour of
   // resetAnalysisState(), which is used during expr substitution.
-  private final FunctionCallExpr mergeAggInputFn_;
+  private FunctionCallExpr mergeAggInputFn_;
 
   // Printed in toSqlImpl(), if set. Used for merge agg fns.
   private String label_;
@@ -84,14 +84,35 @@ public class FunctionCallExpr extends Expr {
    */
   public static Expr createExpr(FunctionName fnName, FunctionParams params) {
     FunctionCallExpr functionCallExpr = new FunctionCallExpr(fnName, params);
-    if (fnName.getFnNamePath().size() == 1
-            && fnName.getFnNamePath().get(0).equalsIgnoreCase("decode")
-        || fnName.getFnNamePath().size() == 2
-            && fnName.getFnNamePath().get(0).equalsIgnoreCase(Catalog.BUILTINS_DB)
-            && fnName.getFnNamePath().get(1).equalsIgnoreCase("decode")) {
+    if (functionNameEqualsBuiltin(fnName, "decode")) {
       return new CaseExpr(functionCallExpr);
     }
+    if (functionNameEqualsBuiltin(fnName, "nvl2")) {
+      List<Expr> plist = Lists.newArrayList(params.exprs());
+      if (!plist.isEmpty()) {
+        plist.set(0, new IsNullPredicate(plist.get(0), true));
+      }
+      return new FunctionCallExpr("if", plist);
+    }
+    // nullif(x, y) -> if(x DISTINCT FROM y, x, NULL)
+    if (functionNameEqualsBuiltin(fnName, "nullif") && params.size() == 2) {
+      return new FunctionCallExpr("if", Lists.newArrayList(
+          new BinaryPredicate(BinaryPredicate.Operator.DISTINCT_FROM, params.exprs().get(0),
+            params.exprs().get(1)), // x IS DISTINCT FROM y
+          params.exprs().get(0), // x
+          new NullLiteral() // NULL
+      ));
+    }
     return functionCallExpr;
+  }
+
+  /** Returns true if fnName is a built-in with given name. */
+  private static boolean functionNameEqualsBuiltin(FunctionName fnName, String name) {
+    return fnName.getFnNamePath().size() == 1
+           && fnName.getFnNamePath().get(0).equalsIgnoreCase(name)
+        || fnName.getFnNamePath().size() == 2
+           && fnName.getFnNamePath().get(0).equals(Catalog.BUILTINS_DB)
+           && fnName.getFnNamePath().get(1).equalsIgnoreCase(name);
   }
 
   /**
@@ -102,8 +123,12 @@ public class FunctionCallExpr extends Expr {
       FunctionCallExpr agg, List<Expr> params) {
     Preconditions.checkState(agg.isAnalyzed());
     Preconditions.checkState(agg.isAggregateFunction());
+    // If the input aggregate function is already a merge aggregate function (due to
+    // 2-phase aggregation), its input types will be the intermediate value types. The
+    // original input argument exprs are in 'agg.mergeAggInputFn_' so use it instead.
+    FunctionCallExpr mergeAggInputFn = agg.isMergeAggFn() ? agg.mergeAggInputFn_ : agg;
     FunctionCallExpr result = new FunctionCallExpr(
-        agg.fnName_, new FunctionParams(false, params), agg);
+        agg.fnName_, new FunctionParams(false, params), mergeAggInputFn);
     // Inherit the function object from 'agg'.
     result.fn_ = agg.fn_;
     result.type_ = agg.type_;
@@ -127,15 +152,16 @@ public class FunctionCallExpr extends Expr {
     fnName_ = other.fnName_;
     isAnalyticFnCall_ = other.isAnalyticFnCall_;
     isInternalFnCall_ = other.isInternalFnCall_;
-    mergeAggInputFn_ =
-        other.mergeAggInputFn_ == null ? null : (FunctionCallExpr)other.mergeAggInputFn_.clone();
+    mergeAggInputFn_ = other.mergeAggInputFn_ == null ?
+        null : (FunctionCallExpr)other.mergeAggInputFn_.clone();
     // Clone the params in a way that keeps the children_ and the params.exprs()
     // in sync. The children have already been cloned in the super c'tor.
     if (other.params_.isStar()) {
       Preconditions.checkState(children_.isEmpty());
       params_ = FunctionParams.createStarParam();
     } else {
-      params_ = new FunctionParams(other.params_.isDistinct(), children_);
+      params_ = new FunctionParams(other.params_.isDistinct(),
+          other.params_.isIgnoreNulls(), children_);
     }
     label_ = other.label_;
   }
@@ -153,12 +179,13 @@ public class FunctionCallExpr extends Expr {
   }
 
   @Override
-  public boolean equals(Object obj) {
-    if (!super.equals(obj)) return false;
-    FunctionCallExpr o = (FunctionCallExpr)obj;
+  public boolean localEquals(Expr that) {
+    if (!super.localEquals(that)) return false;
+    FunctionCallExpr o = (FunctionCallExpr)that;
     return fnName_.equals(o.fnName_) &&
-           params_.isDistinct() == o.params_.isDistinct() &&
-           params_.isStar() == o.params_.isStar();
+        params_.isDistinct() == o.params_.isDistinct() &&
+        params_.isIgnoreNulls() == o.params_.isIgnoreNulls() &&
+        params_.isStar() == o.params_.isStar();
   }
 
   @Override
@@ -170,7 +197,9 @@ public class FunctionCallExpr extends Expr {
     sb.append(fnName_).append("(");
     if (params_.isStar()) sb.append("*");
     if (params_.isDistinct()) sb.append("DISTINCT ");
-    sb.append(Joiner.on(", ").join(childrenToSql())).append(")");
+    sb.append(Joiner.on(", ").join(childrenToSql()));
+    if (params_.isIgnoreNulls()) sb.append(" IGNORE NULLS");
+    sb.append(")");
     return sb.toString();
   }
 
@@ -180,6 +209,7 @@ public class FunctionCallExpr extends Expr {
         .add("name", fnName_)
         .add("isStar", params_.isStar())
         .add("isDistinct", params_.isDistinct())
+        .add("isIgnoreNulls", params_.isIgnoreNulls())
         .addValue(super.debugString())
         .toString();
   }
@@ -230,9 +260,9 @@ public class FunctionCallExpr extends Expr {
   static boolean isNondeterministicBuiltinFnName(String fnName) {
     if (fnName.equalsIgnoreCase("rand") || fnName.equalsIgnoreCase("random")
         || fnName.equalsIgnoreCase("uuid")) {
-      return false;
+      return true;
     }
-    return true;
+    return false;
   }
 
   /**
@@ -276,7 +306,7 @@ public class FunctionCallExpr extends Expr {
       fnName = path.get(path.size() - 1);
     }
     // Non-deterministic functions are never constant.
-    if (!isNondeterministicBuiltinFnName(fnName)) {
+    if (isNondeterministicBuiltinFnName(fnName)) {
       return false;
     }
     // Sleep is a special function for testing.
@@ -374,6 +404,7 @@ public class FunctionCallExpr extends Expr {
       digitsAfter = 0;
     } else if (fnName_.getFunction().equalsIgnoreCase("truncate") ||
                fnName_.getFunction().equalsIgnoreCase("dtrunc") ||
+               fnName_.getFunction().equalsIgnoreCase("trunc") ||
                fnName_.getFunction().equalsIgnoreCase("round") ||
                fnName_.getFunction().equalsIgnoreCase("dround")) {
       if (children_.size() > 1) {
@@ -438,8 +469,6 @@ public class FunctionCallExpr extends Expr {
       return;
     }
 
-    Type[] argTypes = collectChildReturnTypes();
-
     // User needs DB access.
     Db db = analyzer.getDb(fnName_.getDb(), Privilege.VIEW_METADATA, true);
     if (!db.containsFunction(fnName_.getFunction())) {
@@ -451,8 +480,7 @@ public class FunctionCallExpr extends Expr {
       // There is no version of COUNT() that takes more than 1 argument but after
       // the rewrite, we only need count(*).
       // TODO: fix how we rewrite count distinct.
-      argTypes = new Type[0];
-      Function searchDesc = new Function(fnName_, argTypes, Type.INVALID, false);
+      Function searchDesc = new Function(fnName_, new Type[0], Type.INVALID, false);
       fn_ = db.getFunction(searchDesc, Function.CompareMode.IS_NONSTRICT_SUPERTYPE_OF);
       type_ = fn_.getReturnType();
       // Make sure BE doesn't see any TYPE_NULL exprs
@@ -475,6 +503,28 @@ public class FunctionCallExpr extends Expr {
           "AVG requires a numeric or timestamp parameter: " + toSql());
     }
 
+    // SAMPLED_NDV() is only valid with two children. Invocations with an invalid number
+    // of children are gracefully handled when resolving the function signature.
+    if (fnName_.getFunction().equalsIgnoreCase("sampled_ndv")
+        && children_.size() == 2) {
+      if (!(children_.get(1) instanceof NumericLiteral)) {
+        throw new AnalysisException(
+            "Second parameter of SAMPLED_NDV() must be a numeric literal in [0,1]: " +
+            children_.get(1).toSql());
+      }
+      NumericLiteral samplePerc = (NumericLiteral) children_.get(1);
+      if (samplePerc.getDoubleValue() < 0 || samplePerc.getDoubleValue() > 1.0) {
+        throw new AnalysisException(
+            "Second parameter of SAMPLED_NDV() must be a numeric literal in [0,1]: " +
+            samplePerc.toSql());
+      }
+      // Numeric literals with a decimal point are analyzed as decimals. Without this
+      // cast we might resolve to the wrong function because there is no exactly
+      // matching signature with decimal as the second argument.
+      children_.set(1, samplePerc.uncheckedCastTo(Type.DOUBLE));
+    }
+
+    Type[] argTypes = collectChildReturnTypes();
     Function searchDesc = new Function(fnName_, argTypes, Type.INVALID, false);
     fn_ = db.getFunction(searchDesc, Function.CompareMode.IS_NONSTRICT_SUPERTYPE_OF);
     if (fn_ == null || (!isInternalFnCall_ && !fn_.userVisible())) {
@@ -548,10 +598,16 @@ public class FunctionCallExpr extends Expr {
     if (type_.isWildcardChar() || type_.isWildcardVarchar()) {
       type_ = ScalarType.STRING;
     }
-
-    // TODO(tmarshall): Differentiate based on the specific function.
-    if (hasChildCosts()) evalCost_ = getChildCosts() + FUNCTION_CALL_COST;
   }
+
+  @Override
+  protected float computeEvalCost() {
+    // TODO(tmarshall): Differentiate based on the specific function.
+    return hasChildCosts() ? getChildCosts() + FUNCTION_CALL_COST : UNKNOWN_COST;
+  }
+
+  public FunctionCallExpr getMergeAggInputFn() { return mergeAggInputFn_; }
+  public void setMergeAggInputFn(FunctionCallExpr fn) { mergeAggInputFn_ = fn; }
 
   /**
    * Checks that no special aggregate params are included in 'params' that would be
@@ -574,7 +630,8 @@ public class FunctionCallExpr extends Expr {
   void validateMergeAggFn(FunctionCallExpr inputAggFn) {
     Preconditions.checkState(isMergeAggFn());
     List<Expr> copiedInputExprs = mergeAggInputFn_.getChildren();
-    List<Expr> inputExprs = inputAggFn.getChildren();
+    List<Expr> inputExprs = inputAggFn.isMergeAggFn() ?
+        inputAggFn.mergeAggInputFn_.getChildren() : inputAggFn.getChildren();
     Preconditions.checkState(copiedInputExprs.size() == inputExprs.size());
     for (int i = 0; i < inputExprs.size(); ++i) {
       Type copiedInputType = copiedInputExprs.get(i).getType();
@@ -588,4 +645,20 @@ public class FunctionCallExpr extends Expr {
 
   @Override
   public Expr clone() { return new FunctionCallExpr(this); }
+
+  @Override
+  protected Expr substituteImpl(ExprSubstitutionMap smap, Analyzer analyzer) {
+    Expr e = super.substituteImpl(smap, analyzer);
+    if (!(e instanceof FunctionCallExpr)) return e;
+    FunctionCallExpr fn = (FunctionCallExpr) e;
+    FunctionCallExpr mergeFn = fn.getMergeAggInputFn();
+    if (mergeFn != null) {
+      // The merge function needs to be substituted as well.
+      Expr substitutedFn = mergeFn.substitute(smap, analyzer, true);
+      Preconditions.checkState(substitutedFn instanceof FunctionCallExpr);
+      fn.setMergeAggInputFn((FunctionCallExpr) substitutedFn);
+    }
+    return e;
+  }
+
 }

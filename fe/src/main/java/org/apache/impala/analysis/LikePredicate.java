@@ -98,9 +98,8 @@ public class LikePredicate extends Predicate {
   }
 
   @Override
-  public boolean equals(Object obj) {
-    if (!super.equals(obj)) return false;
-    return ((LikePredicate) obj).op_ == op_;
+  public boolean localEquals(Expr that) {
+    return super.localEquals(that) && ((LikePredicate) that).op_ == op_;
   }
 
   @Override
@@ -143,21 +142,23 @@ public class LikePredicate extends Predicate {
       }
     }
     castForFunctionCall(false);
+  }
 
-    if (hasChildCosts()) {
-      if (getChild(1).isLiteral() && !getChild(1).isNullLiteral() &&
-          Pattern.matches("[%_]*[^%_]*[%_]*", ((StringLiteral) getChild(1)).getValue())) {
-        // This pattern only has wildcards as leading or trailing character,
-        // so it is linear.
-        evalCost_ = getChildCosts() +
-            (float) (getAvgStringLength(getChild(0)) + getAvgStringLength(getChild(1)) *
-            BINARY_PREDICATE_COST) + LIKE_COST;
-      } else {
-        // This pattern is more expensive, so calculate its cost as quadratic.
-        evalCost_ = getChildCosts() +
-            (float) (getAvgStringLength(getChild(0)) * getAvgStringLength(getChild(1)) *
-            BINARY_PREDICATE_COST) + LIKE_COST;
-      }
+  @Override
+  protected float computeEvalCost() {
+    if (!hasChildCosts()) return UNKNOWN_COST;
+    if (getChild(1).isLiteral() && !getChild(1).isNullLiteral() &&
+      Pattern.matches("[%_]*[^%_]*[%_]*", ((StringLiteral) getChild(1)).getValue())) {
+      // This pattern only has wildcards as leading or trailing character,
+      // so it is linear.
+      return getChildCosts() +
+          (float) (getAvgStringLength(getChild(0)) + getAvgStringLength(getChild(1)) *
+              BINARY_PREDICATE_COST) + LIKE_COST;
+    } else {
+      // This pattern is more expensive, so calculate its cost as quadratic.
+      return getChildCosts() +
+          (float) (getAvgStringLength(getChild(0)) * getAvgStringLength(getChild(1)) *
+              BINARY_PREDICATE_COST) + LIKE_COST;
     }
   }
 

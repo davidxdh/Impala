@@ -26,7 +26,8 @@
 #include <gutil/strings/join.h>
 #include <gutil/strings/substitute.h>
 
-#include "gutil/bits.h"
+#include "runtime/io/disk-io-mgr.h"
+#include "runtime/io/request-context.h"
 #include "runtime/runtime-state.h"
 #include "runtime/tmp-file-mgr-internal.h"
 #include "util/bit-util.h"
@@ -52,6 +53,7 @@ using boost::algorithm::token_compress_on;
 using boost::filesystem::absolute;
 using boost::filesystem::path;
 using boost::uuids::random_generator;
+using namespace impala::io;
 using namespace strings;
 
 namespace impala {
@@ -130,10 +132,10 @@ Status TmpFileMgr::InitCustom(const vector<string>& tmp_dirs, bool one_dir_per_d
 
   DCHECK(metrics != nullptr);
   num_active_scratch_dirs_metric_ =
-      metrics->AddGauge<int64_t>(TMP_FILE_MGR_ACTIVE_SCRATCH_DIRS, 0);
+      metrics->AddGauge(TMP_FILE_MGR_ACTIVE_SCRATCH_DIRS, 0);
   active_scratch_dirs_metric_ = SetMetric<string>::CreateAndRegister(
       metrics, TMP_FILE_MGR_ACTIVE_SCRATCH_DIRS_LIST, set<string>());
-  num_active_scratch_dirs_metric_->set_value(tmp_dirs_.size());
+  num_active_scratch_dirs_metric_->SetValue(tmp_dirs_.size());
   for (int i = 0; i < tmp_dirs_.size(); ++i) {
     active_scratch_dirs_metric_->Add(tmp_dirs_[i]);
   }
@@ -213,8 +215,7 @@ void TmpFileMgr::File::Blacklist(const ErrorMsg& msg) {
 
 Status TmpFileMgr::File::Remove() {
   // Remove the file if present (it may not be present if no writes completed).
-  FileSystemUtil::RemovePaths({path_});
-  return Status::OK();
+  return FileSystemUtil::RemovePaths({path_});
 }
 
 string TmpFileMgr::File::DebugString() {
@@ -242,7 +243,7 @@ TmpFileMgr::FileGroup::FileGroup(TmpFileMgr* tmp_file_mgr, DiskIoMgr* io_mgr,
     next_allocation_index_(0),
     free_ranges_(64) {
   DCHECK(tmp_file_mgr != nullptr);
-  io_mgr_->RegisterContext(&io_ctx_, nullptr);
+  io_ctx_ = io_mgr_->RegisterContext(nullptr);
 }
 
 TmpFileMgr::FileGroup::~FileGroup() {
@@ -271,11 +272,8 @@ Status TmpFileMgr::FileGroup::CreateFiles() {
   }
   DCHECK_EQ(tmp_files_.size(), files_allocated);
   if (tmp_files_.size() == 0) {
-    // TODO: IMPALA-4697: the merged errors do not show up in the query error log,
-    // so we must point users to the impalad error log.
-    Status err_status(
-        "Could not create files in any configured scratch directories (--scratch_dirs). "
-        "See logs for previous errors that may have caused this.");
+    Status err_status(TErrorCode::SCRATCH_ALLOCATION_FAILED,
+        join(tmp_file_mgr_->tmp_dirs_, ","), GetBackendString());
     for (Status& err : scratch_errors_) err_status.MergeStatus(err);
     return err_status;
   }
@@ -287,8 +285,7 @@ Status TmpFileMgr::FileGroup::CreateFiles() {
 void TmpFileMgr::FileGroup::Close() {
   // Cancel writes before deleting the files, since in-flight writes could re-create
   // deleted files.
-  if (io_ctx_ != nullptr) io_mgr_->UnregisterContext(io_ctx_);
-  io_ctx_ = nullptr;
+  if (io_ctx_ != nullptr) io_mgr_->UnregisterContext(io_ctx_.get());
   for (std::unique_ptr<TmpFileMgr::File>& file : tmp_files_) {
     Status status = file->Remove();
     if (!status.ok()) {
@@ -303,7 +300,7 @@ Status TmpFileMgr::FileGroup::AllocateSpace(
     int64_t num_bytes, File** tmp_file, int64_t* file_offset) {
   lock_guard<SpinLock> lock(lock_);
   int64_t scratch_range_bytes = max<int64_t>(1L, BitUtil::RoundUpToPowerOfTwo(num_bytes));
-  int free_ranges_idx = Bits::Log2Ceiling64(scratch_range_bytes);
+  int free_ranges_idx = BitUtil::Log2Ceiling64(scratch_range_bytes);
   if (!free_ranges_[free_ranges_idx].empty()) {
     *tmp_file = free_ranges_[free_ranges_idx].back().first;
     *file_offset = free_ranges_[free_ranges_idx].back().second;
@@ -313,7 +310,7 @@ Status TmpFileMgr::FileGroup::AllocateSpace(
 
   if (bytes_limit_ != -1
       && current_bytes_allocated_ + scratch_range_bytes > bytes_limit_) {
-    return Status(TErrorCode::SCRATCH_LIMIT_EXCEEDED, bytes_limit_);
+    return Status(TErrorCode::SCRATCH_LIMIT_EXCEEDED, bytes_limit_, GetBackendString());
   }
 
   // Lazily create the files on the first write.
@@ -337,7 +334,8 @@ Status TmpFileMgr::FileGroup::AllocateSpace(
                  << ". Will try another scratch file.";
     scratch_errors_.push_back(status);
   }
-  Status err_status(TErrorCode::SCRATCH_ALLOCATION_FAILED);
+  Status err_status(TErrorCode::SCRATCH_ALLOCATION_FAILED,
+      join(tmp_file_mgr_->tmp_dirs_, ","), GetBackendString());
   // Include all previous errors that may have caused the failure.
   for (Status& err : scratch_errors_) err_status.MergeStatus(err);
   return err_status;
@@ -346,7 +344,7 @@ Status TmpFileMgr::FileGroup::AllocateSpace(
 void TmpFileMgr::FileGroup::RecycleFileRange(unique_ptr<WriteHandle> handle) {
   int64_t scratch_range_bytes =
       max<int64_t>(1L, BitUtil::RoundUpToPowerOfTwo(handle->len()));
-  int free_ranges_idx = Bits::Log2Ceiling64(scratch_range_bytes);
+  int free_ranges_idx = BitUtil::Log2Ceiling64(scratch_range_bytes);
   lock_guard<SpinLock> lock(lock_);
   free_ranges_[free_ranges_idx].emplace_back(
       handle->file_, handle->write_range_->offset());
@@ -362,10 +360,10 @@ Status TmpFileMgr::FileGroup::Write(
 
   unique_ptr<WriteHandle> tmp_handle(new WriteHandle(encryption_timer_, cb));
   WriteHandle* tmp_handle_ptr = tmp_handle.get(); // Pass ptr by value into lambda.
-  DiskIoMgr::WriteRange::WriteDoneCallback callback = [this, tmp_handle_ptr](
+  WriteRange::WriteDoneCallback callback = [this, tmp_handle_ptr](
       const Status& write_status) { WriteComplete(tmp_handle_ptr, write_status); };
   RETURN_IF_ERROR(
-      tmp_handle->Write(io_mgr_, io_ctx_, tmp_file, file_offset, buffer, callback));
+      tmp_handle->Write(io_mgr_, io_ctx_.get(), tmp_file, file_offset, buffer, callback));
   write_counter_->Add(1);
   bytes_written_counter_->Add(buffer.len());
   *handle = move(tmp_handle);
@@ -373,47 +371,72 @@ Status TmpFileMgr::FileGroup::Write(
 }
 
 Status TmpFileMgr::FileGroup::Read(WriteHandle* handle, MemRange buffer) {
+  RETURN_IF_ERROR(ReadAsync(handle, buffer));
+  return WaitForAsyncRead(handle, buffer);
+}
+
+Status TmpFileMgr::FileGroup::ReadAsync(WriteHandle* handle, MemRange buffer) {
   DCHECK(handle->write_range_ != nullptr);
   DCHECK(!handle->is_cancelled_);
   DCHECK_EQ(buffer.len(), handle->len());
+  Status status;
 
-  // Don't grab 'lock_' in this method - it is not necessary because we don't touch
-  // any members that it protects and could block other threads for the duration of
-  // the synchronous read.
+  // Don't grab 'write_state_lock_' in this method - it is not necessary because we
+  // don't touch any members that it protects and could block other threads for the
+  // duration of the synchronous read.
   DCHECK(!handle->write_in_flight_);
+  DCHECK(handle->read_range_ == nullptr);
   DCHECK(handle->write_range_ != nullptr);
-  // Don't grab handle->lock_, it is safe to touch all of handle's state since the
-  // write is not in flight.
-  DiskIoMgr::ScanRange* scan_range = scan_range_pool_.Add(new DiskIoMgr::ScanRange);
-  scan_range->Reset(nullptr, handle->write_range_->file(), handle->write_range_->len(),
-      handle->write_range_->offset(), handle->write_range_->disk_id(), false,
-      DiskIoMgr::BufferOpts::ReadInto(buffer.data(), buffer.len()));
-  DiskIoMgr::BufferDescriptor* io_mgr_buffer;
-  {
-    SCOPED_TIMER(disk_read_timer_);
-    read_counter_->Add(1);
-    bytes_read_counter_->Add(buffer.len());
-    RETURN_IF_ERROR(io_mgr_->Read(io_ctx_, scan_range, &io_mgr_buffer));
-  }
-
-  if (FLAGS_disk_spill_encryption) {
-    RETURN_IF_ERROR(handle->CheckHashAndDecrypt(buffer));
-  }
-
-  DCHECK_EQ(io_mgr_buffer->buffer(), buffer.data());
-  DCHECK_EQ(io_mgr_buffer->len(), buffer.len());
-  DCHECK(io_mgr_buffer->eosr());
-  io_mgr_buffer->Return();
+  // Don't grab handle->write_state_lock_, it is safe to touch all of handle's state
+  // since the write is not in flight.
+  handle->read_range_ = scan_range_pool_.Add(new ScanRange);
+  handle->read_range_->Reset(nullptr, handle->write_range_->file(),
+      handle->write_range_->len(), handle->write_range_->offset(),
+      handle->write_range_->disk_id(), false,
+      BufferOpts::ReadInto(buffer.data(), buffer.len()));
+  read_counter_->Add(1);
+  bytes_read_counter_->Add(buffer.len());
+  RETURN_IF_ERROR(io_mgr_->AddScanRange(io_ctx_.get(), handle->read_range_, true));
   return Status::OK();
 }
 
-Status TmpFileMgr::FileGroup::CancelWriteAndRestoreData(
+Status TmpFileMgr::FileGroup::WaitForAsyncRead(WriteHandle* handle, MemRange buffer) {
+  DCHECK(handle->read_range_ != nullptr);
+  // Don't grab handle->write_state_lock_, it is safe to touch all of handle's state
+  // since the write is not in flight.
+  SCOPED_TIMER(disk_read_timer_);
+  unique_ptr<BufferDescriptor> io_mgr_buffer;
+  Status status = handle->read_range_->GetNext(&io_mgr_buffer);
+  if (!status.ok()) goto exit;
+  DCHECK(io_mgr_buffer != NULL);
+  DCHECK(io_mgr_buffer->eosr());
+  DCHECK_LE(io_mgr_buffer->len(), buffer.len());
+  if (io_mgr_buffer->len() < buffer.len()) {
+    // The read was truncated - this is an error.
+    status = Status(TErrorCode::SCRATCH_READ_TRUNCATED, buffer.len(),
+        handle->write_range_->file(), GetBackendString(), handle->write_range_->offset(),
+        io_mgr_buffer->len());
+    goto exit;
+  }
+  DCHECK_EQ(io_mgr_buffer->buffer(), buffer.data());
+
+  if (FLAGS_disk_spill_encryption) {
+    status = handle->CheckHashAndDecrypt(buffer);
+    if (!status.ok()) goto exit;
+  }
+exit:
+  // Always return the buffer before exiting to avoid leaking it.
+  if (io_mgr_buffer != nullptr) io_mgr_->ReturnBuffer(move(io_mgr_buffer));
+  handle->read_range_ = nullptr;
+  return status;
+}
+
+Status TmpFileMgr::FileGroup::RestoreData(
     unique_ptr<WriteHandle> handle, MemRange buffer) {
   DCHECK_EQ(handle->write_range_->data(), buffer.data());
   DCHECK_EQ(handle->len(), buffer.len());
-  handle->Cancel();
-
-  handle->WaitForWrite();
+  DCHECK(!handle->write_in_flight_);
+  DCHECK(handle->read_range_ == nullptr);
   // Decrypt after the write is finished, so that we don't accidentally write decrypted
   // data to disk.
   Status status;
@@ -468,7 +491,7 @@ Status TmpFileMgr::FileGroup::RecoverWriteError(
   // Choose another file to try. Blacklisting ensures we don't retry the same file.
   // If this fails, the status will include all the errors in 'scratch_errors_'.
   RETURN_IF_ERROR(AllocateSpace(handle->len(), &tmp_file, &file_offset));
-  return handle->RetryWrite(io_mgr_, io_ctx_, tmp_file, file_offset);
+  return handle->RetryWrite(io_mgr_, io_ctx_.get(), tmp_file, file_offset);
 }
 
 string TmpFileMgr::FileGroup::DebugString() {
@@ -495,6 +518,7 @@ TmpFileMgr::WriteHandle::WriteHandle(
   : cb_(cb),
     encryption_timer_(encryption_timer),
     file_(nullptr),
+    read_range_(nullptr),
     is_cancelled_(false),
     write_in_flight_(false) {}
 
@@ -503,9 +527,9 @@ string TmpFileMgr::WriteHandle::TmpFilePath() const {
   return file_->path();
 }
 
-Status TmpFileMgr::WriteHandle::Write(DiskIoMgr* io_mgr, DiskIoRequestContext* io_ctx,
+Status TmpFileMgr::WriteHandle::Write(DiskIoMgr* io_mgr, RequestContext* io_ctx,
     File* file, int64_t offset, MemRange buffer,
-    DiskIoMgr::WriteRange::WriteDoneCallback callback) {
+    WriteRange::WriteDoneCallback callback) {
   DCHECK(!write_in_flight_);
 
   if (FLAGS_disk_spill_encryption) RETURN_IF_ERROR(EncryptAndHash(buffer));
@@ -514,7 +538,7 @@ Status TmpFileMgr::WriteHandle::Write(DiskIoMgr* io_mgr, DiskIoRequestContext* i
   // WriteComplete() may be called concurrently with the remainder of this function.
   file_ = file;
   write_range_.reset(
-      new DiskIoMgr::WriteRange(file->path(), offset, file->AssignDiskQueue(), callback));
+      new WriteRange(file->path(), offset, file->AssignDiskQueue(), callback));
   write_range_->SetData(buffer.data(), buffer.len());
   write_in_flight_ = true;
   Status status = io_mgr->AddWriteRange(io_ctx, write_range_.get());
@@ -531,7 +555,7 @@ Status TmpFileMgr::WriteHandle::Write(DiskIoMgr* io_mgr, DiskIoRequestContext* i
 }
 
 Status TmpFileMgr::WriteHandle::RetryWrite(
-    DiskIoMgr* io_mgr, DiskIoRequestContext* io_ctx, File* file, int64_t offset) {
+    DiskIoMgr* io_mgr, RequestContext* io_ctx, File* file, int64_t offset) {
   DCHECK(write_in_flight_);
   file_ = file;
   write_range_->SetRange(file->path(), offset, file->AssignDiskQueue());
@@ -564,9 +588,20 @@ void TmpFileMgr::WriteHandle::WriteComplete(const Status& write_status) {
 }
 
 void TmpFileMgr::WriteHandle::Cancel() {
-  unique_lock<mutex> lock(write_state_lock_);
-  is_cancelled_ = true;
-  // TODO: in future, if DiskIoMgr supported cancellation, we could cancel it here.
+  CancelRead();
+  {
+    unique_lock<mutex> lock(write_state_lock_);
+    is_cancelled_ = true;
+    // TODO: in future, if DiskIoMgr supported write cancellation, we could cancel it
+    // here.
+  }
+}
+
+void TmpFileMgr::WriteHandle::CancelRead() {
+  if (read_range_ != nullptr) {
+    read_range_->Cancel(Status::CANCELLED);
+    read_range_ = nullptr;
+  }
 }
 
 void TmpFileMgr::WriteHandle::WaitForWrite() {
@@ -577,19 +612,26 @@ void TmpFileMgr::WriteHandle::WaitForWrite() {
 Status TmpFileMgr::WriteHandle::EncryptAndHash(MemRange buffer) {
   DCHECK(FLAGS_disk_spill_encryption);
   SCOPED_TIMER(encryption_timer_);
-  // Since we're using AES-CFB mode, we must take care not to reuse a key/IV pair.
-  // Regenerate a new key and IV for every data buffer we write.
+  // Since we're using GCM/CTR/CFB mode, we must take care not to reuse a
+  // key/IV pair. Regenerate a new key and IV for every data buffer we write.
   key_.InitializeRandom();
   RETURN_IF_ERROR(key_.Encrypt(buffer.data(), buffer.len(), buffer.data()));
-  hash_.Compute(buffer.data(), buffer.len());
+
+  if (!key_.IsGcmMode()) {
+    hash_.Compute(buffer.data(), buffer.len());
+  }
   return Status::OK();
 }
 
 Status TmpFileMgr::WriteHandle::CheckHashAndDecrypt(MemRange buffer) {
   DCHECK(FLAGS_disk_spill_encryption);
   SCOPED_TIMER(encryption_timer_);
-  if (!hash_.Verify(buffer.data(), buffer.len())) {
-    return Status("Block verification failure");
+
+  // GCM mode will verify the integrity by itself
+  if (!key_.IsGcmMode()) {
+    if (!hash_.Verify(buffer.data(), buffer.len())) {
+      return Status("Block verification failure");
+    }
   }
   return key_.Decrypt(buffer.data(), buffer.len(), buffer.data());
 }

@@ -18,11 +18,14 @@
 package org.apache.impala.analysis;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 
 import org.apache.impala.analysis.AnalysisContext.AnalysisResult;
 import org.apache.impala.analysis.UnionStmt.UnionOperand;
 import org.apache.impala.common.AnalysisException;
+import org.apache.impala.common.ColumnAliasGenerator;
+import org.apache.impala.common.TableAliasGenerator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -219,11 +222,21 @@ public class StmtRewriter {
             "expression: " + conjunct.toSql());
       }
 
-      if (conjunct instanceof ExistsPredicate) {
+      Expr rewrittenConjunct = conjunct;
+      if (conjunct instanceof InPredicate && conjunct.getChild(0).isConstant()) {
+        Expr newConjunct = rewriteInConstant(stmt, (InPredicate)conjunct);
+        if (newConjunct != null) {
+          newConjunct.analyze(analyzer);
+          rewrittenConjunct = newConjunct;
+        }
+      }
+
+      if (rewrittenConjunct instanceof ExistsPredicate) {
         // Check if we can determine the result of an ExistsPredicate during analysis.
         // If so, replace the predicate with a BoolLiteral predicate and remove it from
         // the list of predicates to be rewritten.
-        BoolLiteral boolLiteral = replaceExistsPredicate((ExistsPredicate) conjunct);
+        BoolLiteral boolLiteral =
+            replaceExistsPredicate((ExistsPredicate) rewrittenConjunct);
         if (boolLiteral != null) {
           boolLiteral.analyze(analyzer);
           smap.put(conjunct, boolLiteral);
@@ -236,7 +249,7 @@ public class StmtRewriter {
       BoolLiteral boolLiteral = new BoolLiteral(true);
       boolLiteral.analyze(analyzer);
       smap.put(conjunct, boolLiteral);
-      exprsWithSubqueries.add(conjunct);
+      exprsWithSubqueries.add(rewrittenConjunct);
     }
     stmt.whereClause_ = stmt.whereClause_.substitute(smap, analyzer, false);
 
@@ -269,6 +282,130 @@ public class StmtRewriter {
       boolLiteral = new BoolLiteral(!predicate.isNotExists());
     }
     return boolLiteral;
+  }
+
+  /**
+   * Rewrites [NOT] IN predicate when the LHS is a constant and RHS is a subquery.
+   * If 'inPred' is not rewritten, null is returned. If 'inPred' is rewritten, the
+   * resulting expression is not analyzed (caller must analyze). 'outerBlock' is the
+   * parent block of 'inPred'.
+   *
+   * Example: SELECT * FROM t WHERE 1 IN (SELECT id FROM s)
+   *
+   * The rewrite transforms 'inPred' using the following cases. C refers to the LHS
+   * constant and RHS is the subquery. All cases apply to both correlated and
+   * uncorrelated subqueries.
+   *
+   * 1) Predicate is IN: No rewrite since it can be evaluated using the existing
+   *                     NestedLoop based Left Semijoin.
+   *
+   * 2) Predicate is NOT IN and RHS returns a single row.
+   *
+   *    Example: 10 NOT IN (SELECT 1)
+   *    Example: 10 NOT IN (SELECT MAX(b) FROM t)
+   *    Example: 10 NOT IN (SELECT x FROM t LIMIT 1)
+   *
+   *    REWRITE: C NOT IN RHS: => C != (RHS)
+   *
+   * 3) Predicate is NOT IN and RHS returns multiple rows.
+   *
+   *    Example: SELECT * FROM t WHERE 1 NOT IN (SELECT id FROM s)
+   *
+   *    Assume RHS is of the form SELECT expr FROM T WHERE ...
+   *
+   *    REWRITE:
+   *     C NOT IN (RHS)
+   *       Rewrites to:
+   *     NOT EXISTS (SELECT x FROM (SELECT x FROM RHS) tmp
+   *                 WHERE C IS NULL OR tmp.x IS NULL OR tmp.x = C)
+   *
+   *    Example:
+   *     ... 10 NOT IN (SELECT x FROM t WHERE t.y > 3)
+   *       Rewrites to:
+   *     ... NOT EXISTS (SELECT x (SELECT x FROM t WHERE t.y > 3) tmp
+   *                     WHERE 10 IS NULL OR tmp.x IS NULL OR tmp.x = 10)
+   *
+   *    The rewrite wraps the RHS subquery in an inline view and filters it with a
+   *    condition using the LHS constant. The inline view ensures that the filter is
+   *    logically evaluated over the RHS result. Alternatively, injecting the filter into
+   *    the RHS is generally incorrect so requires push-down analysis to preserve
+   *    correctness (consider cases such as limit, aggregation, and analytic functions).
+   *    Such special cases are avoided here by using the inline view.
+   *    TODO: Correlated NOT IN subqueries require that column resolution be extended to
+   *    handle references to an outer block that is more than one nesting level away.
+   *
+   *    The filter constructed from the LHS constant is subtle, so warrants further
+   *    explanation. Consider the cases where the LHS is NULL vs. NOT NULL and the RHS
+   *    is empty vs. not-empty. When RHS subquery evaluates to the empty result set, the
+   *    NOT EXISTS passes for all LHS values. When the RHS subquery is not-empty, it is
+   *    useful to think of C NOT IN (RHS) as the boolean expansion:
+   *          C != x_1 & C != x_2 & C != x_3 & ... where each x_i is bound to a result
+   *          from the RHS subquery.
+   *
+   *    So, if C is equal to any x_i, the expression is false. Similarly, if any
+   *    x_i is null or if C is null, then the overall expression also is false.
+   */
+  private static Expr rewriteInConstant(SelectStmt outerBlock,
+      InPredicate inPred) throws AnalysisException {
+    Expr lhs = inPred.getChild(0);
+    Preconditions.checkArgument(lhs.isConstant());
+
+    Expr rhs = inPred.getChild(1);
+    QueryStmt subquery = inPred.getSubquery().getStatement();
+    Preconditions.checkState(subquery instanceof SelectStmt);
+    SelectStmt rhsQuery = (SelectStmt) subquery;
+
+    // CASE 1, IN:
+    if (!inPred.isNotIn()) return null;
+
+    // CASE 2, NOT IN and RHS returns a single row:
+    if (rhsQuery.returnsSingleRow()) {
+      return new BinaryPredicate(BinaryPredicate.Operator.NE, lhs, rhs);
+    }
+
+    // CASE 3, NOT IN, RHS returns multiple rows.
+    Preconditions.checkState(rhsQuery.getResultExprs().size() == 1);
+    // Do not rewrite NOT IN when the RHS is correlated.
+    if (isCorrelated(rhsQuery)) return null;
+
+    // Wrap RHS in an inline view: (select wrapperColumnAlias from RHS) wrapperTableAlias.
+    // Use outerBlock (parent block of subquery) to generate aliases. Doing so guarantees
+    // that the wrapper view does not produce the same alias if further rewritten.
+    String wrapperTableAlias = outerBlock.getTableAliasGenerator().getNextAlias();
+    String wrapperColumnAlias = outerBlock.getColumnAliasGenerator().getNextAlias();
+    InlineViewRef wrapperView = new InlineViewRef(wrapperTableAlias, rhsQuery,
+        Lists.newArrayList(wrapperColumnAlias));
+    SlotRef wrapperResult = new SlotRef(
+        Lists.newArrayList(wrapperTableAlias, wrapperColumnAlias));
+
+    // Build: lhs IS NULL OR rhsResultExpr IS NULL OR lhs = rhs
+    Expr rewritePredicate = new CompoundPredicate(CompoundPredicate.Operator.OR,
+        new IsNullPredicate(lhs, false),
+        new CompoundPredicate(CompoundPredicate.Operator.OR,
+            new IsNullPredicate(wrapperResult, false),
+            new BinaryPredicate(BinaryPredicate.Operator.EQ, wrapperResult, lhs)));
+
+    List<TableRef> fromList = Lists.newArrayList();
+    fromList.add(wrapperView);
+    SelectStmt rewriteQuery = new SelectStmt(
+        new SelectList(Lists.newArrayList(new SelectListItem(wrapperResult, null))),
+        new FromClause(fromList),
+        rewritePredicate,
+        null, null, null, null);
+    Subquery newSubquery = new Subquery(rewriteQuery);
+    rhsQuery.reset();
+
+    // Build: NOT EXISTS(newSubquery)
+    return new ExistsPredicate(newSubquery, true);
+  }
+
+  /**
+   * Tests if a subquery is correlated to its outer block.
+   */
+  private static boolean isCorrelated(SelectStmt subqueryStmt) {
+    if (!subqueryStmt.hasWhereClause()) return false;
+    return containsCorrelatedPredicate(subqueryStmt.getWhereClause(),
+        subqueryStmt.getTableRefIds());
   }
 
   /**
@@ -336,9 +473,8 @@ public class StmtRewriter {
     // Extract all correlated predicates from the subquery.
     List<Expr> onClauseConjuncts = extractCorrelatedPredicates(subqueryStmt);
     if (!onClauseConjuncts.isEmpty()) {
-      canRewriteCorrelatedSubquery(expr, onClauseConjuncts);
-      // For correlated subqueries that are eligible for rewrite by transforming
-      // into a join, a LIMIT clause has no effect on the results, so we can
+      validateCorrelatedSubqueryStmt(expr);
+      // For correlated subqueries, a LIMIT clause has no effect on the results, so we can
       // safely remove it.
       subqueryStmt.limitElement_ = new LimitElement(null, null);
     }
@@ -372,6 +508,7 @@ public class StmtRewriter {
       SelectListItem firstItem =
           ((SelectStmt) inlineView.getViewStmt()).getSelectList().getItems().get(0);
       if (!onClauseConjuncts.isEmpty() &&
+          firstItem.getExpr() != null &&
           firstItem.getExpr().contains(Expr.NON_NULL_EMPTY_AGG)) {
         // Correlated subqueries with an aggregate function that returns non-null on
         // an empty input are rewritten using a LEFT OUTER JOIN because we
@@ -393,6 +530,12 @@ public class StmtRewriter {
       }
 
       if (joinConjunct != null) onClauseConjuncts.add(joinConjunct);
+    }
+
+    // Ensure that all the extracted correlated predicates can be added to the ON-clause
+    // of the generated join.
+    if (!onClauseConjuncts.isEmpty()) {
+      validateCorrelatedPredicates(expr, inlineView, onClauseConjuncts);
     }
 
     // Create the ON clause from the extracted correlated predicates.
@@ -447,7 +590,8 @@ public class StmtRewriter {
       if (!operator.isEquivalence()) continue;
       List<TupleId> lhsTupleIds = Lists.newArrayList();
       conjunct.getChild(0).getIds(lhsTupleIds, null);
-      if (lhsTupleIds.isEmpty()) continue;
+      // Allows for constants to be a join predicate.
+      if (lhsTupleIds.isEmpty() && !conjunct.getChild(0).isConstant()) continue;
       List<TupleId> rhsTupleIds = Lists.newArrayList();
       conjunct.getChild(1).getIds(rhsTupleIds, null);
       if (rhsTupleIds.isEmpty()) continue;
@@ -498,6 +642,7 @@ public class StmtRewriter {
         joinOp = JoinOperator.NULL_AWARE_LEFT_ANTI_JOIN;
         List<TupleId> tIds = Lists.newArrayList();
         joinConjunct.getIds(tIds, null);
+
         if (tIds.size() <= 1 || !tIds.contains(inlineView.getDesc().getId())) {
           throw new AnalysisException("Unsupported NOT IN predicate with subquery: " +
               expr.toSql());
@@ -525,7 +670,7 @@ public class StmtRewriter {
   /**
    * Replace all unqualified star exprs ('*') from stmt's select list with qualified
    * ones, i.e. tbl_1.*,...,tbl_n.*, where tbl_1,...,tbl_n are the visible tablerefs
-   * in stmt. 'tableIndx' indicates the maximum tableRef ordinal to consider when
+   * in stmt. 'tableIdx' indicates the maximum tableRef ordinal to consider when
    * replacing an unqualified star item.
    */
   private static void replaceUnqualifiedStarItems(SelectStmt stmt, int tableIdx) {
@@ -634,15 +779,12 @@ public class StmtRewriter {
 
   /**
    * Checks if an expr containing a correlated subquery is eligible for rewrite by
-   * tranforming into a join. 'correlatedPredicates' contains the correlated
-   * predicates identified in the subquery. Throws an AnalysisException if 'expr'
-   * is not eligible for rewrite.
+   * transforming into a join. Throws an AnalysisException if 'expr' is not eligible for
+   * rewrite.
    * TODO: Merge all the rewrite eligibility tests into a single function.
    */
-  private static void canRewriteCorrelatedSubquery(Expr expr,
-      List<Expr> correlatedPredicates) throws AnalysisException {
+  private static void validateCorrelatedSubqueryStmt(Expr expr) throws AnalysisException {
     Preconditions.checkNotNull(expr);
-    Preconditions.checkNotNull(correlatedPredicates);
     Preconditions.checkState(expr.contains(Subquery.class));
     SelectStmt stmt = (SelectStmt) expr.getSubquery().getStatement();
     Preconditions.checkNotNull(stmt);
@@ -655,6 +797,30 @@ public class StmtRewriter {
           "and/or aggregation: " + stmt.toSql());
     }
 
+    // The following correlated subqueries with a limit clause are supported:
+    // 1. EXISTS subqueries
+    // 2. Scalar subqueries with aggregation
+    if (stmt.hasLimit() &&
+        (!(expr instanceof BinaryPredicate) || !stmt.hasAggInfo() ||
+         stmt.selectList_.isDistinct()) &&
+        !(expr instanceof ExistsPredicate)) {
+      throw new AnalysisException("Unsupported correlated subquery with a " +
+          "LIMIT clause: " + stmt.toSql());
+    }
+  }
+
+  /**
+   * Checks if all the 'correlatedPredicates' extracted from the subquery of 'expr' can be
+   * added to the ON-clause of the join that results from the subquery rewrite. It throws
+   * an AnalysisException if this is not the case. 'inlineView' is the generated inline
+   * view that will replace the subquery in the rewritten statement.
+   */
+  private static void validateCorrelatedPredicates(Expr expr, InlineViewRef inlineView,
+      List<Expr> correlatedPredicates) throws AnalysisException {
+    Preconditions.checkNotNull(expr);
+    Preconditions.checkNotNull(correlatedPredicates);
+    Preconditions.checkState(inlineView.isAnalyzed());
+    SelectStmt stmt = (SelectStmt) expr.getSubquery().getStatement();
     final com.google.common.base.Predicate<Expr> isSingleSlotRef =
         new com.google.common.base.Predicate<Expr>() {
       @Override
@@ -673,15 +839,31 @@ public class StmtRewriter {
           "HAVING clause: " + stmt.toSql());
     }
 
-    // The following correlated subqueries with a limit clause are supported:
-    // 1. EXISTS subqueries
-    // 2. Scalar subqueries with aggregation
-    if (stmt.hasLimit() &&
-        (!(expr instanceof BinaryPredicate) || !stmt.hasAggInfo() ||
-         stmt.selectList_.isDistinct()) &&
-        !(expr instanceof ExistsPredicate)) {
-      throw new AnalysisException("Unsupported correlated subquery with a " +
-          "LIMIT clause: " + stmt.toSql());
+    // We only support equality correlated predicates in aggregate subqueries
+    // (see IMPALA-5531). This check needs to be performed after the inline view
+    // has been analyzed to make sure we don't incorrectly reject non-equality correlated
+    // predicates from nested collections.
+    if (expr instanceof BinaryPredicate && !inlineView.isCorrelated()
+        && !correlatedPredicates.isEmpty()) {
+      final List<TupleId> subqueryTblIds = stmt.getTableRefIds();
+      final com.google.common.base.Predicate<Expr> isBoundBySubqueryTids =
+          new com.google.common.base.Predicate<Expr>() {
+            @Override
+            public boolean apply(Expr arg) {
+              List<TupleId> tids = Lists.newArrayList();
+              arg.getIds(tids, null);
+              return !Collections.disjoint(tids, subqueryTblIds);
+            }
+        };
+
+      List<Expr> unsupportedPredicates = Lists.newArrayList(Iterables.filter(
+          correlatedPredicates, Predicates.and(Expr.IS_NOT_EQ_BINARY_PREDICATE,
+              isBoundBySubqueryTids)));
+      if (!unsupportedPredicates.isEmpty()) {
+        throw new AnalysisException("Unsupported aggregate subquery with " +
+            "non-equality correlated predicates: " +
+            Expr.listToSql(unsupportedPredicates));
+      }
     }
   }
 

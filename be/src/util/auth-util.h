@@ -20,6 +20,7 @@
 #define IMPALA_UTIL_AUTH_UTIL_H
 
 #include <string>
+#include "service/impala-server.h"
 
 namespace impala {
 
@@ -31,6 +32,38 @@ class TSessionState;
 /// the connected_user is acting as a "proxy user" for the delegated_user. When
 /// delegated_user is empty, the effective user is the connected user.
 const std::string& GetEffectiveUser(const TSessionState& session);
+
+/// Same behavior as the function above with different input parameter type.
+const std::string& GetEffectiveUser(const ImpalaServer::SessionState& session);
+
+/// Checks if 'user' can access the runtime profile or execution summary of a
+/// statement by comparing 'user' with the user that run the statement, 'effective_user',
+/// and checking if 'effective_user' is authorized to access the profile, as indicated by
+/// 'has_access'. An error Status is returned if 'user' is not authorized to
+/// access the runtime profile or execution summary.
+Status CheckProfileAccess(const std::string& user, const std::string& effective_user,
+    bool has_access);
+
+/// Returns the internal kerberos principal. The internal kerberos principal is the
+/// principal that is used for backend connections only.
+/// 'out_principal' will contain the principal string. Must only be called if Kerberos
+/// is enabled.
+Status GetInternalKerberosPrincipal(std::string* out_principal);
+
+/// Returns the external kerberos principal. The external kerberos principal is the
+/// principal that is used for client connections only.
+/// 'out_principal' will contain the principal string. Must only be called if Kerberos
+/// is enabled.
+Status GetExternalKerberosPrincipal(std::string* out_principal);
+
+/// Splits the kerberos principal 'principal' which should be of the format:
+/// "<service>/<hostname>@<realm>", and fills in the respective out parameters.
+/// If 'principal' is not of the above format, an error status is returned.
+Status ParseKerberosPrincipal(const std::string& principal, std::string* service_name,
+    std::string* hostname, std::string* realm);
+
+/// Returns true if kerberos is enabled.
+bool IsKerberosEnabled();
 
 } // namespace impala
 #endif

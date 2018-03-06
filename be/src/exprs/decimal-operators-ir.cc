@@ -23,10 +23,8 @@
 
 #include "codegen/impala-ir.h"
 #include "exprs/anyval-util.h"
-#include "exprs/case-expr.h"
-#include "exprs/expr.h"
+#include "exprs/scalar-expr.h"
 #include "runtime/decimal-value.inline.h"
-#include "runtime/tuple-row.h"
 #include "util/decimal-util.h"
 #include "util/string-parser.h"
 
@@ -35,11 +33,15 @@
 namespace impala {
 
 #define RETURN_IF_OVERFLOW(ctx, overflow, return_type) \
-  do {\
-    if (UNLIKELY(overflow)) {\
-      ctx->AddWarning("Expression overflowed, returning NULL");\
-      return return_type::null();\
-    }\
+  do { \
+    if (UNLIKELY(overflow)) { \
+      if (ctx->impl()->GetConstFnAttr(FunctionContextImpl::DECIMAL_V2)) { \
+        ctx->SetError("Decimal expression overflowed"); \
+      } else { \
+        ctx->AddWarning("Decimal expression overflowed, returning NULL"); \
+      } \
+      return return_type::null(); \
+    } \
   } while (false)
 
 // Inline in IR module so branches can be optimised out.
@@ -532,22 +534,26 @@ IR_ALWAYS_INLINE DecimalVal DecimalOperators::CastToDecimalVal(
   DecimalVal dv;
   int precision = ctx->impl()->GetConstFnAttr(FunctionContextImpl::RETURN_TYPE_PRECISION);
   int scale = ctx->impl()->GetConstFnAttr(FunctionContextImpl::RETURN_TYPE_SCALE);
+  bool is_decimal_v2 = ctx->impl()->GetConstFnAttr(FunctionContextImpl::DECIMAL_V2);
   switch (ColumnType::GetDecimalByteSize(precision)) {
     case 4: {
       Decimal4Value dv4 = StringParser::StringToDecimal<int32_t>(
-          reinterpret_cast<char*>(val.ptr), val.len, precision, scale, &result);
+          reinterpret_cast<char*>(val.ptr), val.len, precision, scale,
+          is_decimal_v2, &result);
       dv = DecimalVal(dv4.value());
       break;
     }
     case 8: {
       Decimal8Value dv8 = StringParser::StringToDecimal<int64_t>(
-          reinterpret_cast<char*>(val.ptr), val.len, precision, scale, &result);
+          reinterpret_cast<char*>(val.ptr), val.len, precision, scale,
+          is_decimal_v2, &result);
       dv = DecimalVal(dv8.value());
       break;
     }
     case 16: {
       Decimal16Value dv16 = StringParser::StringToDecimal<int128_t>(
-          reinterpret_cast<char*>(val.ptr), val.len, precision, scale, &result);
+          reinterpret_cast<char*>(val.ptr), val.len, precision, scale,
+          is_decimal_v2, &result);
       dv = DecimalVal(dv16.value());
       break;
     }
@@ -590,64 +596,63 @@ StringVal DecimalOperators::CastToStringVal(
 }
 
 template <typename T>
-IR_ALWAYS_INLINE T DecimalOperators::ConvertToNanoseconds(T val, int scale) {
-  // Nanosecond scale means there should be 9 decimal digits.
+IR_ALWAYS_INLINE int32_t DecimalOperators::ConvertToNanoseconds(
+    T val, int scale, bool round) {
+  // Nanosecond scale means there should be 9 decimal digits, which is representable
+  // with int32_t.
   const int NANOSECOND_SCALE = 9;
   T nanoseconds;
   if (LIKELY(scale <= NANOSECOND_SCALE)) {
     nanoseconds = val * DecimalUtil::GetScaleMultiplier<T>(
         NANOSECOND_SCALE - scale);
   } else {
-    nanoseconds = val / DecimalUtil::GetScaleMultiplier<T>(
-        scale - NANOSECOND_SCALE);
+    nanoseconds = DecimalUtil::ScaleDownAndRound<T>(
+        val, scale - NANOSECOND_SCALE, round);
+    DCHECK(nanoseconds <= 1000000000);
+    DCHECK(nanoseconds != 1000000000 || round);
   }
+  DCHECK(nanoseconds >= numeric_limits<int32_t>::min()
+      && nanoseconds <= numeric_limits<int32_t>::max());
+
   return nanoseconds;
 }
+
+template <typename T>
+TimestampVal DecimalOperators::ConvertToTimestampVal(
+    const T& decimal_value, int scale, bool round) {
+  typename T::StorageType seconds = decimal_value.whole_part(scale);
+  if (seconds < numeric_limits<int64_t>::min() ||
+      seconds > numeric_limits<int64_t>::max()) {
+    // TimeStampVal() takes int64_t.
+    return TimestampVal::null();
+  }
+  int32_t nanoseconds =
+      ConvertToNanoseconds(decimal_value.fractional_part(scale), scale, round);
+  if (decimal_value.is_negative()) nanoseconds *= -1;
+  TimestampVal result;
+  TimestampValue::FromUnixTimeNanos(seconds, nanoseconds).ToTimestampVal(&result);
+  return result;
+}
+
 
 TimestampVal DecimalOperators::CastToTimestampVal(
     FunctionContext* ctx, const DecimalVal& val) {
   if (val.is_null) return TimestampVal::null();
   int precision = ctx->impl()->GetConstFnAttr(FunctionContextImpl::ARG_TYPE_PRECISION, 0);
   int scale = ctx->impl()->GetConstFnAttr(FunctionContextImpl::ARG_TYPE_SCALE, 0);
+  bool is_decimal_v2 = ctx->impl()->GetConstFnAttr(FunctionContextImpl::DECIMAL_V2);
   TimestampVal result;
   switch (ColumnType::GetDecimalByteSize(precision)) {
-    case 4: {
-      Decimal4Value dv(val.val4);
-      int32_t seconds = dv.whole_part(scale);
-      int32_t nanoseconds = ConvertToNanoseconds(
-          dv.fractional_part(scale), scale);
-      TimestampValue tv(seconds, nanoseconds);
-      tv.ToTimestampVal(&result);
-      break;
-    }
-    case 8: {
-      Decimal8Value dv(val.val8);
-      int64_t seconds = dv.whole_part(scale);
-      int64_t nanoseconds = ConvertToNanoseconds(
-          dv.fractional_part(scale), scale);
-      TimestampValue tv(seconds, nanoseconds);
-      tv.ToTimestampVal(&result);
-      break;
-    }
-    case 16: {
-      Decimal16Value dv(val.val16);
-      int128_t seconds = dv.whole_part(scale);
-      if (seconds < numeric_limits<int64_t>::min() ||
-          seconds > numeric_limits<int64_t>::max()) {
-        // TimeStampVal() takes int64_t.
-        return TimestampVal::null();
-      }
-      int128_t nanoseconds = ConvertToNanoseconds(
-          dv.fractional_part(scale), scale);
-      TimestampValue tv(seconds, nanoseconds);
-      tv.ToTimestampVal(&result);
-      break;
-    }
+    case 4:
+      return ConvertToTimestampVal(Decimal4Value(val.val4), scale, is_decimal_v2);
+    case 8:
+      return ConvertToTimestampVal(Decimal8Value(val.val8), scale, is_decimal_v2);
+    case 16:
+      return ConvertToTimestampVal(Decimal16Value(val.val16), scale, is_decimal_v2);
     default:
       DCHECK(false);
       return TimestampVal::null();
   }
-  return result;
 }
 
 BooleanVal DecimalOperators::CastToBooleanVal(
@@ -683,6 +688,8 @@ BooleanVal DecimalOperators::CastToBooleanVal(
         ctx->impl()->GetConstFnAttr(FunctionContextImpl::DECIMAL_V2); \
     switch (ctx->impl()->GetConstFnAttr(FunctionContextImpl::RETURN_TYPE_SIZE)) { \
       case 4: { \
+        DCHECK_LE(x_size, 4); \
+        DCHECK_LE(y_size, 4); \
         Decimal4Value x_val = GetDecimal4Value(x, x_size, &overflow); \
         Decimal4Value y_val = GetDecimal4Value(y, y_size, &overflow); \
         Decimal4Value result = x_val.OP_FN<int32_t>(x_scale, y_val, y_scale, \
@@ -691,6 +698,8 @@ BooleanVal DecimalOperators::CastToBooleanVal(
         return DecimalVal(result.value()); \
       } \
       case 8: { \
+        DCHECK_LE(x_size, 8); \
+        DCHECK_LE(y_size, 8); \
         Decimal8Value x_val = GetDecimal8Value(x, x_size, &overflow); \
         Decimal8Value y_val = GetDecimal8Value(y, y_size, &overflow); \
         Decimal8Value result = x_val.OP_FN<int64_t>(x_scale, y_val, y_scale, \
@@ -722,38 +731,51 @@ BooleanVal DecimalOperators::CastToBooleanVal(
     int x_scale = ctx->impl()->GetConstFnAttr(FunctionContextImpl::ARG_TYPE_SCALE, 0); \
     int y_size = ctx->impl()->GetConstFnAttr(FunctionContextImpl::ARG_TYPE_SIZE, 1); \
     int y_scale = ctx->impl()->GetConstFnAttr(FunctionContextImpl::ARG_TYPE_SCALE, 1); \
+    int return_size = \
+        ctx->impl()->GetConstFnAttr(FunctionContextImpl::RETURN_TYPE_SIZE); \
     int return_precision = \
         ctx->impl()->GetConstFnAttr(FunctionContextImpl::RETURN_TYPE_PRECISION); \
     int return_scale = \
         ctx->impl()->GetConstFnAttr(FunctionContextImpl::RETURN_TYPE_SCALE); \
-    bool round = \
+    const bool decimal_v2 = \
         ctx->impl()->GetConstFnAttr(FunctionContextImpl::DECIMAL_V2); \
-    switch (ctx->impl()->GetConstFnAttr(FunctionContextImpl::RETURN_TYPE_SIZE)) { \
+    /* We need a type that is big enough for the result and the operands as well */ \
+    int max_size = ::max(::max(x_size, y_size), return_size); \
+    switch (max_size) { \
       case 4: { \
         Decimal4Value x_val = GetDecimal4Value(x, x_size, &overflow); \
         Decimal4Value y_val = GetDecimal4Value(y, y_size, &overflow); \
         Decimal4Value result = x_val.OP_FN<int32_t>(x_scale, y_val, y_scale, \
-            return_precision, return_scale, round, &is_nan, &overflow); \
+            return_precision, return_scale, decimal_v2, &is_nan, &overflow); \
         DCHECK(!overflow) << "Cannot overflow except with Decimal16Value"; \
-        if (is_nan) return DecimalVal::null(); \
+        if (is_nan) { \
+          if (decimal_v2) ctx->SetError("Cannot divide decimal by zero"); \
+          return DecimalVal::null(); \
+        } \
         return DecimalVal(result.value()); \
       } \
       case 8: { \
         Decimal8Value x_val = GetDecimal8Value(x, x_size, &overflow); \
         Decimal8Value y_val = GetDecimal8Value(y, y_size, &overflow); \
         Decimal8Value result = x_val.OP_FN<int64_t>(x_scale, y_val, y_scale, \
-            return_precision, return_scale, round, &is_nan, &overflow); \
+            return_precision, return_scale, decimal_v2, &is_nan, &overflow); \
         DCHECK(!overflow) << "Cannot overflow except with Decimal16Value"; \
-        if (is_nan) return DecimalVal::null(); \
+        if (is_nan) { \
+          if (decimal_v2) ctx->SetError("Cannot divide decimal by zero"); \
+          return DecimalVal::null(); \
+        } \
         return DecimalVal(result.value()); \
       } \
       case 16: { \
         Decimal16Value x_val = GetDecimal16Value(x, x_size, &overflow); \
         Decimal16Value y_val = GetDecimal16Value(y, y_size, &overflow); \
         Decimal16Value result = x_val.OP_FN<int128_t>(x_scale, y_val, y_scale, \
-            return_precision, return_scale, round, &is_nan, &overflow); \
+            return_precision, return_scale, decimal_v2, &is_nan, &overflow); \
         RETURN_IF_OVERFLOW(ctx, overflow, DecimalVal); \
-        if (is_nan) return DecimalVal::null(); \
+        if (is_nan) { \
+          if (decimal_v2) ctx->SetError("Cannot divide decimal by zero"); \
+          return DecimalVal::null(); \
+        } \
         return DecimalVal(result.value()); \
       } \
       default: \

@@ -27,9 +27,16 @@
 
 #include "common/logging.h"
 #include "runtime/mem-tracker.h"
+#include "runtime/exec-env.h"
+#include "service/impala-server.h"
+#include "util/common-metrics.h"
 #include "util/debug-util.h"
+#include "util/mem-info.h"
 #include "util/pprof-path-handlers.h"
-#include "util/webserver.h"
+#include "util/mem-info.h"
+#include "util/cpu-info.h"
+#include "util/disk-info.h"
+#include "util/process-state-info.h"
 
 #include "common/names.h"
 
@@ -128,8 +135,8 @@ void MemUsageHandler(MemTracker* mem_tracker, MetricGroup* metric_group,
   document->AddMember("consumption", consumption, document->GetAllocator());
 
   stringstream ss;
-#ifdef ADDRESS_SANITIZER
-  ss << "Memory tracking is not available with address sanitizer builds.";
+#if defined(ADDRESS_SANITIZER) || defined(THREAD_SANITIZER)
+  ss << "Memory tracking is not available with address or thread sanitizer builds.";
 #else
   char buf[2048];
   MallocExtension::instance()->GetStats(buf, 2048);
@@ -140,12 +147,23 @@ void MemUsageHandler(MemTracker* mem_tracker, MetricGroup* metric_group,
   document->AddMember("overview", overview, document->GetAllocator());
 
   // Dump all mem trackers.
-  Value detailed(mem_tracker->LogUsage().c_str(), document->GetAllocator());
+  Value detailed(mem_tracker->LogUsage(MemTracker::UNLIMITED_DEPTH).c_str(),
+      document->GetAllocator());
   document->AddMember("detailed", detailed, document->GetAllocator());
 
-  if (metric_group != NULL) {
+  Value systeminfo(MemInfo::DebugString().c_str(), document->GetAllocator());
+  document->AddMember("systeminfo", systeminfo, document->GetAllocator());
+
+  if (metric_group != nullptr) {
+    MetricGroup* aggregate_group = metric_group->FindChildGroup("memory");
+    if (aggregate_group != nullptr) {
+      Value json_metrics(kObjectType);
+      aggregate_group->ToJson(false, document, &json_metrics);
+      document->AddMember(
+          "aggregate_metrics", json_metrics["metrics"], document->GetAllocator());
+    }
     MetricGroup* jvm_group = metric_group->FindChildGroup("jvm");
-    if (jvm_group != NULL) {
+    if (jvm_group != nullptr) {
       Value jvm(kObjectType);
       jvm_group->ToJson(false, document, &jvm);
       Value heap(kArrayType);
@@ -164,11 +182,51 @@ void MemUsageHandler(MemTracker* mem_tracker, MetricGroup* metric_group,
       document->AddMember("jvm_heap", heap, document->GetAllocator());
       document->AddMember("jvm_non_heap", non_heap, document->GetAllocator());
     }
+    MetricGroup* buffer_pool_group = metric_group->FindChildGroup("buffer-pool");
+    if (buffer_pool_group != nullptr) {
+      Value json_metrics(kObjectType);
+      buffer_pool_group->ToJson(false, document, &json_metrics);
+      document->AddMember(
+          "buffer_pool", json_metrics["metrics"], document->GetAllocator());
+    }
   }
 }
 
+namespace impala {
 
-void impala::AddDefaultUrlCallbacks(
+void RootHandler(const Webserver::ArgumentMap& args, Document* document) {
+  Value version(GetVersionString().c_str(), document->GetAllocator());
+  document->AddMember("version", version, document->GetAllocator());
+  Value cpu_info(CpuInfo::DebugString().c_str(), document->GetAllocator());
+  document->AddMember("cpu_info", cpu_info, document->GetAllocator());
+  Value mem_info(MemInfo::DebugString().c_str(), document->GetAllocator());
+  document->AddMember("mem_info", mem_info, document->GetAllocator());
+  Value disk_info(DiskInfo::DebugString().c_str(), document->GetAllocator());
+  document->AddMember("disk_info", disk_info, document->GetAllocator());
+  Value os_info(OsInfo::DebugString().c_str(), document->GetAllocator());
+  document->AddMember("os_info", os_info, document->GetAllocator());
+  Value process_state_info(ProcessStateInfo().DebugString().c_str(),
+    document->GetAllocator());
+  document->AddMember("process_state_info", process_state_info,
+    document->GetAllocator());
+
+  if (CommonMetrics::PROCESS_START_TIME != nullptr) {
+    Value process_start_time(CommonMetrics::PROCESS_START_TIME->GetValue().c_str(),
+      document->GetAllocator());
+    document->AddMember("process_start_time", process_start_time,
+      document->GetAllocator());
+  }
+
+  ExecEnv* env = ExecEnv::GetInstance();
+  if (env == nullptr || env->impala_server() == nullptr) return;
+  document->AddMember("impala_server_mode", true, document->GetAllocator());
+  document->AddMember("is_coordinator", env->impala_server()->IsCoordinator(),
+      document->GetAllocator());
+  document->AddMember("is_executor", env->impala_server()->IsExecutor(),
+      document->GetAllocator());
+}
+
+void AddDefaultUrlCallbacks(
     Webserver* webserver, MemTracker* process_mem_tracker, MetricGroup* metric_group) {
   webserver->RegisterUrlCallback("/logs", "logs.tmpl", LogsHandler);
   webserver->RegisterUrlCallback("/varz", "flags.tmpl", FlagsHandler);
@@ -180,10 +238,18 @@ void impala::AddDefaultUrlCallbacks(
     webserver->RegisterUrlCallback("/memz", "memz.tmpl", callback);
   }
 
-#ifndef ADDRESS_SANITIZER
+#if !defined(ADDRESS_SANITIZER) && !defined(THREAD_SANITIZER)
   // Remote (on-demand) profiling is disabled if the process is already being profiled.
   if (!FLAGS_enable_process_lifetime_heap_profiling) {
     AddPprofUrlCallbacks(webserver);
   }
 #endif
+
+  auto root_handler =
+    [](const Webserver::ArgumentMap& args, Document* doc) {
+      RootHandler(args, doc);
+    };
+  webserver->RegisterUrlCallback("/", "root.tmpl", root_handler);
+}
+
 }

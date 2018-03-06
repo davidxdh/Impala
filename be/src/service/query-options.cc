@@ -30,14 +30,19 @@
 
 #include "common/names.h"
 
+DECLARE_int64(min_buffer_size);
+
 using boost::algorithm::iequals;
 using boost::algorithm::is_any_of;
 using boost::algorithm::token_compress_on;
 using boost::algorithm::split;
 using boost::algorithm::trim;
 using std::to_string;
+using beeswax::TQueryOptionLevel;
 using namespace impala;
 using namespace strings;
+
+DECLARE_int32(idle_session_timeout);
 
 // Utility method to wrap ParseUtil::ParseMemSpec() by returning a Status instead of an
 // int.
@@ -57,29 +62,54 @@ void impala::OverlayQueryOptions(const TQueryOptions& src, const QueryOptionsMas
     TQueryOptions* dst) {
   DCHECK_GT(mask.size(), _TImpalaQueryOptions_VALUES_TO_NAMES.size()) <<
       "Size of QueryOptionsMask must be increased.";
-#define QUERY_OPT_FN(NAME, ENUM)\
-  if (src.__isset.NAME && mask[TImpalaQueryOptions::ENUM]) dst->NAME = src.NAME;
+#define QUERY_OPT_FN(NAME, ENUM, LEVEL)\
+  if (src.__isset.NAME && mask[TImpalaQueryOptions::ENUM]) dst->__set_##NAME(src.NAME);
   QUERY_OPTS_TABLE
 #undef QUERY_OPT_FN
 }
 
 void impala::TQueryOptionsToMap(const TQueryOptions& query_options,
     map<string, string>* configuration) {
-#define QUERY_OPT_FN(NAME, ENUM)\
+#define QUERY_OPT_FN(NAME, ENUM, LEVEL)\
   {\
-    stringstream val;\
-    val << query_options.NAME;\
-    (*configuration)[#ENUM] = val.str();\
+    if (query_options.__isset.NAME) { \
+      stringstream val;\
+      val << query_options.NAME;\
+      (*configuration)[#ENUM] = val.str();\
+    } else { \
+      (*configuration)[#ENUM] = ""; \
+    }\
   }
   QUERY_OPTS_TABLE
 #undef QUERY_OPT_FN
 }
 
-string impala::DebugQueryOptions(const TQueryOptions& query_options) {
+// Resets query_options->option to its default value.
+static void ResetQueryOption(const int option, TQueryOptions* query_options) {
   const static TQueryOptions defaults;
+  switch (option) {
+#define QUERY_OPT_FN(NAME, ENUM, LEVEL)\
+    case TImpalaQueryOptions::ENUM:\
+      query_options->__isset.NAME = defaults.__isset.NAME;\
+      query_options->NAME = defaults.NAME;\
+      break;
+  QUERY_OPTS_TABLE
+#undef QUERY_OPT_FN
+  }
+}
+
+static TQueryOptions DefaultQueryOptions() {
+  TQueryOptions defaults;
+  // default value of idle_session_timeout is set by a command line flag.
+  defaults.__set_idle_session_timeout(FLAGS_idle_session_timeout);
+  return defaults;
+}
+
+string impala::DebugQueryOptions(const TQueryOptions& query_options) {
+  const static TQueryOptions defaults = DefaultQueryOptions();
   int i = 0;
   stringstream ss;
-#define QUERY_OPT_FN(NAME, ENUM)\
+#define QUERY_OPT_FN(NAME, ENUM, LEVEL)\
   if (query_options.__isset.NAME &&\
       (!defaults.__isset.NAME || query_options.NAME != defaults.NAME)) {\
     if (i++ > 0) ss << ",";\
@@ -92,7 +122,7 @@ string impala::DebugQueryOptions(const TQueryOptions& query_options) {
 
 // Returns the TImpalaQueryOptions enum for the given "key". Input is case insensitive.
 // Return -1 if the input is an invalid option.
-int GetQueryOptionForKey(const string& key) {
+static int GetQueryOptionForKey(const string& key) {
   map<int, const char*>::const_iterator itr =
       _TImpalaQueryOptions_VALUES_TO_NAMES.begin();
   for (; itr != _TImpalaQueryOptions_VALUES_TO_NAMES.end(); ++itr) {
@@ -111,6 +141,12 @@ Status impala::SetQueryOption(const string& key, const string& value,
   int option = GetQueryOptionForKey(key);
   if (option < 0) {
     return Status(Substitute("Invalid query option: $0", key));
+  } else if (value == "") {
+    ResetQueryOption(option, query_options);
+    if (set_query_options_mask != nullptr) {
+      DCHECK_LT(option, set_query_options_mask->size());
+      set_query_options_mask->reset(option);
+    }
   } else {
     switch (option) {
       case TImpalaQueryOptions::ABORT_ON_ERROR:
@@ -124,9 +160,17 @@ Status impala::SetQueryOption(const string& key, const string& value,
         query_options->__set_disable_codegen(
             iequals(value, "true") || iequals(value, "1"));
         break;
-      case TImpalaQueryOptions::BATCH_SIZE:
-        query_options->__set_batch_size(atoi(value.c_str()));
+      case TImpalaQueryOptions::BATCH_SIZE: {
+        StringParser::ParseResult status;
+        int val = StringParser::StringToInt<int>(value.c_str(),
+            static_cast<int>(value.size()), &status);
+        if (status != StringParser::PARSE_SUCCESS || val < 0 || val > 65536) {
+          return Status(Substitute("Invalid batch size '$0'. Valid sizes are in"
+              "[0, 65536]", value));
+        }
+        query_options->__set_batch_size(val);
         break;
+      }
       case TImpalaQueryOptions::MEM_LIMIT: {
         // Parse the mem limit spec and validate it.
         int64_t bytes_limit;
@@ -172,7 +216,6 @@ Status impala::SetQueryOption(const string& key, const string& value,
         break;
       }
       case TImpalaQueryOptions::COMPRESSION_CODEC: {
-        if (value.empty()) break;
         if (iequals(value, "none")) {
           query_options->__set_compression_codec(THdfsCompression::NONE);
         } else if (iequals(value, "gzip")) {
@@ -258,13 +301,22 @@ Status impala::SetQueryOption(const string& key, const string& value,
         query_options->__set_rm_initial_mem(reservation_size);
         break;
       }
-      case TImpalaQueryOptions::QUERY_TIMEOUT_S:
-        query_options->__set_query_timeout_s(atoi(value.c_str()));
+      case TImpalaQueryOptions::QUERY_TIMEOUT_S: {
+        StringParser::ParseResult result;
+        const int32_t timeout_s =
+            StringParser::StringToInt<int32_t>(value.c_str(), value.length(), &result);
+        if (result != StringParser::PARSE_SUCCESS || timeout_s < 0) {
+          return Status(
+              Substitute("Invalid query timeout: '$0'. "
+                         "Only non-negative numbers are allowed.", value));
+        }
+        query_options->__set_query_timeout_s(timeout_s);
         break;
-      case TImpalaQueryOptions::MAX_BLOCK_MGR_MEMORY: {
+      }
+      case TImpalaQueryOptions::BUFFER_POOL_LIMIT: {
         int64_t mem;
-        RETURN_IF_ERROR(ParseMemValue(value, "block mgr memory limit", &mem));
-        query_options->__set_max_block_mgr_memory(mem);
+        RETURN_IF_ERROR(ParseMemValue(value, "buffer pool limit", &mem));
+        query_options->__set_buffer_pool_limit(mem);
         break;
       }
       case TImpalaQueryOptions::APPX_COUNT_DISTINCT: {
@@ -337,6 +389,16 @@ Status impala::SetQueryOption(const string& key, const string& value,
                   RuntimeFilterBank::MIN_BLOOM_FILTER_SIZE,
                   RuntimeFilterBank::MAX_BLOOM_FILTER_SIZE));
         }
+        if (option == TImpalaQueryOptions::RUNTIME_FILTER_MAX_SIZE
+            && size < FLAGS_min_buffer_size
+            // last condition is to unblock the highly improbable case where the
+            // min_buffer_size is greater than RuntimeFilterBank::MAX_BLOOM_FILTER_SIZE.
+            && FLAGS_min_buffer_size <= RuntimeFilterBank::MAX_BLOOM_FILTER_SIZE) {
+          return Status(Substitute("$0 should not be less than $1 which is the minimum "
+              "buffer size that can be allocated by the buffer pool",
+              PrintTImpalaQueryOptions(static_cast<TImpalaQueryOptions::type>(option)),
+              FLAGS_min_buffer_size));
+        }
         if (option == TImpalaQueryOptions::RUNTIME_BLOOM_FILTER_SIZE) {
           query_options->__set_runtime_bloom_filter_size(size);
         } else if (option == TImpalaQueryOptions::RUNTIME_FILTER_MIN_SIZE) {
@@ -353,7 +415,7 @@ Status impala::SetQueryOption(const string& key, const string& value,
         if (result != StringParser::PARSE_SUCCESS || time_ms < 0) {
           return Status(
               Substitute("$0 is not a valid wait time. Valid sizes are in [0, $1].",
-                  value, 0, numeric_limits<int32_t>::max()));
+                  value, numeric_limits<int32_t>::max()));
         }
         query_options->__set_runtime_filter_wait_time_ms(time_ms);
         break;
@@ -366,8 +428,7 @@ Status impala::SetQueryOption(const string& key, const string& value,
         StringParser::ParseResult status;
         int val = StringParser::StringToInt<int>(value.c_str(), value.size(), &status);
         if (status != StringParser::PARSE_SUCCESS) {
-          return Status(Substitute("Invalid number of runtime filters: '$0'.",
-              value.c_str()));
+          return Status(Substitute("Invalid number of runtime filters: '$0'.", value));
         }
         if (val < 0) {
           return Status(Substitute("Invalid number of runtime filters: '$0'. "
@@ -393,6 +454,26 @@ Status impala::SetQueryOption(const string& key, const string& value,
         } else {
           return Status(Substitute("Invalid PARQUET_FALLBACK_SCHEMA_RESOLUTION option: "
               "'$0'. Valid options are 'POSITION' and 'NAME'.", value));
+        }
+        break;
+      }
+      case TImpalaQueryOptions::PARQUET_ARRAY_RESOLUTION: {
+        if (iequals(value, "three_level") ||
+            value == to_string(TParquetArrayResolution::THREE_LEVEL)) {
+          query_options->__set_parquet_array_resolution(
+              TParquetArrayResolution::THREE_LEVEL);
+        } else if (iequals(value, "two_level") ||
+            value == to_string(TParquetArrayResolution::TWO_LEVEL)) {
+          query_options->__set_parquet_array_resolution(
+              TParquetArrayResolution::TWO_LEVEL);
+        } else if (iequals(value, "two_level_then_three_level") ||
+            value == to_string(TParquetArrayResolution::TWO_LEVEL_THEN_THREE_LEVEL)) {
+          query_options->__set_parquet_array_resolution(
+              TParquetArrayResolution::TWO_LEVEL_THEN_THREE_LEVEL);
+        } else {
+          return Status(Substitute("Invalid PARQUET_ARRAY_RESOLUTION option: '$0'. "
+              "Valid options are 'THREE_LEVEL', 'TWO_LEVEL' and "
+              "'TWO_LEVEL_THEN_THREE_LEVEL'.", value));
         }
         break;
       }
@@ -455,6 +536,116 @@ Status impala::SetQueryOption(const string& key, const string& value,
             iequals(value, "true") || iequals(value, "1"));
         break;
       }
+      case TImpalaQueryOptions::PARQUET_READ_STATISTICS: {
+        query_options->__set_parquet_read_statistics(
+            iequals(value, "true") || iequals(value, "1"));
+        break;
+      }
+      case TImpalaQueryOptions::DEFAULT_JOIN_DISTRIBUTION_MODE: {
+        if (iequals(value, "BROADCAST") || iequals(value, "0")) {
+          query_options->__set_default_join_distribution_mode(
+              TJoinDistributionMode::BROADCAST);
+        } else if (iequals(value, "SHUFFLE") || iequals(value, "1")) {
+          query_options->__set_default_join_distribution_mode(
+              TJoinDistributionMode::SHUFFLE);
+        } else {
+          return Status(Substitute("Invalid default_join_distribution_mode '$0'. "
+              "Valid values are BROADCAST or SHUFFLE", value));
+        }
+        break;
+      }
+      case TImpalaQueryOptions::DISABLE_CODEGEN_ROWS_THRESHOLD: {
+        StringParser::ParseResult status;
+        int val = StringParser::StringToInt<int>(value.c_str(), value.size(), &status);
+        if (status != StringParser::PARSE_SUCCESS) {
+          return Status(Substitute("Invalid threshold: '$0'.", value));
+        }
+        if (val < 0) {
+          return Status(Substitute(
+              "Invalid threshold: '$0'. Only positive values are allowed.", val));
+        }
+        query_options->__set_disable_codegen_rows_threshold(val);
+        break;
+      }
+      case TImpalaQueryOptions::DEFAULT_SPILLABLE_BUFFER_SIZE: {
+        int64_t buffer_size_bytes;
+        RETURN_IF_ERROR(
+            ParseMemValue(value, "Default spillable buffer size", &buffer_size_bytes));
+        if (!BitUtil::IsPowerOf2(buffer_size_bytes)) {
+          return Status(
+              Substitute("Default spillable buffer size must be a power of two: $0",
+                  buffer_size_bytes));
+        }
+        if (buffer_size_bytes > SPILLABLE_BUFFER_LIMIT) {
+          return Status(Substitute(
+              "Default spillable buffer size must be less than or equal to: $0",
+              SPILLABLE_BUFFER_LIMIT));
+        }
+        query_options->__set_default_spillable_buffer_size(buffer_size_bytes);
+        break;
+      }
+      case TImpalaQueryOptions::MIN_SPILLABLE_BUFFER_SIZE: {
+        int64_t buffer_size_bytes;
+        RETURN_IF_ERROR(
+            ParseMemValue(value, "Minimum spillable buffer size", &buffer_size_bytes));
+        if (!BitUtil::IsPowerOf2(buffer_size_bytes)) {
+          return Status(
+              Substitute("Minimum spillable buffer size must be a power of two: $0",
+                  buffer_size_bytes));
+        }
+        if (buffer_size_bytes > SPILLABLE_BUFFER_LIMIT) {
+          return Status(Substitute(
+              "Minimum spillable buffer size must be less than or equal to: $0",
+              SPILLABLE_BUFFER_LIMIT));
+        }
+        query_options->__set_min_spillable_buffer_size(buffer_size_bytes);
+        break;
+      }
+      case TImpalaQueryOptions::MAX_ROW_SIZE: {
+        int64_t max_row_size_bytes;
+        RETURN_IF_ERROR(ParseMemValue(value, "Max row size", &max_row_size_bytes));
+        if (max_row_size_bytes <= 0 || max_row_size_bytes > ROW_SIZE_LIMIT) {
+          return Status(
+              Substitute("Invalid max row size of $0. Valid sizes are in [$1, $2]", value,
+                  1, ROW_SIZE_LIMIT));
+        }
+        query_options->__set_max_row_size(max_row_size_bytes);
+        break;
+      }
+      case TImpalaQueryOptions::IDLE_SESSION_TIMEOUT: {
+        StringParser::ParseResult result;
+        const int32_t requested_timeout =
+            StringParser::StringToInt<int32_t>(value.c_str(), value.length(), &result);
+        if (result != StringParser::PARSE_SUCCESS || requested_timeout < 0) {
+          return Status(
+              Substitute("Invalid idle session timeout: '$0'. "
+                         "Only non-negative numbers are allowed.", value));
+        }
+        query_options->__set_idle_session_timeout(requested_timeout);
+        break;
+      }
+      case TImpalaQueryOptions::COMPUTE_STATS_MIN_SAMPLE_SIZE: {
+        int64_t min_sample_size;
+        RETURN_IF_ERROR(ParseMemValue(value, "Min sample size", &min_sample_size));
+        if (min_sample_size < 0) {
+          return Status(
+              Substitute("Min sample size must be greater or equal to zero: $0", value));
+        }
+        query_options->__set_compute_stats_min_sample_size(min_sample_size);
+        break;
+      }
+      case TImpalaQueryOptions::EXEC_TIME_LIMIT_S: {
+        StringParser::ParseResult result;
+        const int32_t time_limit =
+            StringParser::StringToInt<int32_t>(value.c_str(), value.length(), &result);
+        if (result != StringParser::PARSE_SUCCESS || time_limit < 0) {
+          return Status(
+              Substitute("Invalid query time limit: '$0'. "
+                         "Only non-negative numbers are allowed.", value));
+        }
+        query_options->__set_exec_time_limit_s(time_limit);
+        break;
+      }
       default:
         // We hit this DCHECK(false) if we forgot to add the corresponding entry here
         // when we add a new query option.
@@ -493,4 +684,15 @@ Status impala::ParseQueryOptions(const string& options, TQueryOptions* query_opt
   }
   if (errorStatus.msg().details().size() > 0) return errorStatus;
   return Status::OK();
+}
+
+void impala::PopulateQueryOptionLevels(QueryOptionLevels* query_option_levels)
+{
+#define QUERY_OPT_FN(NAME, ENUM, LEVEL)\
+  {\
+    (*query_option_levels)[#ENUM] = LEVEL;\
+  }
+  QUERY_OPTS_TABLE
+  QUERY_OPT_FN(support_start_over, SUPPORT_START_OVER, TQueryOptionLevel::ADVANCED)
+#undef QUERY_OPT_FN
 }

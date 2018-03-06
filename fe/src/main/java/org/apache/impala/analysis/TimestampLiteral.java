@@ -19,12 +19,12 @@ package org.apache.impala.analysis;
 
 import java.util.Arrays;
 
+import com.google.common.base.Preconditions;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.thrift.TExprNode;
 import org.apache.impala.thrift.TExprNodeType;
 import org.apache.impala.thrift.TTimestampLiteral;
-import org.apache.kudu.client.shaded.com.google.common.base.Preconditions;
 
 /**
  * Represents a literal timestamp. Its value is a 16-byte array that corresponds to a
@@ -45,7 +45,6 @@ public class TimestampLiteral extends LiteralExpr {
     value_ = value;
     strValue_ = strValue;
     type_ = Type.TIMESTAMP;
-    evalCost_ = Expr.LITERAL_COST;
   }
 
   /**
@@ -58,9 +57,9 @@ public class TimestampLiteral extends LiteralExpr {
   }
 
   @Override
-  public boolean equals(Object obj) {
-    if (!super.equals(obj)) return false;
-    return Arrays.equals(value_, ((TimestampLiteral) obj).value_);
+  public boolean localEquals(Expr that) {
+    return super.localEquals(that) &&
+        Arrays.equals(value_, ((TimestampLiteral) that).value_);
   }
 
   @Override

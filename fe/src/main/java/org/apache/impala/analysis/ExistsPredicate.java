@@ -61,13 +61,15 @@ public class ExistsPredicate extends Predicate {
   }
 
   @Override
-  public boolean equals(Object o) {
-    if (!super.equals(o)) return false;
-    return notExists_ == ((ExistsPredicate)o).notExists_;
+  public boolean localEquals(Expr that) {
+    return super.localEquals(that) && notExists_ == ((ExistsPredicate)that).notExists_;
   }
 
   @Override
   public Expr clone() { return new ExistsPredicate(this); }
+
+  @Override
+  protected float computeEvalCost() { return UNKNOWN_COST; }
 
   @Override
   public String toSqlImpl() {

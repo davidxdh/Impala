@@ -40,16 +40,60 @@ from TCLIService import TCLIService
 
 LOG = logging.getLogger('admission_test')
 
-# We set a WAIT debug action so it doesn't complete the execution of this query. The
-# limit is a parameter for debugging purposes; each thread will insert its id so
+# The query used for testing. It is important that this query returns many rows
+# while keeping fragments active on all backends. This allows a thread to keep
+# the query active and consuming resources by fetching one row at a time. The
+# where clause is for debugging purposes; each thread will insert its id so
 # that running queries can be correlated with the thread that submitted them.
-QUERY = "select * from alltypes where id != %s"# limit %s"
+QUERY = """
+select * from alltypesagg where id != {0}
+union all
+select * from alltypesagg where id != {0}
+union all
+select * from alltypesagg where id != {0}
+union all
+select * from alltypesagg where id != {0}
+union all
+select * from alltypesagg where id != {0}
+union all
+select * from alltypesagg where id != {0}
+union all
+select * from alltypesagg where id != {0}
+union all
+select * from alltypesagg where id != {0}
+union all
+select * from alltypesagg where id != {0}
+union all
+select * from alltypesagg where id != {0}
+union all
+select * from alltypesagg where id != {0}
+union all
+select * from alltypesagg where id != {0}
+union all
+select * from alltypesagg where id != {0}
+union all
+select * from alltypesagg where id != {0}
+union all
+select * from alltypesagg where id != {0}
+union all
+select * from alltypesagg where id != {0}
+union all
+select * from alltypesagg where id != {0}
+union all
+select * from alltypesagg where id != {0}
+union all
+select * from alltypesagg where id != {0}
+"""
 
-# Time to sleep (in milliseconds) between issuing queries. The default statestore
-# heartbeat is 500ms, so the lower the delay the more we can submit before the global
-# state is updated. When the delay is at least the statestore heartbeat frequency, all
-# state should be visible by every impalad by the time the next query is submitted.
-SUBMISSION_DELAY_MS = [0, 50, 100, 600]
+# The statestore heartbeat and topic update frequency (ms). Set low for testing.
+STATESTORE_RPC_FREQUENCY_MS = 100
+
+# Time to sleep (in milliseconds) between issuing queries. When the delay is at least
+# the statestore heartbeat frequency, all state should be visible by every impalad by
+# the time the next query is submitted. Otherwise the different impalads will see stale
+# state for some admission decisions.
+SUBMISSION_DELAY_MS = \
+    [0, STATESTORE_RPC_FREQUENCY_MS / 2, STATESTORE_RPC_FREQUENCY_MS * 3 / 2]
 
 # The number of queries to submit. The test does not support fewer queries than
 # MAX_NUM_CONCURRENT_QUERIES + MAX_NUM_QUEUED_QUERIES to keep some validation logic
@@ -63,12 +107,9 @@ ROUND_ROBIN_SUBMISSION = [True, False]
 # pool with the parameters below.
 POOL_NAME = "default-pool"
 
-# The statestore heartbeat and topic update frequency (ms). Set low for testing.
-STATESTORE_RPC_FREQUENCY_MS = 500
-
-# Stress test timeout (seconds). The timeout needs to be significantly higher in code
-# coverage builds (IMPALA-3790).
-STRESS_TIMEOUT = specific_build_type_timeout(30, code_coverage_build_timeout=600)
+# Stress test timeout (seconds). The timeout needs to be significantly higher for
+# slow builds like code coverage and ASAN (IMPALA-3790, IMPALA-6241).
+STRESS_TIMEOUT = specific_build_type_timeout(60, slow_build_timeout=600)
 
 # The number of queries that can execute concurrently in the pool POOL_NAME.
 MAX_NUM_CONCURRENT_QUERIES = 5
@@ -79,23 +120,34 @@ MAX_NUM_QUEUED_QUERIES = 10
 # Mem limit (bytes) used in the mem limit test
 MEM_TEST_LIMIT = 12 * 1024 * 1024 * 1024
 
-_STATESTORED_ARGS = "-statestore_heartbeat_frequency_ms=%s "\
-                    "-statestore_update_frequency_ms=%s" %\
-                    (STATESTORE_RPC_FREQUENCY_MS, STATESTORE_RPC_FREQUENCY_MS)
+_STATESTORED_ARGS = ("-statestore_heartbeat_frequency_ms={freq_ms} "
+                     "-statestore_priority_update_frequency_ms={freq_ms}").format(
+                    freq_ms=STATESTORE_RPC_FREQUENCY_MS)
+
+# Name of the subscriber metric tracking the admission control update interval.
+REQUEST_QUEUE_UPDATE_INTERVAL =\
+    'statestore-subscriber.topic-impala-request-queue.update-interval'
 
 # Key in the query profile for the query options.
-PROFILE_QUERY_OPTIONS_KEY = "Query Options (non default): "
+PROFILE_QUERY_OPTIONS_KEY = "Query Options (set by configuration): "
+
+# The different ways that a query thread can end its query.
+QUERY_END_BEHAVIORS = ['EOS', 'CLIENT_CANCEL', 'QUERY_TIMEOUT', 'CLIENT_CLOSE']
+
+# The timeout used for the QUERY_TIMEOUT end behaviour
+QUERY_END_TIMEOUT_S = 1
 
 def impalad_admission_ctrl_flags(max_requests, max_queued, pool_max_mem,
-    proc_mem_limit = None):
+    proc_mem_limit = None, queue_wait_timeout_ms=None):
+  extra_flags = ""
   if proc_mem_limit is not None:
-    proc_limit_flag = "-mem_limit=%s" % (proc_mem_limit)
-  else:
-    proc_limit_flag = ""
-  return ("-vmodule admission-controller=3 -default_pool_max_requests %s "
-      "-default_pool_max_queued %s -default_pool_mem_limit %s "
-      "-disable_admission_control=false %s" %\
-      (max_requests, max_queued, pool_max_mem, proc_limit_flag))
+    extra_flags += " -mem_limit={0}".format(proc_mem_limit)
+  if queue_wait_timeout_ms is not None:
+    extra_flags += " -queue_wait_timeout_ms={0}".format(queue_wait_timeout_ms)
+  return ("-vmodule admission-controller=3 -default_pool_max_requests {0} "
+      "-default_pool_max_queued {1} -default_pool_mem_limit {2} "
+      "-disable_admission_control=false {3}".format(
+      max_requests, max_queued, pool_max_mem, extra_flags))
 
 
 def impalad_admission_ctrl_config_args(additional_args=""):
@@ -113,9 +165,9 @@ def log_metrics(log_prefix, metrics, log_level=logging.DEBUG):
       metrics['dequeued'], metrics['rejected'], metrics['released'],
       metrics['timed-out'])
 
-def compute_metric_deltas(m2, m1, metric_names):
+def compute_metric_deltas(m2, m1):
   """Returns a dictionary of the differences of metrics in m2 and m1 (m2 - m1)"""
-  return dict((n, m2.get(n, 0) - m1.get(n, 0)) for n in metric_names)
+  return dict((n, m2.get(n, 0) - m1.get(n, 0)) for n in m2.keys())
 
 def metric_key(pool_name, metric_name):
   """Helper method to construct the admission controller metric keys"""
@@ -144,8 +196,9 @@ class TestAdmissionController(TestAdmissionControllerBase, HS2TestSuite):
       assert re.search(expected_error_re, str(e))
 
   def __check_query_options(self, profile, expected_query_options):
-    """Validate that the per-pool query options were set on the specified profile.
-    expected_query_options is a list of "KEY=VALUE" strings, e.g. ["MEM_LIMIT=1", ...]"""
+    """Validate that the expected per-pool query options were set on the specified
+    profile. expected_query_options is a list of "KEY=VALUE" strings, e.g.
+    ["MEM_LIMIT=1", ...]"""
     confs = []
     for line in profile.split("\n"):
       if PROFILE_QUERY_OPTIONS_KEY in line:
@@ -155,8 +208,10 @@ class TestAdmissionController(TestAdmissionControllerBase, HS2TestSuite):
     assert len(confs) == len(expected_query_options)
     confs = map(str.lower, confs)
     for expected in expected_query_options:
-      assert expected.lower() in confs,\
-          "Expected query options '%s' to be set" % (",".join(expected_query_options))
+      if expected.lower() not in confs:
+        expected = ",".join(sorted(expected_query_options))
+        actual = ",".join(sorted(confs))
+        assert False, "Expected query options %s, got %s." % (expected, actual)
 
   def __check_hs2_query_opts(self, pool_name, mem_limit=None, expected_options=None):
     """ Submits a query via HS2 (optionally with a mem_limit in the confOverlay)
@@ -204,12 +259,12 @@ class TestAdmissionController(TestAdmissionControllerBase, HS2TestSuite):
     try:
       for pool in ['', 'not_a_pool_name']:
         expected_error =\
-            "No mapping found for request from user '\w+' with requested pool '%s'"\
+            "No mapping found for request from user '\S+' with requested pool '%s'"\
             % (pool)
         self.__check_pool_rejected(client, pool, expected_error)
 
       # Check rejected if user does not have access.
-      expected_error = "Request from user '\w+' with requested pool 'root.queueC' "\
+      expected_error = "Request from user '\S+' with requested pool 'root.queueC' "\
           "denied access to assigned pool 'root.queueC'"
       self.__check_pool_rejected(client, 'root.queueC', expected_error)
 
@@ -253,6 +308,18 @@ class TestAdmissionController(TestAdmissionControllerBase, HS2TestSuite):
       self.__check_query_options(result.runtime_profile,\
           ['MEM_LIMIT=12345', 'QUERY_TIMEOUT_S=5', 'REQUEST_POOL=root.queueA',\
            'ABORT_ON_ERROR=1', 'MAX_IO_BUFFERS=100'])
+
+      # Once options are reset to their defaults, the queue
+      # configuration should kick back in. We'll see the
+      # queue-configured mem_limit, and we won't see
+      # abort on error, because it's back to being the default.
+      client.execute('set mem_limit=""')
+      client.execute('set abort_on_error=""')
+      client.set_configuration({ 'request_pool': 'root.queueA' })
+      result = client.execute("select 1")
+      self.__check_query_options(result.runtime_profile,
+            [queueA_mem_limit, 'REQUEST_POOL=root.queueA', 'QUERY_TIMEOUT_S=5'])
+
     finally:
       client.close()
 
@@ -296,7 +363,8 @@ class TestAdmissionController(TestAdmissionControllerBase, HS2TestSuite):
 
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
-      impalad_args=impalad_admission_ctrl_flags(1, 1, 1234, 1024 * 1024 * 1024),
+      impalad_args=impalad_admission_ctrl_flags(max_requests=1, max_queued=1,
+          pool_max_mem=10 * 1024 * 1024, proc_mem_limit=1024 * 1024 * 1024),
       statestored_args=_STATESTORED_ARGS)
   def test_trivial_coord_query_limits(self):
     """Tests that trivial coordinator only queries have negligible resource requirements.
@@ -311,17 +379,51 @@ class TestAdmissionController(TestAdmissionControllerBase, HS2TestSuite):
         "select * from functional.alltypestiny"]
     for query in non_trivial_queries:
       ex = self.execute_query_expect_failure(self.client, query)
-      assert "memory needed 4.00 GB is greater than pool max mem resources" in str(ex)
+      assert re.search("Rejected query from pool default-pool: request memory needed "
+          ".* is greater than pool max mem resources 10.00 MB", str(ex))
+
+  @pytest.mark.execute_serially
+  @CustomClusterTestSuite.with_args(
+      impalad_args=impalad_admission_ctrl_flags(max_requests=1, max_queued=1,
+          pool_max_mem=10 * 1024 * 1024, proc_mem_limit=1024 * 1024 * 1024),
+      statestored_args=_STATESTORED_ARGS)
+  def test_reject_min_reservation(self, vector):
+    """Test that the query will be rejected by admission control if:
+       a) the largest per-backend min buffer reservation is larger than the query mem
+          limit
+       b) the largest per-backend min buffer reservation is larger than the
+          buffer_pool_limit query option
+       c) the cluster-wide min-buffer reservation size is larger than the pool memory
+          resources.
+    """
+    self.run_test_case('QueryTest/admission-reject-min-reservation', vector)
+
+  # Process mem_limit used in test_mem_limit_upper_bound
+  PROC_MEM_TEST_LIMIT = 1024 * 1024 * 1024
+
+  @pytest.mark.execute_serially
+  @CustomClusterTestSuite.with_args(
+      impalad_args=impalad_admission_ctrl_flags(max_requests=1, max_queued=1,
+          pool_max_mem=10 * PROC_MEM_TEST_LIMIT, proc_mem_limit=PROC_MEM_TEST_LIMIT))
+  def test_mem_limit_upper_bound(self, vector):
+    """ Test to ensure that a query is admitted if the requested memory is equal to the
+    process mem limit"""
+    query = "select * from functional.alltypesagg limit 1"
+    exec_options = vector.get_value('exec_option')
+    # Setting requested memory equal to process memory limit
+    exec_options['mem_limit'] = self.PROC_MEM_TEST_LIMIT
+    self.execute_query_expect_success(self.client, query, exec_options)
 
 class TestAdmissionControllerStress(TestAdmissionControllerBase):
   """Submits a number of queries (parameterized) with some delay between submissions
   (parameterized) and the ability to submit to one impalad or many in a round-robin
-  fashion. The queries are set with the WAIT debug action so that we have more control
-  over the state that the admission controller uses to make decisions.  Each query is
-  submitted on a separate thread. Depending on the test parameters a varying number of
-  queries will be admitted, queued, and rejected. Once queries are admitted, the query
-  execution blocks and we can cancel the query in order to allow another queued query to
-  be admitted.
+  fashion. Each query is submitted on a separate thread. After admission, the query
+  thread will block with the query open and wait for the main thread to notify it to
+  end its query. The query thread can end its query by fetching to the end, cancelling
+  itself, closing itself, or waiting for the query timeout to take effect. Depending
+  on the test parameters a varying number of queries will be admitted, queued, and
+  rejected. After the queries are admitted, the main thread will request each admitted
+  query thread to end its query and allow queued queries to be admitted.
 
   The test tracks the state of the admission controller using the metrics from each
   impalad to do the following:
@@ -329,13 +431,15 @@ class TestAdmissionControllerStress(TestAdmissionControllerBase):
       queued, and rejected requests should sum to the number of queries and that the
       values are reasonable given the test parameters.
   (2) While there are running queries:
-      * Cancel the currently running queries (they are blocked with the WAIT debug action)
-        and verify the metric for the number of completed queries. The threads that
-        submitted those queries should complete.
+      * Request the currently running queries to end and wait for the queries to end.
+        Verify the metric for the number of completed queries. The threads that
+        submitted those queries will keep their connections open until the entire test
+        completes. This verifies that admission control is tied to the end of the query
+        and does not depend on closing the connection.
       * Check that queued requests are then dequeued and verify using the metric for the
         number of dequeued requests. The threads that were waiting to submit the query
         should then insert themselves into a list of currently running queries and then
-        fetch() the results (which will block).
+        wait for a notification from the main thread.
   (3) After all queries have completed, check that the final number of admitted,
       queued, and rejected requests are reasonable given the test parameters. When
       submitting to a single impalad, we know exactly what the values should be,
@@ -379,6 +483,7 @@ class TestAdmissionControllerStress(TestAdmissionControllerBase):
     self.executing_threads = list()
 
   def teardown(self):
+    # Set shutdown for all threads (cancel if needed)
     for thread in self.all_threads:
       try:
         thread.lock.acquire()
@@ -393,6 +498,9 @@ class TestAdmissionControllerStress(TestAdmissionControllerBase):
             client.close()
       finally:
         thread.lock.release()
+
+    # Wait for all threads to exit
+    for thread in self.all_threads:
       thread.join(5)
       LOG.debug("Join thread for query num %s %s", thread.query_num,
           "TIMED OUT" if thread.isAlive() else "")
@@ -433,7 +541,7 @@ class TestAdmissionControllerStress(TestAdmissionControllerBase):
     while True:
       current = self.get_admission_metrics()
       log_metrics("wait_for_metric_changes, current=", current)
-      deltas = compute_metric_deltas(current, initial, metric_names)
+      deltas = compute_metric_deltas(current, initial)
       delta_sum = sum([ deltas[x] for x in metric_names ])
       LOG.debug("DeltaSum=%s Deltas=%s (Expected=%s for metrics=%s)",\
           delta_sum, deltas, expected_delta, metric_names)
@@ -442,18 +550,20 @@ class TestAdmissionControllerStress(TestAdmissionControllerBase):
             round(time() - start_time, 1))
         return (deltas, current)
       assert (time() - start_time < STRESS_TIMEOUT),\
-          "Timed out waiting %s seconds for metrics" % (STRESS_TIMEOUT,)
+          "Timed out waiting {0} seconds for metrics {1} delta {2} "\
+          "current {3} initial {4}" .format(
+              STRESS_TIMEOUT, ','.join(metric_names), expected_delta, str(current), str(initial))
       sleep(1)
 
   def wait_for_statestore_updates(self, heartbeats):
-    """Waits for a number of statestore heartbeats from all impalads."""
+    """Waits for a number of admission control statestore updates from all impalads."""
     start_time = time()
     num_impalads = len(self.impalads)
     init = dict()
     curr = dict()
     for impalad in self.impalads:
-      init[impalad] = impalad.service.get_metric_value(\
-          'statestore-subscriber.topic-update-interval-time')['count']
+      init[impalad] = impalad.service.get_metric_value(
+          REQUEST_QUEUE_UPDATE_INTERVAL)['count']
       curr[impalad] = init[impalad]
 
     while True:
@@ -461,8 +571,8 @@ class TestAdmissionControllerStress(TestAdmissionControllerBase):
           init.values(), [curr[i] - init[i] for i in self.impalads])
       if all([curr[i] - init[i] >= heartbeats for i in self.impalads]): break
       for impalad in self.impalads:
-        curr[impalad] = impalad.service.get_metric_value(\
-            'statestore-subscriber.topic-update-interval-time')['count']
+        curr[impalad] = impalad.service.get_metric_value(
+            REQUEST_QUEUE_UPDATE_INTERVAL)['count']
       assert (time() - start_time < STRESS_TIMEOUT),\
           "Timed out waiting %s seconds for heartbeats" % (STRESS_TIMEOUT,)
       sleep(STATESTORE_RPC_FREQUENCY_MS / float(1000))
@@ -481,43 +591,46 @@ class TestAdmissionControllerStress(TestAdmissionControllerBase):
     # lock to synchronize before checking the list length (on which another thread
     # may call append() concurrently).
     while len(self.executing_threads) < num_threads:
-      assert (time() - start_time < STRESS_TIMEOUT),\
-          "Timed out waiting %s seconds for %s admitted client rpcs to return" %\
-              (STRESS_TIMEOUT, num_threads)
+      assert (time() - start_time < STRESS_TIMEOUT), ("Timed out waiting %s seconds for "
+          "%s admitted client rpcs to return. Only %s executing " % (
+          STRESS_TIMEOUT, num_threads, len(self.executing_threads)))
       sleep(0.1)
     LOG.debug("Found all %s admitted threads after %s seconds", num_threads,
         round(time() - start_time, 1))
 
-  def cancel_admitted_queries(self, num_queries):
+  def end_admitted_queries(self, num_queries):
     """
-    Cancels queries on threads that are currently blocked on query execution.
+    Requests each admitted query to end its query.
     """
     assert len(self.executing_threads) >= num_queries
-    LOG.debug("Cancelling %s queries", num_queries)
+    LOG.debug("Requesting {0} clients to end queries".format(num_queries))
+
+    # Request admitted clients to end their queries
+    current_executing_queries = []
     for i in xrange(num_queries):
       # pop() is thread-safe, it's OK if another thread is appending concurrently.
       thread = self.executing_threads.pop(0)
       LOG.debug("Cancelling query %s", thread.query_num)
-      # The other thread sets the query_state before appending itself to the list,
-      # and will not change its state until it is cancelled by this thread.
       assert thread.query_state == 'ADMITTED'
-      client = thread.impalad.service.create_beeswax_client()
-      try:
-        cancel_result = client.cancel(thread.query_handle)
-        assert cancel_result.status_code == 0,\
-            'Unexpected status code from cancel request: %s' % cancel_result
-        # Wait for the query to be cancelled and return
-        thread.join(20)
-        LOG.debug("Cancelled admitted query %s %s",
-            thread.query_num, "TIMED OUT" if thread.isAlive() else "")
-        assert not thread.isAlive()
-        assert thread.query_state == 'COMPLETED'
-      finally:
-        client.close()
+      current_executing_queries.append(thread)
+      thread.query_state = 'REQUEST_QUERY_END'
+
+    # Wait for the queries to end
+    start_time = time()
+    while True:
+      all_done = True
+      for thread in self.all_threads:
+        if thread.query_state == 'REQUEST_QUERY_END':
+          all_done = False
+      if all_done:
+        break
+      assert (time() - start_time < STRESS_TIMEOUT),\
+        "Timed out waiting %s seconds for query end" % (STRESS_TIMEOUT,)
+      sleep(1)
 
   class SubmitQueryThread(threading.Thread):
     def __init__(self, impalad, additional_query_options, vector, query_num,
-        executing_threads):
+        query_end_behavior, executing_threads):
       """
       executing_threads must be provided so that this thread can add itself when the
       query is admitted and begins execution.
@@ -527,6 +640,7 @@ class TestAdmissionControllerStress(TestAdmissionControllerBase):
       self.vector = vector
       self.additional_query_options = additional_query_options
       self.query_num = query_num
+      self.query_end_behavior = query_end_behavior
       self.impalad = impalad
       self.error = None
       # query_state is defined and used only by the test code, not a property exposed by
@@ -550,13 +664,15 @@ class TestAdmissionControllerStress(TestAdmissionControllerBase):
             return
 
           exec_options = self.vector.get_value('exec_option')
-          exec_options['debug_action'] = '0:GETNEXT:WAIT'
           exec_options.update(self.additional_query_options)
-          query = QUERY % (self.query_num,)
+          query = QUERY.format(self.query_num)
           self.query_state = 'SUBMITTING'
           client = self.impalad.service.create_beeswax_client()
           ImpalaTestSuite.change_database(client, self.vector.get_value('table_format'))
           client.set_configuration(exec_options)
+
+          if self.query_end_behavior == 'QUERY_TIMEOUT':
+            client.execute("SET QUERY_TIMEOUT_S={0}".format(QUERY_END_TIMEOUT_S))
 
           LOG.debug("Submitting query %s", self.query_num)
           self.query_handle = client.execute_async(query)
@@ -578,22 +694,23 @@ class TestAdmissionControllerStress(TestAdmissionControllerBase):
         # The thread becomes visible to the main thread when it is added to the
         # shared list of executing_threads. append() is atomic and thread-safe.
         self.executing_threads.append(self)
-        try:
-          # fetch() will block until we cancel the query from the main thread
-          # (unless an unexpected error occurs). If an error occurs on the main therad,
-          # it is possible that teardown() cancels this query before we call fetch(). In
-          # that case a different exception is thrown and we handle it gracefully.
-          client.fetch(query, self.query_handle)
-        except ImpalaBeeswaxException as e:
-          if "Cancelled" in str(e):
-            LOG.debug("Query %s completed", self.query_num)
+
+        # Synchronize with the main thread. At this point, the thread is executing a
+        # query. It needs to wait until the main thread requests it to end its query.
+        while not self.shutdown:
+          # The QUERY_TIMEOUT needs to stay active until the main thread requests it
+          # to end. Otherwise, the query may get cancelled early. Fetch rows 5 times
+          # per QUERY_TIMEOUT interval to keep the query active.
+          if self.query_end_behavior == 'QUERY_TIMEOUT' and \
+             self.query_state != 'COMPLETED':
+            fetch_result = client.fetch(query, self.query_handle, 1)
+            assert len(fetch_result.data) == 1, str(fetch_result)
+          if self.query_state == 'REQUEST_QUERY_END':
+            self._end_query(client, query)
+            # The query has released admission control resources
             self.query_state = 'COMPLETED'
             self.query_handle = None
-          elif "Invalid or unknown query handle" in str(e):
-            # May happen if the test is being torn down early (i.e. an error occurred).
-            LOG.debug("Query %s already cancelled in test shutdown.")
-          else:
-            raise e
+          sleep(QUERY_END_TIMEOUT_S * 0.2)
       except Exception as e:
         LOG.exception(e)
         # Unknown errors will be raised later
@@ -603,6 +720,29 @@ class TestAdmissionControllerStress(TestAdmissionControllerBase):
         LOG.debug("Thread terminating in state=%s", self.query_state)
         if client is not None:
           client.close()
+
+    def _end_query(self, client, query):
+      """Bring the query to the appropriate end state defined by self.query_end_behaviour.
+      Returns once the query has reached that state."""
+      LOG.debug("Ending query %s by %s",
+          str(self.query_handle.get_handle()), self.query_end_behavior)
+      if self.query_end_behavior == 'QUERY_TIMEOUT':
+        # Sleep and wait for the query to be cancelled. The cancellation will
+        # set the state to EXCEPTION.
+        start_time = time()
+        while (client.get_state(self.query_handle) != \
+               client.QUERY_STATES['EXCEPTION']):
+          assert (time() - start_time < STRESS_TIMEOUT),\
+            "Timed out waiting %s seconds for query cancel" % (STRESS_TIMEOUT,)
+          sleep(1)
+      elif self.query_end_behavior == 'EOS':
+        # Fetch all rows so we hit eos.
+        client.fetch(query, self.query_handle)
+      elif self.query_end_behavior == 'CLIENT_CANCEL':
+        client.cancel(self.query_handle)
+      else:
+        assert self.query_end_behavior == 'CLIENT_CLOSE'
+        client.close_query(self.query_handle)
 
   def _check_queries_page_resource_pools(self):
     """Checks that all queries in the '/queries' webpage json have the correct resource
@@ -644,36 +784,45 @@ class TestAdmissionControllerStress(TestAdmissionControllerBase):
     initial_metrics = self.get_admission_metrics();
     log_metrics("Initial metrics: ", initial_metrics);
 
-    # Want query_num to start at 1 because this gets used as the limit in the query to
-    # help debugging (we can associate a running query with a thread). If we start at 0,
-    # that query would be evaluated as a constant expression and never hit the WAIT debug
-    # action.
-    for query_num in xrange(1, num_queries + 1):
+    for query_num in xrange(num_queries):
       impalad = self.impalads[query_num % len(self.impalads)]
+      query_end_behavior = QUERY_END_BEHAVIORS[query_num % len(QUERY_END_BEHAVIORS)]
       thread = self.SubmitQueryThread(impalad, additional_query_options, vector,
-          query_num, self.executing_threads)
+          query_num, query_end_behavior, self.executing_threads)
       thread.start()
       self.all_threads.append(thread)
       sleep(submission_delay_ms / 1000.0)
 
-    # Wait for all of the queries to be admitted, queued, or rejected (as reported
-    # by the impalad metrics).
+    # Wait for the admission control to make the initial admission decision for all of
+    # the queries. They should either be admitted immediately, queued, or rejected.
+    # The test query is chosen that it with remain active on all backends until the test
+    # ends the query. This prevents queued queries from being dequeued in the background
+    # without this thread explicitly ending them, so that the test can admit queries in
+    # discrete waves.
     LOG.debug("Wait for initial admission decisions")
     (metric_deltas, curr_metrics) = self.wait_for_metric_changes(\
         ['admitted', 'queued', 'rejected'], initial_metrics, num_queries)
-    # Also wait for the threads that submitted the queries to start executing
+    # Also wait for the test threads that submitted the queries to start executing.
     self.wait_for_admitted_threads(metric_deltas['admitted'])
 
     # Check that the admission decisions are reasonable given the test parameters
     # The number of admitted and queued requests should be at least the configured limits
     # but less than or equal to those limits times the number of impalads.
-    assert metric_deltas['admitted'] >= MAX_NUM_CONCURRENT_QUERIES
-    assert metric_deltas['admitted'] <= MAX_NUM_CONCURRENT_QUERIES * len(self.impalads)
+    assert metric_deltas['dequeued'] == 0,\
+        "Queued queries should not run until others are made to finish"
+    assert metric_deltas['admitted'] >= MAX_NUM_CONCURRENT_QUERIES,\
+        "Admitted fewer than expected queries"
+    assert metric_deltas['admitted'] <= MAX_NUM_CONCURRENT_QUERIES * len(self.impalads),\
+        "Admitted more than expected queries: at least one daemon over-admitted"
     assert metric_deltas['queued'] >=\
-        min(num_queries - metric_deltas['admitted'], MAX_NUM_QUEUED_QUERIES)
-    assert metric_deltas['queued'] <= MAX_NUM_QUEUED_QUERIES * len(self.impalads)
-    assert metric_deltas['rejected'] ==\
-        num_queries - metric_deltas['admitted'] - metric_deltas['queued']
+        min(num_queries - metric_deltas['admitted'], MAX_NUM_QUEUED_QUERIES),\
+        "Should have queued more queries before rejecting them"
+    assert metric_deltas['queued'] <= MAX_NUM_QUEUED_QUERIES * len(self.impalads),\
+        "Queued too many queries: at least one daemon queued too many"
+    assert metric_deltas['rejected'] + metric_deltas['admitted'] +\
+        metric_deltas['queued'] == num_queries ,\
+        "Initial admission decisions don't add up to {0}: {1}".format(
+        num_queries, str(metric_deltas))
     initial_metric_deltas = metric_deltas
 
     # Like above, check that the count from the queries webpage json is reasonable.
@@ -683,19 +832,26 @@ class TestAdmissionControllerStress(TestAdmissionControllerBase):
     assert queries_page_num_queued <= MAX_NUM_QUEUED_QUERIES * len(self.impalads)
     self._check_queries_page_resource_pools()
 
+    # Admit queries in waves until all queries are done. A new wave of admission
+    # is started by killing some of the running queries.
     while len(self.executing_threads) > 0:
       curr_metrics = self.get_admission_metrics();
       log_metrics("Main loop, curr_metrics: ", curr_metrics);
-      num_to_cancel = len(self.executing_threads)
-      LOG.debug("Main loop, will cancel %s queries", num_to_cancel)
-      self.cancel_admitted_queries(num_to_cancel)
-      self.wait_for_metric_changes(['released'], curr_metrics, num_to_cancel)
+      num_to_end = len(self.executing_threads)
+      LOG.debug("Main loop, will request %s queries to end", num_to_end)
+      self.end_admitted_queries(num_to_end)
+      self.wait_for_metric_changes(['released'], curr_metrics, num_to_end)
 
       num_queued_remaining =\
           curr_metrics['queued'] - curr_metrics['dequeued'] - curr_metrics['timed-out']
       expected_admitted = min(num_queued_remaining, MAX_NUM_CONCURRENT_QUERIES)
-      (metric_deltas, _) = self.wait_for_metric_changes(['admitted'], curr_metrics,
-          expected_admitted)
+      (metric_deltas, _) = self.wait_for_metric_changes(
+          ['admitted', 'timed-out'], curr_metrics, expected_admitted)
+
+      # The queue timeout is set high for these tests, so we don't expect any queries to
+      # time out.
+      assert metric_deltas['admitted'] >= expected_admitted
+      assert metric_deltas['timed-out'] == 0
       self.wait_for_admitted_threads(metric_deltas['admitted'])
       # Wait a few topic updates to ensure the admission controllers have reached a steady
       # state or we may find an impalad dequeue more requests after we capture metrics.
@@ -703,8 +859,7 @@ class TestAdmissionControllerStress(TestAdmissionControllerBase):
 
     final_metrics = self.get_admission_metrics();
     log_metrics("Final metrics: ", final_metrics, logging.INFO);
-    metric_deltas = compute_metric_deltas(final_metrics, initial_metrics,
-        final_metrics.keys())
+    metric_deltas = compute_metric_deltas(final_metrics, initial_metrics)
     assert metric_deltas['timed-out'] == 0
 
     if round_robin_submission:
@@ -735,8 +890,8 @@ class TestAdmissionControllerStress(TestAdmissionControllerBase):
 
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
-      impalad_args=impalad_admission_ctrl_flags(MAX_NUM_CONCURRENT_QUERIES,
-        MAX_NUM_QUEUED_QUERIES, -1),
+      impalad_args=impalad_admission_ctrl_flags(max_requests=MAX_NUM_CONCURRENT_QUERIES,
+        max_queued=MAX_NUM_QUEUED_QUERIES, pool_max_mem=-1, queue_wait_timeout_ms=600000),
       statestored_args=_STATESTORED_ARGS)
   def test_admission_controller_with_flags(self, vector):
     self.pool_name = 'default-pool'
@@ -767,8 +922,10 @@ class TestAdmissionControllerStress(TestAdmissionControllerBase):
 
   @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(
-      impalad_args=impalad_admission_ctrl_flags(MAX_NUM_CONCURRENT_QUERIES * 30,
-        MAX_NUM_QUEUED_QUERIES, MEM_TEST_LIMIT, MEM_TEST_LIMIT),
+      impalad_args=impalad_admission_ctrl_flags(
+        max_requests=MAX_NUM_CONCURRENT_QUERIES * 30, max_queued=MAX_NUM_QUEUED_QUERIES,
+        pool_max_mem=MEM_TEST_LIMIT, proc_mem_limit=MEM_TEST_LIMIT,
+        queue_wait_timeout_ms=600000),
       statestored_args=_STATESTORED_ARGS)
   def test_mem_limit(self, vector):
     # Impala may set the proc mem limit lower than we think depending on the overcommit

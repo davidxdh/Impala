@@ -85,6 +85,59 @@ under the License.
 
       </dlentry>
 
+      <dlentry id="base64decode" rev="2.6.0 IMPALA-2107">
+
+        <dt>
+          <codeph>base64decode(string str)</codeph>
+        </dt>
+
+        <dd>
+          <indexterm audience="hidden">base64decode() function</indexterm>
+          <b>Purpose:</b>
+          <p>
+            <b>Return type:</b> <codeph>string</codeph>
+          </p>
+          <p conref="../shared/impala_common.xml#common/usage_notes_blurb"/>
+          <p>
+            For general information about Base64 encoding, see
+            <xref keyref="base64"/>.
+          </p>
+          <p conref="../shared/impala_common.xml#common/base64_use_cases"/>
+          <p conref="../shared/impala_common.xml#common/base64_charset"/>
+          <p conref="../shared/impala_common.xml#common/base64_alignment"/>
+          <p conref="../shared/impala_common.xml#common/base64_error_handling"/>
+          <p conref="../shared/impala_common.xml#common/example_blurb"/>
+          <p conref="../shared/impala_common.xml#common/base64_examples"/>
+        </dd>
+
+      </dlentry>
+
+      <dlentry id="base64encode" rev="2.6.0 IMPALA-2107">
+
+        <dt>
+          <codeph>base64encode(string str)</codeph>
+        </dt>
+
+        <dd>
+          <indexterm audience="hidden">base64encode() function</indexterm>
+          <b>Purpose:</b>
+          <p>
+            <b>Return type:</b> <codeph>string</codeph>
+          </p>
+          <p conref="../shared/impala_common.xml#common/usage_notes_blurb"/>
+          <p>
+            For general information about Base64 encoding, see
+            <xref keyref="base64"/>.
+          </p>
+          <p conref="../shared/impala_common.xml#common/base64_use_cases"/>
+          <p conref="../shared/impala_common.xml#common/base64_charset"/>
+          <p conref="../shared/impala_common.xml#common/base64_alignment"/>
+          <p conref="../shared/impala_common.xml#common/example_blurb"/>
+          <p conref="../shared/impala_common.xml#common/base64_examples"/>
+        </dd>
+
+      </dlentry>
+
       <dlentry rev="2.3.0" id="btrim">
 
         <dt>
@@ -150,14 +203,24 @@ select concat('[',btrim('xyhelxyzlozyzzxx','xyz'),']');
           <codeph>char_length(string a), <ph rev="1.3.0" id="character_length">character_length(string a)</ph></codeph>
         </dt>
 
-        <dd>
+        <dd rev="IMPALA-6391 IMPALA-2172">
           <indexterm audience="hidden">char_length() function</indexterm>
           <indexterm audience="hidden">character_length() function</indexterm>
-          <b>Purpose:</b> Returns the length in characters of the argument string. Aliases for the
-          <codeph>length()</codeph> function.
+          <b>Purpose:</b> Returns the length in characters of the argument string, including any
+          trailing spaces that pad a <codeph>CHAR</codeph> value.
           <p>
             <b>Return type:</b> <codeph>int</codeph>
           </p>
+          <p conref="../shared/impala_common.xml#common/usage_notes_blurb"/>
+          <p>
+            When applied to a <codeph>STRING</codeph> value, it returns the
+            same result as the <codeph>length()</codeph> function. When applied
+            to a <codeph>CHAR</codeph> value, it might return a larger value
+            than <codeph>length()</codeph> does, to account for trailing spaces
+            in the <codeph>CHAR</codeph>.
+          </p>
+          <p conref="../shared/impala_common.xml#common/example_blurb"/>
+          <p conref="../shared/impala_common.xml#common/length_demo"/>
         </dd>
 
       </dlentry>
@@ -302,7 +365,7 @@ SELECT chr(97);
       <dlentry id="instr">
 
         <dt>
-          <codeph>instr(string str, string substr)</codeph>
+          <codeph>instr(string str, string substr <ph rev="IMPALA-3973">[, bigint position [, bigint occurrence ] ]</ph>)</codeph>
         </dt>
 
         <dd>
@@ -312,6 +375,178 @@ SELECT chr(97);
           <p>
             <b>Return type:</b> <codeph>int</codeph>
           </p>
+          <p conref="../shared/impala_common.xml#common/usage_notes_blurb"/>
+
+          <p>
+            If the substring is not present in the string, the function returns 0:
+          </p>
+
+<codeblock rev="IMPALA-3973 2.8.0">
+select instr('foo bar bletch', 'z');
++------------------------------+
+| instr('foo bar bletch', 'z') |
++------------------------------+
+| 0                            |
++------------------------------+
+</codeblock>
+
+          <p rev="IMPALA-3973 2.8.0">
+            The optional third and fourth arguments let you find instances of the substring
+            other than the first instance starting from the left:
+          </p>
+          <ul>
+            <li>
+              <p>
+                The third argument lets you specify a starting point within the string
+                other than 1:
+              </p>
+
+<codeblock>
+-- Restricting the search to positions 7..end,
+-- the first occurrence of 'b' is at position 9.
+select instr('foo bar bletch', 'b', 7);
++---------------------------------+
+| instr('foo bar bletch', 'b', 7) |
++---------------------------------+
+| 9                               |
++---------------------------------+
+
+-- If there are no more occurrences after the
+-- specified position, the result is 0.
+select instr('foo bar bletch', 'b', 10);
++----------------------------------+
+| instr('foo bar bletch', 'b', 10) |
++----------------------------------+
+| 0                                |
++----------------------------------+
+</codeblock>
+
+              <p>
+                If the third argument is negative, the search works right-to-left
+                starting that many characters from the right. The return value still
+                represents the position starting from the left side of the string.
+              </p>
+
+<codeblock rev="IMPALA-3973 2.8.0">
+-- Scanning right to left, the first occurrence of 'o'
+-- is at position 8. (8th character from the left.)
+select instr('hello world','o',-1);
++-------------------------------+
+| instr('hello world', 'o', -1) |
++-------------------------------+
+| 8                             |
++-------------------------------+
+
+-- Scanning right to left, starting from the 6th character
+-- from the right, the first occurrence of 'o' is at
+-- position 5 (5th character from the left).
+select instr('hello world','o',-6);
++-------------------------------+
+| instr('hello world', 'o', -6) |
++-------------------------------+
+| 5                             |
++-------------------------------+
+
+-- If there are no more occurrences after the
+-- specified position, the result is 0.
+select instr('hello world','o',-10);
++--------------------------------+
+| instr('hello world', 'o', -10) |
++--------------------------------+
+| 0                              |
++--------------------------------+
+</codeblock>
+
+            </li>
+
+            <li>
+              <p>
+                The fourth argument lets you specify an occurrence other than the first:
+              </p>
+
+<codeblock rev="IMPALA-3973 2.8.0">
+-- 2nd occurrence of 'b' is at position 9.
+select instr('foo bar bletch', 'b', 1, 2);
++------------------------------------+
+| instr('foo bar bletch', 'b', 1, 2) |
++------------------------------------+
+| 9                                  |
++------------------------------------+
+
+-- Negative position argument means scan right-to-left.
+-- This example finds second instance of 'b' from the right.
+select instr('foo bar bletch', 'b', -1, 2);
++-------------------------------------+
+| instr('foo bar bletch', 'b', -1, 2) |
++-------------------------------------+
+| 5                                   |
++-------------------------------------+
+</codeblock>
+
+              <p>
+                If the fourth argument is greater than the number of matching occurrences,
+                the function returns 0:
+              </p>
+
+<codeblock>
+-- There is no 3rd occurrence within the string.
+select instr('foo bar bletch', 'b', 1, 3);
++------------------------------------+
+| instr('foo bar bletch', 'b', 1, 3) |
++------------------------------------+
+| 0                                  |
++------------------------------------+
+
+-- There is not even 1 occurrence when scanning
+-- the string starting at position 10.
+select instr('foo bar bletch', 'b', 10, 1);
++-------------------------------------+
+| instr('foo bar bletch', 'b', 10, 1) |
++-------------------------------------+
+| 0                                   |
++-------------------------------------+
+</codeblock>
+
+              <p>
+                The fourth argument cannot be negative or zero. A non-positive value for
+                this argument causes an error:
+              </p>
+
+<codeblock>
+select instr('foo bar bletch', 'b', 1, 0);
+ERROR: UDF ERROR: Invalid occurrence parameter to instr function: 0
+
+select instr('aaaaaaaaa','aa', 1, -1);
+ERROR: UDF ERROR: Invalid occurrence parameter to instr function: -1
+</codeblock>
+
+            </li>
+
+            <li>
+              <p>
+                If either of the optional arguments is <codeph>NULL</codeph>,
+                the function also returns <codeph>NULL</codeph>:
+              </p>
+
+<codeblock>
+select instr('foo bar bletch', 'b', null);
++------------------------------------+
+| instr('foo bar bletch', 'b', null) |
++------------------------------------+
+| NULL                               |
++------------------------------------+
+
+select instr('foo bar bletch', 'b', 1, null);
++---------------------------------------+
+| instr('foo bar bletch', 'b', 1, null) |
++---------------------------------------+
+| NULL                                  |
++---------------------------------------+
+</codeblock>
+            </li>
+
+          </ul>
+
         </dd>
 
       </dlentry>
@@ -322,12 +557,31 @@ SELECT chr(97);
           <codeph>length(string a)</codeph>
         </dt>
 
-        <dd>
+        <dd rev="IMPALA-6391 IMPALA-2172">
           <indexterm audience="hidden">length() function</indexterm>
-          <b>Purpose:</b> Returns the length in characters of the argument string.
+          <b>Purpose:</b> Returns the length in characters of the argument string,
+          ignoring any trailing spaces in <codeph>CHAR</codeph> values.
           <p>
             <b>Return type:</b> <codeph>int</codeph>
           </p>
+          <p conref="../shared/impala_common.xml#common/usage_notes_blurb"/>
+          <p>
+            When applied to a <codeph>STRING</codeph> value, it returns the
+            same result as the <codeph>char_length()</codeph> function. When applied
+            to a <codeph>CHAR</codeph> value, it might return a smaller value
+            than <codeph>char_length()</codeph> does, because <codeph>length()</codeph>
+            ignores any trailing spaces in the <codeph>CHAR</codeph>.
+          </p>
+          <note>
+            Because the behavior of <codeph>length()</codeph> with <codeph>CHAR</codeph>
+            values containing trailing spaces is not standardized across the industry,
+            when porting code from other database systems, evaluate the behavior of
+            <codeph>length()</codeph> on the source system and switch to
+            <codeph>char_length()</codeph> for Impala if necessary.
+          </note>
+
+          <p conref="../shared/impala_common.xml#common/example_blurb"/>
+          <p conref="../shared/impala_common.xml#common/length_demo"/>
         </dd>
 
       </dlentry>
@@ -673,6 +927,65 @@ Returned 1 row(s) in 0.12s</codeblock>
 
       </dlentry>
 
+      <dlentry id="replace" rev="2.9.0 IMPALA-4729">
+
+        <dt>
+          <codeph>replace(string initial, string target, string replacement)</codeph>
+        </dt>
+
+        <dd>
+          <indexterm audience="hidden">replace() function</indexterm>
+          <b>Purpose:</b> Returns the initial argument with all occurrences of the target string
+          replaced by the replacement string.
+          <p>
+            <b>Return type:</b> <codeph>string</codeph>
+          </p>
+          <p conref="../shared/impala_common.xml#common/usage_notes_blurb"/>
+          <p>
+            Because this function does not use any regular expression patterns, it is typically faster
+            than <codeph>regexp_replace()</codeph> for simple string substitutions.
+          </p>
+          <p>
+            If any argument is <codeph>NULL</codeph>, the return value is <codeph>NULL</codeph>.
+          </p>
+          <p>
+            Matching is case-sensitive.
+          </p>
+          <p>
+            If the replacement string contains another instance of the target
+            string, the expansion is only performed once, instead of
+            applying again to the newly constructed string.
+          </p>
+          <p conref="../shared/impala_common.xml#common/added_in_290"/>
+          <p conref="../shared/impala_common.xml#common/example_blurb"/>
+<codeblock>-- Replace one string with another.
+select replace('hello world','world','earth');
++------------------------------------------+
+| replace('hello world', 'world', 'earth') |
++------------------------------------------+
+| hello earth                              |
++------------------------------------------+
+
+-- All occurrences of the target string are replaced.
+select replace('hello world','o','0');
++----------------------------------+
+| replace('hello world', 'o', '0') |
++----------------------------------+
+| hell0 w0rld                      |
++----------------------------------+
+
+-- If no match is found, the original string is returned unchanged.
+select replace('hello world','xyz','abc');
++--------------------------------------+
+| replace('hello world', 'xyz', 'abc') |
++--------------------------------------+
+| hello world                          |
++--------------------------------------+
+</codeblock>
+        </dd>
+
+      </dlentry>
+
       <dlentry id="reverse">
 
         <dt>
@@ -740,7 +1053,7 @@ Returned 1 row(s) in 0.12s</codeblock>
 
       </dlentry>
 
-      <dlentry rev="2.3.0 CDH-35915 IMPALA-2084" id="split_part">
+      <dlentry rev="2.3.0 IMPALA-2084" id="split_part">
 
         <dt>
           <codeph>split_part(string source, string delimiter, bigint n)</codeph>
@@ -748,11 +1061,10 @@ Returned 1 row(s) in 0.12s</codeblock>
 
         <dd>
           <indexterm audience="hidden">split_part() function</indexterm>
-          <b>Purpose:</b> Returns the nth field within a delimited string.
-          The fields are numbered starting from 1.
-          The delimiter can consist of multiple characters, not just a
-          single character. All matching of the delimiter is done exactly, not using any
-          regular expression patterns.
+          <b>Purpose:</b> Returns the nth field within a delimited string. The
+          fields are numbered starting from 1. The delimiter can consist of
+          multiple characters, not just a single character. All matching of the
+          delimiter is done exactly, not using any regular expression patterns.
           <p>
             <b>Return type:</b> <codeph>string</codeph>
           </p>
@@ -761,7 +1073,8 @@ Returned 1 row(s) in 0.12s</codeblock>
           <p conref="../shared/impala_common.xml#common/regexp_escapes"/>
           <p conref="../shared/impala_common.xml#common/example_blurb"/>
           <p>
-            These examples show how to retrieve the nth field from a delimited string:
+            These examples show how to retrieve the nth field from a delimited
+            string:
           </p>
 <codeblock><![CDATA[
 select split_part('x,y,z',',',1);
@@ -784,8 +1097,8 @@ select split_part('x,y,z',',',3);
 +-----------------------------+
 | z                           |
 +-----------------------------+
+]]>
 </codeblock>
-
           <p>
             These examples show what happens for out-of-range field positions.
             Specifying a value less than 1 produces an error. Specifying a value
@@ -807,8 +1120,8 @@ from t1
 +-------------------+-------------------------------------+---------------------------+
 |                   | []                                  | 0                         |
 +-------------------+-------------------------------------+---------------------------+
+]]>
 </codeblock>
-
           <p>
             These examples show how the delimiter can be a multi-character value:
           </p>
@@ -845,8 +1158,8 @@ select split_part('one\|/two\|/three','\|/',3);
           <p>
             <b>Return type:</b> <codeph>string</codeph>
           </p>
-        </dd>
 
+        </dd>
       </dlentry>
 
       <dlentry id="strright">

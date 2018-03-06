@@ -28,9 +28,6 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.yarn.api.records.QueueACL;
 import org.apache.hadoop.yarn.conf.YarnConfiguration;
-import org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.AllocationConfiguration;
-import org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.AllocationFileLoaderService;
-import org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.FairSchedulerConfiguration;
 import org.apache.thrift.TException;
 import org.apache.thrift.TSerializer;
 import org.apache.thrift.protocol.TBinaryProtocol;
@@ -42,6 +39,7 @@ import org.apache.impala.common.ByteUnits;
 import org.apache.impala.common.ImpalaException;
 import org.apache.impala.common.InternalException;
 import org.apache.impala.common.JniUtil;
+import org.apache.impala.common.RuntimeEnv;
 import org.apache.impala.thrift.TErrorCode;
 import org.apache.impala.thrift.TPoolConfigParams;
 import org.apache.impala.thrift.TPoolConfig;
@@ -49,6 +47,9 @@ import org.apache.impala.thrift.TResolveRequestPoolParams;
 import org.apache.impala.thrift.TResolveRequestPoolResult;
 import org.apache.impala.thrift.TStatus;
 import org.apache.impala.util.FileWatchService.FileChangeListener;
+import org.apache.impala.yarn.server.resourcemanager.scheduler.fair.AllocationConfiguration;
+import org.apache.impala.yarn.server.resourcemanager.scheduler.fair.AllocationFileLoaderService;
+import org.apache.impala.yarn.server.resourcemanager.scheduler.fair.FairSchedulerConfiguration;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
@@ -170,7 +171,9 @@ public class RequestPoolService {
       throw new IllegalArgumentException(
           "Unable to find allocation configuration file: " + fsAllocationPath);
     }
-    Configuration allocConf = new Configuration(false);
+    // Load the default Hadoop configuration files for picking up overrides like custom
+    // group mapping plugins etc.
+    Configuration allocConf = new Configuration();
     allocConf.set(FairSchedulerConfiguration.ALLOCATION_FILE, fsAllocationURL.getPath());
     allocLoader_ = new AllocationFileLoaderService();
     allocLoader_.init(allocConf);
@@ -449,5 +452,15 @@ public class RequestPoolService {
     shortName = requestingUser.getShortName();
     UserGroupInformation ugi = UserGroupInformation.createRemoteUser(shortName);
     return allocationConf_.get().hasAccess(pool, QueueACL.SUBMIT_APPLICATIONS, ugi);
+  }
+
+  /**
+   * Returns the AllocationConfiguration corresponding to this instance of
+   * RequestPoolService.
+   */
+  @VisibleForTesting
+  AllocationConfiguration getAllocationConfig() {
+    Preconditions.checkState(RuntimeEnv.INSTANCE.isTestEnv());
+    return allocationConf_.get();
   }
 }

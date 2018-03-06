@@ -37,10 +37,9 @@ namespace impala {
 /// is used and all data is deep copied into memory owned by the builder.
 class NljBuilder : public DataSink {
  public:
-  NljBuilder(const RowDescriptor& row_desc, RuntimeState* state);
+  NljBuilder(const RowDescriptor* row_desc, RuntimeState* state);
 
   /// Implementations of DataSink interface methods.
-  virtual std::string GetName() override { return "Nested Loop Join Builder"; }
   virtual Status Prepare(RuntimeState* state, MemTracker* parent_mem_tracker) override;
   virtual Status Open(RuntimeState* state) override;
   virtual Status Send(RuntimeState* state, RowBatch* batch) override;

@@ -19,11 +19,13 @@ package org.apache.impala.analysis;
 
 import java.lang.reflect.Method;
 import java.util.ArrayList;
+import java.util.BitSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.ListIterator;
 import java.util.Set;
 
+import org.apache.impala.analysis.BinaryPredicate.Operator;
 import org.apache.impala.catalog.Catalog;
 import org.apache.impala.catalog.Function;
 import org.apache.impala.catalog.Function.CompareMode;
@@ -32,6 +34,7 @@ import org.apache.impala.catalog.ScalarType;
 import org.apache.impala.catalog.Type;
 import org.apache.impala.common.AnalysisException;
 import org.apache.impala.common.TreeNode;
+import org.apache.impala.rewrite.ExprRewriter;
 import org.apache.impala.thrift.TExpr;
 import org.apache.impala.thrift.TExprNode;
 import org.slf4j.Logger;
@@ -41,6 +44,7 @@ import com.google.common.base.Joiner;
 import com.google.common.base.Objects;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Predicates;
+import com.google.common.collect.Iterables;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
 
@@ -49,6 +53,8 @@ import com.google.common.collect.Sets;
  *
  */
 abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneable {
+  private final static Logger LOG = LoggerFactory.getLogger(Expr.class);
+
   // Limits on the number of expr children and the depth of an expr tree. These maximum
   // values guard against crashes due to stack overflows (IMPALA-432) and were
   // experimentally determined to be safe.
@@ -79,6 +85,7 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
   public final static float LITERAL_COST = 1;
   public final static float SLOT_REF_COST = 1;
   public final static float TIMESTAMP_ARITHMETIC_COST = 5;
+  public final static float UNKNOWN_COST = -1;
 
   // To be used when estimating the cost of Exprs of type string where we don't otherwise
   // have an estimate of how long the strings produced by that Expr are.
@@ -151,10 +158,28 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
         }
       };
 
+  public final static com.google.common.base.Predicate<Expr> IS_FALSE_LITERAL =
+      new com.google.common.base.Predicate<Expr>() {
+        @Override
+        public boolean apply(Expr arg) {
+          return arg instanceof BoolLiteral && !((BoolLiteral)arg).getValue();
+        }
+      };
+
   public final static com.google.common.base.Predicate<Expr> IS_EQ_BINARY_PREDICATE =
       new com.google.common.base.Predicate<Expr>() {
         @Override
         public boolean apply(Expr arg) { return BinaryPredicate.getEqSlots(arg) != null; }
+      };
+
+  public final static com.google.common.base.Predicate<Expr> IS_NOT_EQ_BINARY_PREDICATE =
+      new com.google.common.base.Predicate<Expr>() {
+        @Override
+        public boolean apply(Expr arg) {
+          return arg instanceof BinaryPredicate
+              && ((BinaryPredicate) arg).getOp() != Operator.EQ
+              && ((BinaryPredicate) arg).getOp() != Operator.NOT_DISTINCT;
+        }
       };
 
   public final static com.google.common.base.Predicate<Expr> IS_BINARY_PREDICATE =
@@ -163,13 +188,32 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
         public boolean apply(Expr arg) { return arg instanceof BinaryPredicate; }
       };
 
+  public final static com.google.common.base.Predicate<Expr> IS_EXPR_EQ_LITERAL_PREDICATE =
+      new com.google.common.base.Predicate<Expr>() {
+    @Override
+    public boolean apply(Expr arg) {
+      return arg instanceof BinaryPredicate
+          && ((BinaryPredicate) arg).getOp() == Operator.EQ
+          && (((BinaryPredicate) arg).getChild(1).isLiteral());
+    }
+  };
+
   public final static com.google.common.base.Predicate<Expr>
       IS_NONDETERMINISTIC_BUILTIN_FN_PREDICATE =
       new com.google.common.base.Predicate<Expr>() {
         @Override
         public boolean apply(Expr arg) {
-          return arg instanceof FunctionCallExpr &&
-             !((FunctionCallExpr)arg).isNondeterministicBuiltinFn();
+          return arg instanceof FunctionCallExpr
+              && ((FunctionCallExpr) arg).isNondeterministicBuiltinFn();
+        }
+      };
+
+  public final static com.google.common.base.Predicate<Expr> IS_UDF_PREDICATE =
+      new com.google.common.base.Predicate<Expr>() {
+        @Override
+        public boolean apply(Expr arg) {
+          return arg instanceof FunctionCallExpr
+              && !((FunctionCallExpr) arg).getFnName().isBuiltin();
         }
       };
 
@@ -266,7 +310,7 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
   /**
    * Perform semantic analysis of node and all of its children.
    * Throws exception if any errors found.
-   * @see org.apache.impala.parser.ParseNode#analyze(org.apache.impala.parser.Analyzer)
+   * @see ParseNode#analyze(Analyzer)
    */
   public final void analyze(Analyzer analyzer) throws AnalysisException {
     if (isAnalyzed()) return;
@@ -297,6 +341,7 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
 
     // Do all the analysis for the expr subclass before marking the Expr analyzed.
     analyzeImpl(analyzer);
+    evalCost_ = computeEvalCost();
     analysisDone();
   }
 
@@ -318,6 +363,12 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
       throw new IllegalStateException(e);
     }
   }
+
+  /**
+   * Compute and return evalcost of this expr given the evalcost of all children has been
+   * computed. Should be called bottom-up whenever the structure of subtree is modified.
+   */
+  abstract protected float computeEvalCost();
 
   protected void computeNumDistinctValues() {
     if (isConstant()) {
@@ -459,8 +510,12 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
   }
 
   /**
-   * Converts numeric literal in the expr tree rooted at this expr to return floating
-   * point types instead of decimals, if possible.
+   * DECIMAL_V1:
+   * ----------
+   * This function applies a heuristic that casts literal child exprs of this expr from
+   * decimal to floating point in certain circumstances to reduce processing cost. In
+   * earlier versions of Impala's decimal support, it was much slower than floating point
+   * arithmetic. The original rationale for the automatic casting follows.
    *
    * Decimal has a higher processing cost than floating point and we should not pay
    * the cost if the user does not require the accuracy. For example:
@@ -473,14 +528,19 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
    *
    * Another way to think about it is that DecimalLiterals are analyzed as returning
    * decimals (of the narrowest precision/scale) and we later convert them to a floating
-   * point type when it is consistent with the user's intent.
+   * point type according to a heuristic that attempts to guess what the user intended.
    *
-   * TODO: another option is to do constant folding in the FE and then apply this rule.
+   * DECIMAL_V2:
+   * ----------
+   * This function does nothing. All decimal numeric literals are interpreted as decimals
+   * and the normal expression typing rules apply.
    */
   protected void convertNumericLiteralsFromDecimal(Analyzer analyzer)
       throws AnalysisException {
     Preconditions.checkState(this instanceof ArithmeticExpr ||
         this instanceof BinaryPredicate);
+    // This heuristic conversion is not part of DECIMAL_V2.
+    if (analyzer.getQueryOptions().isDecimal_v2()) return;
     if (children_.size() == 1) return; // Do not attempt to convert for unary ops
     Preconditions.checkState(children_.size() == 2);
     Type t0 = getChild(0).getType();
@@ -628,23 +688,45 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
   }
 
   /**
+   * Returns true if this expr matches 'that'. Two exprs match if:
+   * 1. The tree structures ignoring implicit casts are the same.
+   * 2. For every pair of corresponding SlotRefs, slotRefCmp.matches() returns true.
+   * 3. For every pair of corresponding non-SlotRef exprs, localEquals() returns true.
+   */
+  public boolean matches(Expr that, SlotRef.Comparator slotRefCmp) {
+    if (that == null) return false;
+    if (this instanceof CastExpr && ((CastExpr)this).isImplicit()) {
+      return children_.get(0).matches(that, slotRefCmp);
+    }
+    if (that instanceof CastExpr && ((CastExpr)that).isImplicit()) {
+      return matches(((CastExpr) that).children_.get(0), slotRefCmp);
+    }
+    if (this instanceof SlotRef && that instanceof SlotRef) {
+      return slotRefCmp.matches((SlotRef)this, (SlotRef)that);
+    }
+    if (!localEquals(that)) return false;
+    if (children_.size() != that.children_.size()) return false;
+    for (int i = 0; i < children_.size(); ++i) {
+      if (!children_.get(i).matches(that.children_.get(i), slotRefCmp)) return false;
+    }
+    return true;
+  }
+
+  /**
+   * Local eq comparator. Returns true if this expr is equal to 'that' ignoring children.
+   */
+  protected boolean localEquals(Expr that) {
+    return getClass() == that.getClass() &&
+        (fn_ == null ? that.fn_ == null : fn_.equals(that.fn_));
+  }
+
+  /**
    * Returns true if two expressions are equal. The equality comparison works on analyzed
-   * as well as unanalyzed exprs by ignoring implicit casts (see CastExpr.equals()).
+   * as well as unanalyzed exprs by ignoring implicit casts.
    */
   @Override
-  public boolean equals(Object obj) {
-    if (obj == null) return false;
-    if (obj.getClass() != this.getClass()) return false;
-    // don't compare type, this could be called pre-analysis
-    Expr expr = (Expr) obj;
-    if (children_.size() != expr.children_.size()) return false;
-    for (int i = 0; i < children_.size(); ++i) {
-      if (!children_.get(i).equals(expr.children_.get(i))) return false;
-    }
-    if (fn_ == null && expr.fn_ == null) return true;
-    if (fn_ == null || expr.fn_ == null) return false; // One null, one not
-    // Both fn_'s are not null
-    return fn_.equals(expr.fn_);
+  public final boolean equals(Object obj) {
+    return obj instanceof Expr && matches((Expr) obj, SlotRef.SLOTREF_EQ_CMP);
   }
 
   /**
@@ -678,7 +760,7 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
   }
 
   /**
-   * Return the intersection of l1 and l2.599
+   * Return the intersection of l1 and l2.
    */
   public static <C extends Expr> List<C> intersect(List<C> l1, List<C> l2) {
     List<C> result = new ArrayList<C>();
@@ -686,32 +768,6 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
       if (l2.contains(element)) result.add(element);
     }
     return result;
-  }
-
-  /**
-   * Compute the intersection of l1 and l2, given the smap, and
-   * return the intersecting l1 elements in i1 and the intersecting l2 elements in i2.
-   */
-  public static void intersect(Analyzer analyzer,
-      List<Expr> l1, List<Expr> l2, ExprSubstitutionMap smap,
-      List<Expr> i1, List<Expr> i2) {
-    i1.clear();
-    i2.clear();
-    List<Expr> s1List = Expr.substituteList(l1, smap, analyzer, false);
-    Preconditions.checkState(s1List.size() == l1.size());
-    List<Expr> s2List = Expr.substituteList(l2, smap, analyzer, false);
-    Preconditions.checkState(s2List.size() == l2.size());
-    for (int i = 0; i < s1List.size(); ++i) {
-      Expr s1 = s1List.get(i);
-      for (int j = 0; j < s2List.size(); ++j) {
-        Expr s2 = s2List.get(j);
-        if (s1.equals(s2)) {
-          i1.add(l1.get(i));
-          i2.add(l2.get(j));
-          break;
-        }
-      }
-    }
   }
 
   @Override
@@ -811,8 +867,7 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
    * Exprs that have non-child exprs which should be affected by substitutions must
    * override this method and apply the substitution to such exprs as well.
    */
-  protected Expr substituteImpl(ExprSubstitutionMap smap, Analyzer analyzer)
-      throws AnalysisException {
+  protected Expr substituteImpl(ExprSubstitutionMap smap, Analyzer analyzer) {
     if (isImplicitCast()) return getChild(0).substituteImpl(smap, analyzer);
     if (smap != null) {
       Expr substExpr = smap.get(this);
@@ -895,6 +950,25 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
   }
 
   /**
+   * Return a new list without duplicate exprs (according to matches() using cmp).
+   */
+  public static <C extends Expr> List<C> removeDuplicates(List<C> l,
+      SlotRef.Comparator cmp) {
+    List<C> newList = Lists.newArrayList();
+    for (C expr: l) {
+      boolean exists = false;
+      for (C newExpr : newList) {
+        if (newExpr.matches(expr, cmp)) {
+          exists = true;
+          break;
+        }
+      }
+      if (!exists) newList.add(expr);
+    }
+    return newList;
+  }
+
+  /**
    * Removes constant exprs
    */
   public static <C extends Expr> void removeConstants(List<C> l) {
@@ -904,6 +978,102 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
       C e = it.next();
       if (e.isConstant()) it.remove();
     }
+  }
+
+  // Arbitrary max exprs considered for constant propagation due to O(n^2) complexity.
+  private final static int CONST_PROPAGATION_EXPR_LIMIT = 200;
+
+  /**
+   * Propagates constant expressions of the form <slot ref> = <constant> to
+   * other uses of slot ref in the given conjuncts; returns a BitSet with
+   * bits set to true in all changed indices.  Only one round of substitution
+   * is performed.  The candidates BitSet is used to determine which members of
+   * conjuncts are considered for propagation.
+   */
+  private static BitSet propagateConstants(List<Expr> conjuncts, BitSet candidates,
+      Analyzer analyzer) {
+    Preconditions.checkState(conjuncts.size() <= candidates.size());
+    BitSet changed = new BitSet(conjuncts.size());
+    for (int i = candidates.nextSetBit(0); i >= 0; i = candidates.nextSetBit(i+1)) {
+      if (!(conjuncts.get(i) instanceof BinaryPredicate)) continue;
+      BinaryPredicate bp = (BinaryPredicate) conjuncts.get(i);
+      if (bp.getOp() != BinaryPredicate.Operator.EQ) continue;
+      SlotRef slotRef = bp.getBoundSlot();
+      if (slotRef == null || !bp.getChild(1).isConstant()) continue;
+      Expr subst = bp.getSlotBinding(slotRef.getSlotId());
+      ExprSubstitutionMap smap = new ExprSubstitutionMap();
+      smap.put(slotRef, subst);
+      for (int j = 0; j < conjuncts.size(); ++j) {
+        // Don't rewrite with our own substitution!
+        if (j == i) continue;
+        Expr toRewrite = conjuncts.get(j);
+        Expr rewritten = toRewrite.substitute(smap, analyzer, true);
+        if (!rewritten.equals(toRewrite)) {
+          conjuncts.set(j, rewritten);
+          changed.set(j, true);
+        }
+      }
+    }
+    return changed;
+  }
+
+  /*
+   * Propagates constants, performs expr rewriting and removes duplicates.
+   * Returns false if a contradiction has been implied, true otherwise.
+   * Catches and logs, but ignores any exceptions thrown during rewrite, which
+   * will leave conjuncts intact and rewritten as far as possible until the
+   * exception.
+   */
+  public static boolean optimizeConjuncts(List<Expr> conjuncts, Analyzer analyzer) {
+    Preconditions.checkNotNull(conjuncts);
+    try {
+      BitSet candidates = new BitSet(conjuncts.size());
+      candidates.set(0, Math.min(conjuncts.size(), CONST_PROPAGATION_EXPR_LIMIT));
+      int transfers = 0;
+
+      // Constant propagation may make other slots constant, so repeat the process
+      // until there are no more changes.
+      while (!candidates.isEmpty()) {
+        BitSet changed = propagateConstants(conjuncts, candidates, analyzer);
+        candidates.clear();
+        int pruned = 0;
+        for (int i = changed.nextSetBit(0); i >= 0; i = changed.nextSetBit(i+1)) {
+          // When propagating constants, we may de-normalize expressions, so we
+          // must normalize binary predicates.  Any additional rules will be
+          // applied by the rewriter.
+          int index = i - pruned;
+          Preconditions.checkState(index >= 0);
+          ExprRewriter rewriter = analyzer.getExprRewriter();
+          Expr rewritten = rewriter.rewrite(conjuncts.get(index), analyzer);
+          // Re-analyze to add implicit casts and update cost
+          rewritten.reset();
+          rewritten.analyze(analyzer);
+          if (!rewritten.isConstant()) {
+            conjuncts.set(index, rewritten);
+            if (++transfers < CONST_PROPAGATION_EXPR_LIMIT) candidates.set(index, true);
+            continue;
+          }
+          // Remove constant boolean literal expressions.  N.B. - we may have
+          // expressions determined to be constant which can not yet be discarded
+          // because they can't be evaluated if expr rewriting is turned off.
+          if (rewritten instanceof NullLiteral ||
+              Expr.IS_FALSE_LITERAL.apply(rewritten)) {
+            conjuncts.clear();
+            conjuncts.add(rewritten);
+            return false;
+          }
+          if (Expr.IS_TRUE_LITERAL.apply(rewritten)) {
+            pruned++;
+            conjuncts.remove(index);
+          }
+        }
+      }
+    } catch (AnalysisException e) {
+      LOG.warn("Not able to analyze after rewrite: " + e.toString() + " conjuncts: " +
+          Expr.debugString(conjuncts));
+    }
+    Expr.removeDuplicates(conjuncts);
+    return true;
   }
 
   /**
@@ -1268,5 +1438,20 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
       // function calls that return string.
       return DEFAULT_AVG_STRING_LENGTH;
     }
+  }
+
+  /**
+   * Generates a comma-separated string from the toSql() string representations of
+   * 'exprs'.
+   */
+  public static String listToSql(List<Expr> exprs) {
+    com.google.common.base.Function<Expr, String> toSql =
+        new com.google.common.base.Function<Expr, String>() {
+        @Override
+        public String apply(Expr arg) {
+          return arg.toSql();
+        }
+    };
+    return Joiner.on(",").join(Iterables.transform(exprs, toSql));
   }
 }

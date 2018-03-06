@@ -19,27 +19,28 @@ package org.apache.impala.analysis;
 
 import java.util.Set;
 
-import org.junit.Assert;
-import org.junit.Test;
-
 import org.apache.impala.authorization.AuthorizationConfig;
 import org.apache.impala.catalog.AuthorizationException;
 import org.apache.impala.catalog.Catalog;
 import org.apache.impala.catalog.ImpaladCatalog;
 import org.apache.impala.common.AnalysisException;
-import org.apache.impala.common.InternalException;
+import org.apache.impala.common.FrontendTestBase;
+import org.apache.impala.common.ImpalaException;
 import org.apache.impala.service.Frontend;
 import org.apache.impala.testutil.ImpaladTestCatalog;
 import org.apache.impala.testutil.TestUtils;
 import org.apache.impala.thrift.TAccessEvent;
 import org.apache.impala.thrift.TCatalogObjectType;
+import org.junit.Assert;
+import org.junit.Test;
+
 import com.google.common.collect.Sets;
 
 /**
  * Tests that auditing access events are properly captured during analysis for all
  * statement types.
  */
-public class AuditingTest extends AnalyzerTest {
+public class AuditingTest extends FrontendTestBase {
   @Test
   public void TestSelect() throws AuthorizationException, AnalysisException {
     // Simple select from a table.
@@ -229,6 +230,13 @@ public class AuditingTest extends AnalyzerTest {
         "drop table functional.unsupported_partition_types");
     Assert.assertEquals(accessEvents, Sets.newHashSet(new TAccessEvent(
         "functional.unsupported_partition_types", TCatalogObjectType.TABLE, "DROP")));
+
+    // Dropping a table without using a fully qualified path should generate the correct
+    // access event (see IMPALA-5318).
+    accessEvents = AnalyzeAccessEvents(
+        "drop table unsupported_partition_types", "functional");
+    Assert.assertEquals(accessEvents, Sets.newHashSet(new TAccessEvent(
+        "functional.unsupported_partition_types", TCatalogObjectType.TABLE, "DROP")));
   }
 
   @Test
@@ -347,22 +355,20 @@ public class AuditingTest extends AnalyzerTest {
 
   @Test
   public void TestAccessEventsOnAuthFailure() throws AuthorizationException,
-      AnalysisException, InternalException {
+      ImpalaException {
     // The policy file doesn't exist so all operations will result in
     // an AuthorizationError
     AuthorizationConfig config = AuthorizationConfig.createHadoopGroupAuthConfig(
         "server1", "/does/not/exist", "");
     ImpaladCatalog catalog = new ImpaladTestCatalog(config);
     Frontend fe = new Frontend(config, catalog);
-    AnalysisContext analysisContext =
-        new AnalysisContext(catalog, TestUtils.createQueryContext(), config);
+    AnalysisContext analysisCtx = createAnalysisCtx(config);
     // We should get an audit event even when an authorization failure occurs.
     try {
-      analysisContext.analyze("create table foo_does_not_exist(i int)");
-      analysisContext.authorize(fe.getAuthzChecker());
+      parseAndAnalyze("create table foo_does_not_exist(i int)", analysisCtx, fe);
       Assert.fail("Expected AuthorizationException");
     } catch (AuthorizationException e) {
-      Assert.assertEquals(1, analysisContext.getAnalyzer().getAccessEvents().size());
+      Assert.assertEquals(1, analysisCtx.getAnalyzer().getAccessEvents().size());
     }
   }
 
@@ -399,14 +405,14 @@ public class AuditingTest extends AnalyzerTest {
         "functional_kudu.alltypes");
     Assert.assertEquals(accessEvents, Sets.newHashSet(
         new TAccessEvent("functional_kudu.alltypes", TCatalogObjectType.TABLE, "SELECT"),
-        new TAccessEvent("functional_kudu.testtbl", TCatalogObjectType.TABLE, "INSERT")));
+        new TAccessEvent("functional_kudu.testtbl", TCatalogObjectType.TABLE, "ALL")));
 
     // Delete
     accessEvents = AnalyzeAccessEvents(
         "delete from functional_kudu.testtbl where id = 1");
     Assert.assertEquals(accessEvents, Sets.newHashSet(
         new TAccessEvent("functional_kudu.testtbl", TCatalogObjectType.TABLE, "SELECT"),
-        new TAccessEvent("functional_kudu.testtbl", TCatalogObjectType.TABLE, "INSERT")));
+        new TAccessEvent("functional_kudu.testtbl", TCatalogObjectType.TABLE, "ALL")));
 
     // Delete using a complex query
     accessEvents = AnalyzeAccessEvents(
@@ -415,14 +421,14 @@ public class AuditingTest extends AnalyzerTest {
     Assert.assertEquals(accessEvents, Sets.newHashSet(
         new TAccessEvent("functional_kudu.testtbl", TCatalogObjectType.TABLE, "SELECT"),
         new TAccessEvent("functional_kudu.alltypes", TCatalogObjectType.TABLE, "SELECT"),
-        new TAccessEvent("functional_kudu.testtbl", TCatalogObjectType.TABLE, "INSERT")));
+        new TAccessEvent("functional_kudu.testtbl", TCatalogObjectType.TABLE, "ALL")));
 
     // Update
     accessEvents = AnalyzeAccessEvents(
         "update functional_kudu.testtbl set name = 'test' where id < 10");
     Assert.assertEquals(accessEvents, Sets.newHashSet(
         new TAccessEvent("functional_kudu.testtbl", TCatalogObjectType.TABLE, "SELECT"),
-        new TAccessEvent("functional_kudu.testtbl", TCatalogObjectType.TABLE, "INSERT")));
+        new TAccessEvent("functional_kudu.testtbl", TCatalogObjectType.TABLE, "ALL")));
 
     // Drop table
     accessEvents = AnalyzeAccessEvents("drop table functional_kudu.testtbl");
@@ -456,8 +462,13 @@ public class AuditingTest extends AnalyzerTest {
    */
   private Set<TAccessEvent> AnalyzeAccessEvents(String stmt)
       throws AuthorizationException, AnalysisException {
-    Analyzer analyzer = createAnalyzer(Catalog.DEFAULT_DB);
-    AnalyzesOk(stmt, analyzer);
-    return analyzer.getAccessEvents();
+    return AnalyzeAccessEvents(stmt, Catalog.DEFAULT_DB);
+  }
+
+  private Set<TAccessEvent> AnalyzeAccessEvents(String stmt, String db)
+      throws AuthorizationException, AnalysisException {
+    AnalysisContext ctx = createAnalysisCtx(db);
+    AnalyzesOk(stmt, ctx);
+    return ctx.getAnalyzer().getAccessEvents();
   }
 }

@@ -22,9 +22,20 @@
 #include "common/status.h"
 #include "udf/udf.h"
 
-using namespace impala_udf;
-
 namespace impala {
+
+using impala_udf::FunctionContext;
+using impala_udf::AnyVal;
+using impala_udf::BooleanVal;
+using impala_udf::TinyIntVal;
+using impala_udf::SmallIntVal;
+using impala_udf::IntVal;
+using impala_udf::BigIntVal;
+using impala_udf::FloatVal;
+using impala_udf::DoubleVal;
+using impala_udf::TimestampVal;
+using impala_udf::StringVal;
+using impala_udf::DecimalVal;
 
 class Expr;
 class OpcodeRegistry;
@@ -61,12 +72,26 @@ class TimestampFunctions {
       FunctionContext::FunctionStateScope scope);
 
   /// Parses 'string_val' based on the format 'fmt'.
+  /// The time zone interpretation of the parsed timestamp is determined by
+  /// FLAGS_use_local_tz_for_unix_timestamp_conversions. If the flag is true, the
+  /// instance is interpreted as a local value. If the flag is false, UTC is assumed.
   static BigIntVal Unix(FunctionContext* context, const StringVal& string_val,
       const StringVal& fmt);
-  /// Converts 'tv_val' to a unix time_t
+
+  /// Converts 'tv_val' to a unix time_t.
+  /// The time zone interpretation of the specified timestamp is determined by
+  /// FLAGS_use_local_tz_for_unix_timestamp_conversions. If the flag is true, the
+  /// instance is interpreted as a local value. If the flag is false, UTC is assumed.
   static BigIntVal Unix(FunctionContext* context, const TimestampVal& tv_val);
+
   /// Returns the current time.
+  /// The time zone interpretation of the current time is determined by
+  /// FLAGS_use_local_tz_for_unix_timestamp_conversions. If the flag is true, the
+  /// instance is interpreted as a local value. If the flag is false, UTC is assumed.
   static BigIntVal Unix(FunctionContext* context);
+
+  /// Interpret 'tv_val' as a timestamp in UTC and convert to unix time in microseconds.
+  static BigIntVal UtcToUnixMicros(FunctionContext* context, const TimestampVal& tv_val);
 
   // Functions to convert to and from TimestampVal type
   static TimestampVal ToTimestamp(FunctionContext* context, const BigIntVal& bigint_val);
@@ -88,17 +113,19 @@ class TimestampFunctions {
   static StringVal FromUnix(FunctionContext* context, const TIME& unix_time,
       const StringVal& fmt);
 
+  /// Return a timestamp in UTC from a unix time in microseconds.
+  static TimestampVal UnixMicrosToUtcTimestamp(FunctionContext* context,
+      const BigIntVal& unix_time_micros);
+
   /// Convert a timestamp to or from a particular timezone based time.
   static TimestampVal FromUtc(FunctionContext* context,
     const TimestampVal& ts_val, const StringVal& tz_string_val);
   static TimestampVal ToUtc(FunctionContext* context,
       const TimestampVal& ts_val, const StringVal& tz_string_val);
 
-  /// Returns the day's name as a string (e.g. 'Saturday').
-  static StringVal DayName(FunctionContext* context, const TimestampVal& dow);
-
   /// Functions to extract parts of the timestamp, return integers.
   static IntVal Year(FunctionContext* context, const TimestampVal& ts_val);
+  static IntVal Quarter(FunctionContext* context, const TimestampVal& ts_val);
   static IntVal Month(FunctionContext* context, const TimestampVal& ts_val);
   static IntVal DayOfWeek(FunctionContext* context, const TimestampVal& ts_val);
   static IntVal DayOfMonth(FunctionContext* context, const TimestampVal& ts_val);
@@ -111,11 +138,14 @@ class TimestampFunctions {
 
   /// Date/time functions.
   static TimestampVal Now(FunctionContext* context);
+  static TimestampVal UtcTimestamp(FunctionContext* context);
   static StringVal ToDate(FunctionContext* context, const TimestampVal& ts_val);
   static IntVal DateDiff(FunctionContext* context, const TimestampVal& ts_val1,
       const TimestampVal& ts_val2);
   static std::string ShortDayName(FunctionContext* context, const TimestampVal& ts);
+  static StringVal LongDayName(FunctionContext* context, const TimestampVal& ts);
   static std::string ShortMonthName(FunctionContext* context, const TimestampVal& ts);
+  static StringVal LongMonthName(FunctionContext* context, const TimestampVal& ts);
 
   /// Return verbose string version of current time of day
   /// e.g. Mon Dec 01 16:25:05 2003 EST.
@@ -181,6 +211,15 @@ class TimestampFunctions {
   static TimestampVal AddSub(FunctionContext* context, const TimestampVal& timestamp,
       const AnyIntVal& num_interval_units);
 
+  /// Return the last date in the month of a specified input date.
+  /// The TIMESTAMP argument requires a date component,
+  /// it may or may not have a time component.
+  /// The function will return a NULL TimestampVal when:
+  ///   1) The TIMESTAMP argument is missing a date component.
+  ///   2) The TIMESTAMP argument is outside of the supported range:
+  ///         between 1400-01-31 00:00:00 and 9999-12-31 23:59:59
+  static TimestampVal LastDay(FunctionContext* context, const TimestampVal& ts);
+
   /// Helper function to check date/time format strings.
   /// TODO: eventually return format converted from Java to Boost.
   static StringValue* CheckFormat(StringValue* format);
@@ -190,18 +229,13 @@ class TimestampFunctions {
       const StringVal& format, bool is_error);
 
  private:
-  /// Static result values for DayName() function.
-  static const char* MONDAY;
-  static const char* TUESDAY;
-  static const char* WEDNESDAY;
-  static const char* THURSDAY;
-  static const char* FRIDAY;
-  static const char* SATURDAY;
-  static const char* SUNDAY;
 
-  /// Static result values for ShortDayName() and ShortMonthName() functions.
+  /// Static result values for DayName(), ShortDayName(), ShortMonthName() and
+  /// LongMonthName functions.
   static const std::string DAY_ARRAY[7];
+  static const std::string DAYNAME_ARRAY[7];
   static const std::string MONTH_ARRAY[12];
+  static const std::string MONTHNAME_ARRAY[12];
 };
 
 } // namespace impala

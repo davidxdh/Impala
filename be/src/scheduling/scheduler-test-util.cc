@@ -16,12 +16,16 @@
 // under the License.
 
 #include "scheduling/scheduler-test-util.h"
-#include "scheduling/scheduler.h"
+
+#include <boost/unordered_set.hpp>
 
 #include "common/names.h"
+#include "scheduling/scheduler.h"
 
 using namespace impala;
 using namespace impala::test;
+
+DECLARE_int32(krpc_port);
 
 /// Sample 'n' elements without replacement from the set [0..N-1].
 /// This is an implementation of "Algorithm R" by J. Vitter.
@@ -58,14 +62,14 @@ const string Cluster::IP_PREFIX = "10";
 /// Default size for new blocks is 1MB.
 const int64_t Block::DEFAULT_BLOCK_SIZE = 1 << 20;
 
-int Cluster::AddHost(bool has_backend, bool has_datanode) {
+int Cluster::AddHost(bool has_backend, bool has_datanode, bool is_executor) {
   int host_idx = hosts_.size();
   int be_port = has_backend ? BACKEND_PORT : -1;
   int dn_port = has_datanode ? DATANODE_PORT : -1;
   IpAddr ip = HostIdxToIpAddr(host_idx);
   DCHECK(ip_to_idx_.find(ip) == ip_to_idx_.end());
   ip_to_idx_[ip] = host_idx;
-  hosts_.push_back(Host(HostIdxToHostname(host_idx), ip, be_port, dn_port));
+  hosts_.push_back(Host(HostIdxToHostname(host_idx), ip, be_port, dn_port, is_executor));
   // Add host to lists of backend indexes per type.
   if (has_backend) backend_host_idxs_.push_back(host_idx);
   if (has_datanode) {
@@ -79,8 +83,9 @@ int Cluster::AddHost(bool has_backend, bool has_datanode) {
   return host_idx;
 }
 
-void Cluster::AddHosts(int num_hosts, bool has_backend, bool has_datanode) {
-  for (int i = 0; i < num_hosts; ++i) AddHost(has_backend, has_datanode);
+void Cluster::AddHosts(int num_hosts, bool has_backend, bool has_datanode,
+    bool is_executor) {
+  for (int i = 0; i < num_hosts; ++i) AddHost(has_backend, has_datanode, is_executor);
 }
 
 Hostname Cluster::HostIdxToHostname(int host_idx) {
@@ -450,19 +455,19 @@ SchedulerWrapper::SchedulerWrapper(const Plan& plan)
 }
 
 Status SchedulerWrapper::Compute(bool exec_at_coord, Result* result) {
-  DCHECK(scheduler_ != NULL);
+  DCHECK(scheduler_ != nullptr);
 
   // Compute Assignment.
   FragmentScanRangeAssignment* assignment = result->AddAssignment();
-  return scheduler_->ComputeScanRangeAssignment(*scheduler_->GetBackendConfig(), 0, NULL,
-      false, plan_.scan_range_locations(), plan_.referenced_datanodes(), exec_at_coord,
-      plan_.query_options(), NULL, assignment);
+  return scheduler_->ComputeScanRangeAssignment(*scheduler_->GetExecutorsConfig(), 0,
+      nullptr, false, plan_.scan_range_locations(), plan_.referenced_datanodes(),
+      exec_at_coord, plan_.query_options(), nullptr, assignment);
 }
 
 void SchedulerWrapper::AddBackend(const Host& host) {
   // Add to topic delta
   TTopicDelta delta;
-  delta.topic_name = Scheduler::IMPALA_MEMBERSHIP_TOPIC;
+  delta.topic_name = Statestore::IMPALA_MEMBERSHIP_TOPIC;
   delta.is_delta = true;
   AddHostToTopicDelta(host, &delta);
   SendTopicDelta(delta);
@@ -471,15 +476,18 @@ void SchedulerWrapper::AddBackend(const Host& host) {
 void SchedulerWrapper::RemoveBackend(const Host& host) {
   // Add deletion to topic delta
   TTopicDelta delta;
-  delta.topic_name = Scheduler::IMPALA_MEMBERSHIP_TOPIC;
+  delta.topic_name = Statestore::IMPALA_MEMBERSHIP_TOPIC;
   delta.is_delta = true;
-  delta.topic_deletions.push_back(host.ip);
+  TTopicItem item;
+  item.__set_deleted(true);
+  item.__set_key(host.ip);
+  delta.topic_entries.push_back(item);
   SendTopicDelta(delta);
 }
 
 void SchedulerWrapper::SendFullMembershipMap() {
   TTopicDelta delta;
-  delta.topic_name = Scheduler::IMPALA_MEMBERSHIP_TOPIC;
+  delta.topic_name = Statestore::IMPALA_MEMBERSHIP_TOPIC;
   delta.is_delta = false;
   for (const Host& host : plan_.cluster().hosts()) {
     if (host.be_port >= 0) AddHostToTopicDelta(host, &delta);
@@ -489,24 +497,26 @@ void SchedulerWrapper::SendFullMembershipMap() {
 
 void SchedulerWrapper::SendEmptyUpdate() {
   TTopicDelta delta;
-  delta.topic_name = Scheduler::IMPALA_MEMBERSHIP_TOPIC;
+  delta.topic_name = Statestore::IMPALA_MEMBERSHIP_TOPIC;
   delta.is_delta = true;
   SendTopicDelta(delta);
 }
 
 void SchedulerWrapper::InitializeScheduler() {
-  DCHECK(scheduler_ == NULL);
+  DCHECK(scheduler_ == nullptr);
   DCHECK_GT(plan_.cluster().NumHosts(), 0) << "Cannot initialize scheduler with 0 "
                                            << "hosts.";
   const Host& scheduler_host = plan_.cluster().hosts()[0];
   string scheduler_backend_id = scheduler_host.ip;
-  TNetworkAddress scheduler_backend_address;
-  scheduler_backend_address.hostname = scheduler_host.ip;
-  scheduler_backend_address.port = scheduler_host.be_port;
-
-  scheduler_.reset(new Scheduler(
-      NULL, scheduler_backend_id, scheduler_backend_address, &metrics_, NULL, NULL));
-  scheduler_->Init();
+  TNetworkAddress scheduler_backend_address =
+      MakeNetworkAddress(scheduler_host.ip, scheduler_host.be_port);
+  TNetworkAddress scheduler_krpc_address =
+      MakeNetworkAddress(scheduler_host.ip, FLAGS_krpc_port);
+  scheduler_.reset(new Scheduler(nullptr, scheduler_backend_id,
+      &metrics_, nullptr, nullptr));
+  const Status status = scheduler_->Init(scheduler_backend_address,
+      scheduler_krpc_address, scheduler_host.ip);
+  DCHECK(status.ok()) << "Scheduler init failed in test";
   // Initialize the scheduler backend maps.
   SendFullMembershipMap();
 }
@@ -519,6 +529,8 @@ void SchedulerWrapper::AddHostToTopicDelta(const Host& host, TTopicDelta* delta)
   be_desc.address.hostname = host.ip;
   be_desc.address.port = host.be_port;
   be_desc.ip_address = host.ip;
+  be_desc.__set_is_coordinator(host.is_coordinator);
+  be_desc.__set_is_executor(host.is_executor);
 
   // Build topic item.
   TTopicItem item;
@@ -532,10 +544,10 @@ void SchedulerWrapper::AddHostToTopicDelta(const Host& host, TTopicDelta* delta)
 }
 
 void SchedulerWrapper::SendTopicDelta(const TTopicDelta& delta) {
-  DCHECK(scheduler_ != NULL);
+  DCHECK(scheduler_ != nullptr);
   // Wrap in topic delta map.
   StatestoreSubscriber::TopicDeltaMap delta_map;
-  delta_map.emplace(Scheduler::IMPALA_MEMBERSHIP_TOPIC, delta);
+  delta_map.emplace(Statestore::IMPALA_MEMBERSHIP_TOPIC, delta);
 
   // Send to the scheduler.
   vector<TTopicDelta> dummy_result;

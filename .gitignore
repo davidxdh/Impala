@@ -16,6 +16,7 @@ bin/impala-config-local.sh
 
 # distcc options
 .impala_compiler_opts
+.impala_compiler_opts_v2
 
 pprof.out
 
@@ -28,6 +29,7 @@ CMakeFiles
 cmake_install.cmake
 CTestTestfile.cmake
 !CMakeLists.txt
+.cmake_build_type
 .ninja_deps
 .ninja_log
 build.ninja
@@ -37,9 +39,8 @@ Testing/
 llvm-ir/
 shell/gen-py/
 shell/build/
-tests/build
-tests/results
-tests/test-hive-udfs/target/
+benchmark_results*.json
+target
 
 avro_schemas/
 logs/
@@ -56,5 +57,7 @@ hs_err_pid*.log
 *.jar
 
 # Vim related files
+.*.swn
+.*.swo
 .*.swp
 .vimrc

@@ -20,16 +20,16 @@
 #define IMPALA_EXEC_FILTER_CONTEXT_H
 
 #include <boost/unordered_map.hpp>
-#include <gutil/strings/substitute.h>
-
-#include "exprs/expr-context.h"
+#include "exprs/scalar-expr-evaluator.h"
+#include "runtime/runtime-filter.h"
 #include "util/runtime-profile.h"
 
 namespace impala {
 
 class BloomFilter;
 class LlvmCodeGen;
-class RuntimeFilter;
+class MinMaxFilter;
+class ScalarExpr;
 class TupleRow;
 
 /// Container struct for per-filter statistics, with statistics for each granularity of
@@ -42,7 +42,7 @@ class FilterStats {
   /// Constructs a new FilterStats object with a profile that is a child of
   /// 'profile'. 'is_partition_filter' determines whether partition-level counters are
   /// registered.
-  FilterStats(RuntimeProfile* runtime_profile, bool is_partition_filter);
+  FilterStats(RuntimeProfile* runtime_profile);
 
   static const std::string ROW_GROUPS_KEY;
   static const std::string FILES_KEY;
@@ -80,45 +80,67 @@ class FilterStats {
 /// FilterContext contains all metadata for a single runtime filter, and allows the filter
 /// to be applied in the context of a single thread.
 struct FilterContext {
-  /// Expression which produces a value to test against the runtime filter.
-  /// This field is referenced in generated code so if the order of it changes
-  /// inside this struct, please update CodegenEval().
-  ExprContext* expr_ctx;
+  /// Evaluator for 'expr'. This field is referenced in generated code so if the order
+  /// of it changes inside this struct, please update CodegenEval().
+  ScalarExprEvaluator* expr_eval = nullptr;
 
   /// Cache of filter from runtime filter bank.
   /// The field is referenced in generated code so if the order of it changes
   /// inside this struct, please update CodegenEval().
-  const RuntimeFilter* filter;
+  const RuntimeFilter* filter = nullptr;
 
   /// Statistics for this filter, owned by object pool.
-  FilterStats* stats;
+  FilterStats* stats = nullptr;
 
   /// Working copy of local bloom filter
-  BloomFilter* local_bloom_filter;
+  BloomFilter* local_bloom_filter = nullptr;
+
+  /// Working copy of local min-max filter
+  MinMaxFilter* local_min_max_filter = nullptr;
 
   /// Struct name in LLVM IR.
   static const char* LLVM_CLASS_NAME;
 
   /// Clones this FilterContext for use in a multi-threaded context (i.e. by scanner
   /// threads).
-  Status CloneFrom(const FilterContext& from, RuntimeState* state);
+  Status CloneFrom(const FilterContext& from, ObjectPool* pool, RuntimeState* state,
+      MemPool* expr_perm_pool, MemPool* expr_results_pool);
 
-  /// Evaluates 'row' on the expression in 'expr_ctx' with the resulting value being
-  /// checked against runtime filter 'filter' for matches. Returns true if 'row' finds
+  /// Evaluates 'row' with 'expr_eval' with the resulting value being checked
+  /// against runtime filter 'filter' for matches. Returns true if 'row' finds
   /// a match in 'filter'. Returns false otherwise.
   bool Eval(TupleRow* row) const noexcept;
 
-  /// Evaluates 'row' on the expression in 'expr_ctx' and hashes the resulting value.
-  /// The hash value is then used for setting some bits in 'local_bloom_filter'.
+  /// Evaluates 'row' with 'expr_eval' and inserts the value into 'local_bloom_filter'
+  /// or 'local_min_max_filter' as appropriate.
   void Insert(TupleRow* row) const noexcept;
 
-  /// Codegen Eval() by codegen'ing the expression evaluations and replacing the type
+  /// Materialize filter values by copying any values stored by filters into memory owned
+  /// by the filter. Filters may assume that the memory for Insert()-ed values stays valid
+  /// until this is called.
+  void MaterializeValues() const;
+
+  /// Codegen Eval() by codegen'ing the expression 'filter_expr' and replacing the type
   /// argument to RuntimeFilter::Eval() with a constant. On success, 'fn' is set to
   /// the generated function. On failure, an error status is returned.
-  Status CodegenEval(LlvmCodeGen* codegen, llvm::Function** fn) const;
+  static Status CodegenEval(LlvmCodeGen* codegen, ScalarExpr* filter_expr,
+      llvm::Function** fn) WARN_UNUSED_RESULT;
 
-  FilterContext()
-      : expr_ctx(NULL), filter(NULL), local_bloom_filter(NULL) { }
+  /// Codegen Insert() by codegen'ing the expression 'filter_expr', replacing the type
+  /// argument to RawValue::GetHashValue() with a constant, and calling into the correct
+  /// version of BloomFilter::Insert() or MinMaxFilter::Insert(), depending on the filter
+  /// desc and if 'local_bloom_filter' or 'local_min_max_filter' are null.
+  /// For bloom filters, it also selects the correct Insert() based on the presence of
+  /// AVX, and for min-max filters it selects the correct Insert() based on type.
+  /// On success, 'fn' is set to the generated function. On failure, an error status is
+  /// returned.
+  static Status CodegenInsert(LlvmCodeGen* codegen, ScalarExpr* filter_expr,
+      FilterContext* ctx, llvm::Function** fn) WARN_UNUSED_RESULT;
+
+  // Returns if there is any always_false filter in ctxs. If there is, the counter stats
+  // is updated.
+  static bool CheckForAlwaysFalse(const std::string& stats_name,
+      const std::vector<FilterContext>& ctxs);
 };
 
 }

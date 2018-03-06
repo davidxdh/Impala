@@ -60,7 +60,11 @@ public class TupleIsNullPredicate extends Predicate {
   protected void analyzeImpl(Analyzer analyzer) throws AnalysisException {
     super.analyzeImpl(analyzer);
     analyzer_ = analyzer;
-    evalCost_ = tupleIds_.size() * IS_NULL_COST;
+  }
+
+  @Override
+  protected float computeEvalCost() {
+    return tupleIds_.size() * IS_NULL_COST;
   }
 
   @Override
@@ -79,9 +83,9 @@ public class TupleIsNullPredicate extends Predicate {
   }
 
   @Override
-  public boolean equals(Object o) {
-    if (!super.equals(o)) return false;
-    TupleIsNullPredicate other = (TupleIsNullPredicate) o;
+  public boolean localEquals(Expr that) {
+    if (!super.localEquals(that)) return false;
+    TupleIsNullPredicate other = (TupleIsNullPredicate) that;
     return other.tupleIds_.containsAll(tupleIds_) &&
         tupleIds_.containsAll(other.tupleIds_);
   }

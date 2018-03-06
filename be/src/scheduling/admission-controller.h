@@ -31,6 +31,7 @@
 #include "scheduling/request-pool-service.h"
 #include "scheduling/query-schedule.h"
 #include "statestore/statestore-subscriber.h"
+#include "util/condition-variable.h"
 #include "util/internal-queue.h"
 #include "util/thread.h"
 
@@ -95,12 +96,13 @@ class ExecEnv;
 ///  a) Mem Reserved: the amount of memory that has been reported as reserved by all
 ///     backends, which come from the statestore topic updates. The values that are sent
 ///     come from the pool mem trackers in UpdateMemTrackerStats(), which reflects the
-///     memory reserved by fragments that have begun execution. For queries that have mem
-///     limits, the limit is considered to be its reserved memory, otherwise the current
-///     consumption is used (see MemTracker::GetPoolMemReserved()). The per-pool and
-///     per-host aggregates are computed in UpdateClusterAggregates(). This state, once
-///     all updates are fully distributed and aggregated, provides enough information to
-///     make admission decisions by any impalad. However, this requires waiting for both
+///     memory reserved by fragments that have begun execution. For queries that are
+///     executing and have mem limits, the limit is considered to be its reserved memory
+///     because it may consume up to that limit. Otherwise the query's current consumption
+///     is used (see MemTracker::GetPoolMemReserved()). The per-pool and per-host
+///     aggregates are computed in UpdateClusterAggregates(). This state, once all updates
+///     are fully distributed and aggregated, provides enough information to make
+///     admission decisions by any impalad. However, this requires waiting for both
 ///     admitted requests to start all remote fragments and then for the updated state to
 ///     be distributed via the statestore.
 ///  b) Mem Admitted: the amount of memory required (i.e. the value used in admission,
@@ -178,7 +180,8 @@ class ExecEnv;
 ///       better idea of what is perhaps unnecessary.
 class AdmissionController {
  public:
-  AdmissionController(RequestPoolService* request_pool_service, MetricGroup* metrics,
+  AdmissionController(StatestoreSubscriber* subscriber,
+      RequestPoolService* request_pool_service, MetricGroup* metrics,
       const TNetworkAddress& host_addr);
   ~AdmissionController();
 
@@ -194,17 +197,18 @@ class AdmissionController {
   /// been submitted via AdmitQuery(). (If the request was not admitted, this is
   /// a no-op.)
   /// This does not block.
-  Status ReleaseQuery(QuerySchedule* schedule);
+  void ReleaseQuery(const QuerySchedule& schedule);
 
-  /// Registers with the subscription manager.
-  Status Init(StatestoreSubscriber* subscriber);
+  /// Registers the request queue topic with the statestore.
+  Status Init();
 
  private:
   class PoolStats;
   friend class PoolStats;
 
-  /// Statestore topic name.
-  static const std::string IMPALA_REQUEST_QUEUE_TOPIC;
+  /// Subscription manager used to handle admission control updates. This is not
+  /// owned by this class.
+  StatestoreSubscriber* subscriber_;
 
   /// Used for user-to-pool resolution and looking up pool configurations. Not owned by
   /// the AdmissionController.
@@ -214,7 +218,7 @@ class AdmissionController {
   MetricGroup* metrics_group_;
 
   /// Thread dequeuing and admitting queries.
-  boost::scoped_ptr<Thread> dequeue_thread_;
+  std::unique_ptr<Thread> dequeue_thread_;
 
   // The local impalad's host/port id, used to construct topic keys.
   const std::string host_id_;
@@ -403,7 +407,7 @@ class AdmissionController {
 
   /// Notifies the dequeuing thread that pool stats have changed and it may be
   /// possible to dequeue and admit queries.
-  boost::condition_variable dequeue_cv_;
+  ConditionVariable dequeue_cv_;
 
   /// If true, tear down the dequeuing thread. This only happens in unit tests.
   bool done_;
@@ -421,12 +425,9 @@ class AdmissionController {
   void AddPoolUpdates(std::vector<TTopicDelta>* subscriber_topic_updates);
 
   /// Updates the remote stats with per-host topic_updates coming from the statestore.
-  /// Called by UpdatePoolStats(). Must hold admission_ctrl_lock_.
+  /// Removes remote stats identified by topic deletions coming from the
+  /// statestore. Called by UpdatePoolStats(). Must hold admission_ctrl_lock_.
   void HandleTopicUpdates(const std::vector<TTopicItem>& topic_updates);
-
-  /// Removes remote stats identified by the topic_deletions coming from the statestore.
-  /// Called by UpdatePoolStats(). Must hold admission_ctrl_lock_.
-  void HandleTopicDeletions(const std::vector<std::string>& topic_deletions);
 
   /// Re-computes the per-pool aggregate stats and the per-host aggregates in
   /// host_mem_reserved_ using each pool's remote_stats_ and local_stats_.
@@ -455,10 +456,12 @@ class AdmissionController {
   /// admission_ctrl_lock_.
   void UpdateHostMemAdmitted(const QuerySchedule& schedule, int64_t per_node_mem);
 
-  /// Returns an error status if this request must be rejected immediately, e.g. requires
-  /// more memory than possible to reserve or the queue is already full.
+  /// Returns true if this request must be rejected immediately, e.g. requires more
+  /// memory than possible to reserve or the queue is already full. If true,
+  /// rejection_reason is set to a explanation of why the request was rejected.
   /// Must hold admission_ctrl_lock_.
-  Status RejectImmediately(QuerySchedule* schedule, const TPoolConfig& pool_cfg);
+  bool RejectImmediately(QuerySchedule* schedule, const TPoolConfig& pool_cfg,
+      std::string* rejection_reason);
 
   /// Gets or creates the PoolStats for pool_name. Must hold admission_ctrl_lock_.
   PoolStats* GetPoolStats(const std::string& pool_name);

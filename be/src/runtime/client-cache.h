@@ -26,6 +26,7 @@
 #include <boost/bind.hpp>
 #include <gutil/strings/substitute.h>
 
+#include "catalog/catalog-service-client-wrapper.h"
 #include "runtime/client-cache-types.h"
 #include "util/metrics.h"
 #include "rpc/thrift-client.h"
@@ -79,14 +80,15 @@ class ClientCacheHelper {
   //
   /// If there is an error creating the new client, *client_key will be NULL.
   Status GetClient(const TNetworkAddress& address, ClientFactory factory_method,
-      ClientKey* client_key);
+      ClientKey* client_key) WARN_UNUSED_RESULT;
 
   /// Returns a newly-opened client in client_key. May reopen the existing client, or may
   /// replace it with a new one (created using 'factory_method').
   //
   /// Returns an error status and sets 'client_key' to NULL if a new client cannot
   /// created.
-  Status ReopenClient(ClientFactory factory_method, ClientKey* client_key);
+  Status ReopenClient(
+      ClientFactory factory_method, ClientKey* client_key) WARN_UNUSED_RESULT;
 
   /// Returns a client to the cache. Upon return, *client_key will be NULL, and the
   /// associated client will be available in the per-host cache.
@@ -189,7 +191,7 @@ class ClientCacheHelper {
 
   /// Create a new client for specific address in 'client' and put it in client_map_
   Status CreateClient(const TNetworkAddress& address, ClientFactory factory_method,
-      ClientKey* client_key);
+      ClientKey* client_key) WARN_UNUSED_RESULT;
 };
 
 /// A scoped client connection to help manage clients from a client cache. Clients of this
@@ -200,6 +202,7 @@ class ClientConnection {
   ClientConnection(ClientCache<T>* client_cache, TNetworkAddress address, Status* status)
     : client_cache_(client_cache), client_(NULL), address_(address),
       client_is_unrecoverable_(false) {
+    // TODO: Inject fault here to exercise IMPALA-5576.
     *status = client_cache_->GetClient(address, &client_);
     if (status->ok()) DCHECK(client_ != NULL);
   }
@@ -214,9 +217,7 @@ class ClientConnection {
     }
   }
 
-  Status Reopen() {
-    return client_cache_->ReopenClient(&client_);
-  }
+  Status Reopen() WARN_UNUSED_RESULT { return client_cache_->ReopenClient(&client_); }
 
   T* operator->() const { return client_; }
 
@@ -224,57 +225,37 @@ class ClientConnection {
   /// TCP connection underpinning this client has been closed unexpectedly. Note that
   /// this can lead to f() being called twice, as this method may retry f() once,
   /// depending on the error received from the first attempt.
-  /// TODO: Detect already-closed cnxns and only retry in that case.
-  ///
-  /// retry_is_safe is an output parameter. In case of connection failure,
-  /// '*retry_is_safe' is set to true because the send never occurred and it's
-  /// safe to retry the RPC. Otherwise, it's set to false to indicate that the RPC was
-  /// in progress when it failed or the RPC was completed, therefore retrying the RPC
-  /// is not safe.
   ///
   /// Returns RPC_RECV_TIMEOUT if a timeout occurred while waiting for a response,
   /// RPC_CLIENT_CONNECT_FAILURE if the client failed to connect, and RPC_GENERAL_ERROR
   /// if the RPC could not be completed for any other reason (except for an unexpectedly
-  /// closed cnxn, see TODO).
+  /// closed cnxn).
   /// Application-level failures should be signalled through the response type.
-  ///
-  /// TODO: Use TTransportException::TTransportExceptionType to distinguish between
-  /// failure modes.
   template <class F, class Request, class Response>
-  Status DoRpc(const F& f, const Request& request, Response* response,
-      bool* retry_is_safe = NULL) {
-    DCHECK(response != NULL);
+  Status DoRpc(const F& f, const Request& request, Response* response) {
+    DCHECK(response != nullptr);
     client_is_unrecoverable_ = true;
-    if (retry_is_safe != NULL) *retry_is_safe = false;
+    bool send_done = false;
     try {
-      (client_->*f)(*response, request);
-    } catch (const apache::thrift::TApplicationException& e) {
-      // TApplicationException only happens in recv RPC call.
-      // which means send RPC call is done, should not retry.
-      return Status(TErrorCode::RPC_GENERAL_ERROR, e.what());
-    } catch (const apache::thrift::TException& e) {
-      if (IsRecvTimeoutTException(e)) {
-        return Status(TErrorCode::RPC_RECV_TIMEOUT, strings::Substitute(
-            "Client $0 timed-out during recv call.", TNetworkAddressToString(address_)));
+      (client_->*f)(*response, request, &send_done);
+    } catch (const apache::thrift::transport::TTransportException& e) {
+      if (send_done && IsRecvTimeoutTException(e)) {
+        return RecvTimeoutStatus(typeid(*response).name());
       }
-      VLOG(1) << "client " << client_ << " unexpected exception: "
-              << e.what() << ", type=" << typeid(e).name();
 
-      // Client may have unexpectedly been closed, so re-open and retry.
-      // TODO: ThriftClient should return proper error codes.
-      const Status& status = Reopen();
-      if (!status.ok()) {
-        if (retry_is_safe != NULL) *retry_is_safe = true;
-        return Status(TErrorCode::RPC_CLIENT_CONNECT_FAILURE, status.GetDetail());
+      // Client may have unexpectedly been closed, so re-open and retry once if we didn't
+      // successfully send the payload yet or if the exception indicates the connection
+      // was closed on the other end. Note that TCP can have a half-open connection so
+      // send() may still succeed even after the other end already closed the socket.
+      // The payload can just be buffered in the kernel.
+      if (!send_done || IsConnResetTException(e)) {
+        return RetryRpc(f, request, response);
       }
-      try {
-        (client_->*f)(*response, request);
-      } catch (apache::thrift::TException& e) {
-        // By this point the RPC really has failed.
-        // TODO: Revisit this logic later. It's possible that the new connection
-        // works but we hit timeout here.
-        return Status(TErrorCode::RPC_GENERAL_ERROR, e.what());
-      }
+
+      // Payload was sent and failure wasn't a timeout waiting for response. Fail the RPC.
+      return GeneralErrorStatus(e, typeid(*response).name(), send_done);
+    } catch (const apache::thrift::TException& e) {
+      return GeneralErrorStatus(e, typeid(*response).name(), send_done);
     }
     client_is_unrecoverable_ = false;
     return Status::OK();
@@ -289,13 +270,14 @@ class ClientConnection {
     DCHECK(client_is_unrecoverable_);
     try {
       (client_->*recv_func)(*response);
-    } catch (const apache::thrift::TException& e) {
+    } catch (const apache::thrift::transport::TTransportException& e) {
       if (IsRecvTimeoutTException(e)) {
-        return Status(TErrorCode::RPC_RECV_TIMEOUT, strings::Substitute(
-            "Client $0 timed-out during recv call.", TNetworkAddressToString(address_)));
+        return RecvTimeoutStatus(typeid(*response).name());
       }
       // If it's not timeout exception, then the connection is broken, stop retrying.
-      return Status(TErrorCode::RPC_GENERAL_ERROR, e.what());
+      return GeneralErrorStatus(e, typeid(*response).name(), true);
+    } catch (const apache::thrift::TException& e) {
+      return GeneralErrorStatus(e, typeid(*response).name(), true);
     }
     client_is_unrecoverable_ = false;
     return Status::OK();
@@ -310,6 +292,55 @@ class ClientConnection {
   /// fails for any reason, the connection could be left in a bad state and cannot be
   /// recovered.
   bool client_is_unrecoverable_;
+
+  /// Returns an error Status for general RPC errors not due to recv timeout or
+  /// stale connections. Will also log some details about the error.
+  Status GeneralErrorStatus(
+      const apache::thrift::TException& e, const std::string& rpc_name, bool send_done) {
+    ErrorMsg msg(TErrorCode::RPC_GENERAL_ERROR, strings::Substitute("Client for $0 hit "
+        "an unexpected exception: $1, type: $2, rpc: $3, send: $4",
+        TNetworkAddressToString(address_), e.what(), typeid(e).name(), rpc_name,
+        send_done ? "done" : "not done"));
+    VLOG_QUERY << msg.msg();
+    return Status::Expected(msg);
+  }
+
+  /// Returns an error Status for RPC errors due to recv timeout.
+  /// Will also log some details about the error.
+  Status RecvTimeoutStatus(const std::string& rpc_name) {
+    ErrorMsg msg(TErrorCode::RPC_RECV_TIMEOUT, TNetworkAddressToString(address_),
+        rpc_name);
+    VLOG_QUERY << msg.msg();
+    return Status::Expected(msg);
+  }
+
+  /// Retry the RPC if TCP connection underpinning this client has been closed
+  /// unexpectedly. Called only when we didn't succeed in sending all the payload
+  /// in the first invocation of RPC call. Returns RPC_CLIENT_CONNECT_FAILURE
+  /// on connection failure or RPC_GENERAL_ERROR for all other RPC failures.
+  template <class F, class Request, class Response>
+  Status RetryRpc(const F& f, const Request& request, Response* response) {
+    DCHECK(client_is_unrecoverable_);
+    // Client may have unexpectedly been closed, so re-open and retry.
+    // TODO: ThriftClient should return proper error codes.
+    Status status = Reopen();
+    if (!status.ok()) {
+      ErrorMsg msg(TErrorCode::RPC_CLIENT_CONNECT_FAILURE, status.GetDetail());
+      VLOG_QUERY << msg.msg() << " rpc: " << typeid(*response).name();
+      return Status::Expected(msg);
+    }
+    bool send_done = false;
+    try {
+      (client_->*f)(*response, request, &send_done);
+    } catch (const apache::thrift::TException& e) {
+      // By this point the RPC really has failed.
+      // TODO: Revisit this logic later. It's possible that the new connection
+      // works but we hit timeout here.
+      return GeneralErrorStatus(e, typeid(*response).name(), send_done);
+    }
+    client_is_unrecoverable_ = false;
+    return Status::OK();
+  }
 };
 
 /// Generic cache of Thrift clients for a given service type.
@@ -376,18 +407,18 @@ class ClientCache {
   /// Obtains a pointer to a Thrift interface object (of type T),
   /// backed by a live transport which is already open. Returns
   /// Status::OK unless there was an error opening the transport.
-  Status GetClient(const TNetworkAddress& address, T** iface) {
-    return client_cache_helper_.GetClient(address, client_factory_,
-        reinterpret_cast<ClientKey*>(iface));
+  Status GetClient(const TNetworkAddress& address, T** iface) WARN_UNUSED_RESULT {
+    return client_cache_helper_.GetClient(
+        address, client_factory_, reinterpret_cast<ClientKey*>(iface));
   }
 
   /// Close and delete the underlying transport. Return a new client connecting to the
   /// same host/port.
   /// Returns an error status if a new connection cannot be established and *client will
   /// be unaffected in that case.
-  Status ReopenClient(T** client) {
-    return client_cache_helper_.ReopenClient(client_factory_,
-        reinterpret_cast<ClientKey*>(client));
+  Status ReopenClient(T** client) WARN_UNUSED_RESULT {
+    return client_cache_helper_.ReopenClient(
+        client_factory_, reinterpret_cast<ClientKey*>(client));
   }
 
   /// Return the client to the cache and set *client to NULL.

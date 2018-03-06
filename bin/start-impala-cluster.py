@@ -25,7 +25,7 @@ import psutil
 import sys
 from getpass import getuser
 from time import sleep, time
-from optparse import OptionParser
+from optparse import OptionParser, SUPPRESS_HELP
 from testdata.common import cgroups
 
 KUDU_MASTER_HOSTS = os.getenv('KUDU_MASTER_HOSTS', '127.0.0.1')
@@ -36,6 +36,12 @@ DEFAULT_IMPALA_MAX_LOG_FILES = os.environ.get('IMPALA_MAX_LOG_FILES', 10)
 parser = OptionParser()
 parser.add_option("-s", "--cluster_size", type="int", dest="cluster_size", default=3,
                   help="Size of the cluster (number of impalad instances to start).")
+parser.add_option("-c", "--num_coordinators", type="int", dest="num_coordinators",
+                  default=3, help="Number of coordinators.")
+parser.add_option("--use_exclusive_coordinators", dest="use_exclusive_coordinators",
+                  action="store_true", default=False, help="If true, coordinators only "
+                  "coordinate queries and execute coordinator fragments. If false, "
+                  "coordinators also act as executors.")
 parser.add_option("--build_type", dest="build_type", default= 'latest',
                   help="Build type to use - debug / release / latest")
 parser.add_option("--impalad_args", dest="impalad_args", action="append", type="string",
@@ -47,8 +53,10 @@ parser.add_option("--state_store_args", dest="state_store_args", action="append"
 parser.add_option("--catalogd_args", dest="catalogd_args", action="append",
                   type="string", default=[],
                   help="Additional arguments to pass to the Catalog Service at startup")
+parser.add_option("--disable_krpc", dest="disable_krpc", action="store_true",
+                  default=False, help="Disable KRPC DataStream service during startup.")
 parser.add_option("--kill", "--kill_only", dest="kill_only", action="store_true",
-                  default=False, help="Instead of starting the cluster, just kill all"\
+                  default=False, help="Instead of starting the cluster, just kill all"
                   " the running impalads and the statestored.")
 parser.add_option("--force_kill", dest="force_kill", action="store_true", default=False,
                   help="Force kill impalad and statestore processes.")
@@ -64,9 +72,6 @@ parser.add_option('--max_log_files', default=DEFAULT_IMPALA_MAX_LOG_FILES,
                   help='Max number of log files before rotation occurs.')
 parser.add_option("-v", "--verbose", dest="verbose", action="store_true", default=False,
                   help="Prints all output to stderr/stdout.")
-parser.add_option("--wait_for_cluster", dest="wait_for_cluster", action="store_true",
-                  default=False, help="Wait until the cluster is ready to accept "\
-                  "queries before returning.")
 parser.add_option("--log_level", type="int", dest="log_level", default=1,
                    help="Set the impalad backend logging level")
 parser.add_option("--jvm_args", dest="jvm_args", default="",
@@ -74,6 +79,11 @@ parser.add_option("--jvm_args", dest="jvm_args", default="",
 parser.add_option("--kudu_master_hosts", default=KUDU_MASTER_HOSTS,
                   help="The host name or address of the Kudu master. Multiple masters "
                       "can be specified using a comma separated list.")
+
+# For testing: list of comma-separated delays, in milliseconds, that delay impalad catalog
+# replica initialization. The ith delay is applied to the ith impalad.
+parser.add_option("--catalog_init_delays", dest="catalog_init_delays", default="",
+                  help=SUPPRESS_HELP)
 
 options, args = parser.parse_args()
 
@@ -88,7 +98,7 @@ CATALOGD_PATH = os.path.join(IMPALA_HOME,
 MINI_IMPALA_CLUSTER_PATH = IMPALAD_PATH + " -in-process"
 
 IMPALA_SHELL = os.path.join(IMPALA_HOME, 'bin/impala-shell.sh')
-IMPALAD_PORTS = ("-beeswax_port=%d -hs2_port=%d  -be_port=%d "
+IMPALAD_PORTS = ("-beeswax_port=%d -hs2_port=%d  -be_port=%d -krpc_port=%d "
                  "-state_store_subscriber_port=%d -webserver_port=%d")
 JVM_ARGS = "-jvm_debug_port=%s -jvm_args=%s"
 BE_LOGGING_ARGS = "-log_filename=%s -log_dir=%s -v=%s -logbufsecs=5 -max_log_files=%s"
@@ -133,7 +143,7 @@ def exec_impala_process(cmd, args, stderr_log_file_path):
   os.system(cmd)
 
 def kill_cluster_processes(force=False):
-  binaries = ['catalogd', 'impalad', 'statestored', 'mini-impala-cluster']
+  binaries = ['catalogd', 'impalad', 'statestored']
   kill_matching_processes(binaries, force)
 
 def kill_matching_processes(binary_names, force=False):
@@ -177,22 +187,16 @@ def start_catalogd():
     raise RuntimeError("Unable to start catalogd. Check log or file permissions"
                        " for more details.")
 
-def start_mini_impala_cluster(cluster_size):
-  print ("Starting in-process Impala Cluster logging "
-         "to %s/mini-impala-cluster.INFO" % options.log_dir)
-  args = "-num_backends=%s %s" %\
-         (cluster_size, build_impalad_logging_args(0, 'mini-impala-cluster'))
-  stderr_log_file_path = os.path.join(options.log_dir, 'mini-impala-cluster-error.log')
-  exec_impala_process(MINI_IMPALA_CLUSTER_PATH, args, stderr_log_file_path)
-
 def build_impalad_port_args(instance_num):
   BASE_BEESWAX_PORT = 21000
   BASE_HS2_PORT = 21050
   BASE_BE_PORT = 22000
+  BASE_KRPC_PORT = 27000
   BASE_STATE_STORE_SUBSCRIBER_PORT = 23000
   BASE_WEBSERVER_PORT = 25000
   return IMPALAD_PORTS % (BASE_BEESWAX_PORT + instance_num, BASE_HS2_PORT + instance_num,
                           BASE_BE_PORT + instance_num,
+                          BASE_KRPC_PORT + instance_num,
                           BASE_STATE_STORE_SUBSCRIBER_PORT + instance_num,
                           BASE_WEBSERVER_PORT + instance_num)
 
@@ -204,7 +208,10 @@ def build_jvm_args(instance_num):
   BASE_JVM_DEBUG_PORT = 30000
   return JVM_ARGS % (BASE_JVM_DEBUG_PORT + instance_num, options.jvm_args)
 
-def start_impalad_instances(cluster_size):
+def start_impalad_instances(cluster_size, num_coordinators, use_exclusive_coordinators):
+  """Start 'cluster_size' impalad instances. The first 'num_coordinator' instances will
+    act as coordinators. 'use_exclusive_coordinators' specifies whether the coordinators
+    will only execute coordinator fragments."""
   if cluster_size == 0:
     # No impalad instances should be started.
     return
@@ -214,6 +221,10 @@ def start_impalad_instances(cluster_size):
   # is very annoying, the mem limit will be reduced. This can be overridden using the
   # --impalad_args flag. virtual_memory().total returns the total physical memory.
   mem_limit = int(0.8 * psutil.virtual_memory().total / cluster_size)
+
+  delay_list = []
+  if options.catalog_init_delays != "":
+    delay_list = [delay.strip() for delay in options.catalog_init_delays.split(",")]
 
   # Start each impalad instance and optionally redirect the output to a log file.
   for i in range(cluster_size):
@@ -239,6 +250,19 @@ def start_impalad_instances(cluster_size):
     if options.kudu_master_hosts:
       # Must be prepended, otherwise the java options interfere.
       args = "-kudu_master_hosts %s %s" % (options.kudu_master_hosts, args)
+
+    if i >= num_coordinators:
+      args = "-is_coordinator=false %s" % (args)
+    elif use_exclusive_coordinators:
+      # Coordinator instance that doesn't execute non-coordinator fragments
+      args = "-is_executor=false %s" % (args)
+
+    if i < len(delay_list):
+      args = "-stress_catalog_init_delay_ms=%s %s" % (delay_list[i], args)
+
+    if options.disable_krpc:
+      args = "-use_krpc=false %s" % (args)
+
     stderr_log_file_path = os.path.join(options.log_dir, '%s-error.log' % service_name)
     exec_impala_process(IMPALAD_PATH, args, stderr_log_file_path)
 
@@ -272,36 +296,53 @@ def wait_for_cluster_web(timeout_in_seconds=CLUSTER_WAIT_TIMEOUT_IN_SECONDS):
   A cluster is deemed "ready" if:
     - All backends are registered with the statestore.
     - Each impalad knows about all other impalads.
+    - Each coordinator impalad's catalog cache is ready.
   This information is retrieved by querying the statestore debug webpage
   and each individual impalad's metrics webpage.
   """
   impala_cluster = ImpalaCluster()
   # impalad processes may take a while to come up.
   wait_for_impala_process_count(impala_cluster)
-  for impalad in impala_cluster.impalads:
-    impalad.service.wait_for_num_known_live_backends(options.cluster_size,
-        timeout=CLUSTER_WAIT_TIMEOUT_IN_SECONDS, interval=2)
-    wait_for_catalog(impalad, timeout_in_seconds=CLUSTER_WAIT_TIMEOUT_IN_SECONDS)
 
-def wait_for_catalog(impalad, timeout_in_seconds):
-  """Waits for the impalad catalog to become ready"""
+  # TODO: fix this for coordinator-only nodes as well.
+  expected_num_backends = options.cluster_size
+  if options.catalog_init_delays != "":
+    for delay in options.catalog_init_delays.split(","):
+      if int(delay.strip()) != 0: expected_num_backends -= 1
+
+  for impalad in impala_cluster.impalads:
+    impalad.service.wait_for_num_known_live_backends(expected_num_backends,
+        timeout=CLUSTER_WAIT_TIMEOUT_IN_SECONDS, interval=2)
+    if impalad._get_arg_value('is_coordinator', default='true') == 'true' and \
+       impalad._get_arg_value('stress_catalog_init_delay_ms', default=0) == 0:
+      wait_for_catalog(impalad)
+
+def wait_for_catalog(impalad, timeout_in_seconds=CLUSTER_WAIT_TIMEOUT_IN_SECONDS):
+  """Waits for a catalog copy to be received by the impalad. When its received,
+     additionally waits for client ports to be opened."""
   start_time = time()
-  catalog_ready = False
-  attempt = 0
-  while (time() - start_time < timeout_in_seconds and not catalog_ready):
+  client_beeswax = None
+  client_hs2 = None
+  num_dbs = 0
+  num_tbls = 0
+  while (time() - start_time < timeout_in_seconds):
     try:
       num_dbs = impalad.service.get_metric_value('catalog.num-databases')
       num_tbls = impalad.service.get_metric_value('catalog.num-tables')
-      catalog_ready = impalad.service.get_metric_value('catalog.ready')
-      if catalog_ready or attempt % 4 == 0:
-          print 'Waiting for Catalog... Status: %s DBs / %s tables (ready=%s)' %\
-              (num_dbs, num_tbls, catalog_ready)
-      attempt += 1
-    except Exception, e:
-      print e
+      client_beeswax = impalad.service.create_beeswax_client()
+      client_hs2 = impalad.service.create_hs2_client()
+      break
+    except Exception as e:
+      print 'Client services not ready.'
+      print 'Waiting for catalog cache: (%s DBs / %s tables). Trying again ...' %\
+        (num_dbs, num_tbls)
+    finally:
+      if client_beeswax is not None: client_beeswax.close()
     sleep(0.5)
-  if not catalog_ready:
-    raise RuntimeError('Catalog was not initialized in expected time period.')
+
+  if client_beeswax is None or client_hs2 is None:
+    raise RuntimeError('Unable to open client ports within %s seconds.'\
+                       % timeout_in_seconds)
 
 def wait_for_cluster_cmdline(timeout_in_seconds=CLUSTER_WAIT_TIMEOUT_IN_SECONDS):
   """Checks if the cluster is "ready" by executing a simple query in a loop"""
@@ -324,6 +365,14 @@ if __name__ == "__main__":
 
   if options.cluster_size < 0:
     print 'Please specify a cluster size >= 0'
+    sys.exit(1)
+
+  if options.num_coordinators <= 0:
+    print 'Please specify a valid number of coordinators > 0'
+    sys.exit(1)
+
+  if options.use_exclusive_coordinators and options.num_coordinators >= options.cluster_size:
+    print 'Cannot start an Impala cluster with no executors'
     sys.exit(1)
 
   if not os.path.isdir(options.log_dir):
@@ -363,21 +412,26 @@ if __name__ == "__main__":
     # restart_only_impalad=True.
     wait_for_cluster = wait_for_cluster_cmdline
 
-  if options.inprocess:
-    # The statestore and the impalads start in the same process.
-    start_mini_impala_cluster(options.cluster_size)
-    wait_for_cluster_cmdline()
-  else:
-    try:
-      if not options.restart_impalad_only:
-        start_statestore()
-        start_catalogd()
-      start_impalad_instances(options.cluster_size)
-      # Sleep briefly to reduce log spam: the cluster takes some time to start up.
-      sleep(3)
-      wait_for_cluster()
-    except Exception, e:
-      print 'Error starting cluster: %s' % e
-      sys.exit(1)
+  try:
+    if not options.restart_impalad_only:
+      start_statestore()
+      start_catalogd()
+    start_impalad_instances(options.cluster_size, options.num_coordinators,
+                            options.use_exclusive_coordinators)
+    # Sleep briefly to reduce log spam: the cluster takes some time to start up.
+    sleep(3)
 
-  print 'Impala Cluster Running with %d nodes.' % options.cluster_size
+    # Check for the cluster to be ready.
+    wait_for_cluster()
+  except Exception, e:
+    print 'Error starting cluster: %s' % e
+    sys.exit(1)
+
+  if options.use_exclusive_coordinators == True:
+    executors = options.cluster_size - options.num_coordinators
+  else:
+    executors = options.cluster_size
+  print 'Impala Cluster Running with %d nodes (%d coordinators, %d executors).' % (
+      options.cluster_size,
+      min(options.cluster_size, options.num_coordinators),
+      executors)

@@ -114,7 +114,7 @@ error_codes = (
    "Verify that all your impalads are the same version."),
 
   ("RPC_GENERAL_ERROR", 30, "RPC Error: $0"),
-  ("RPC_RECV_TIMEOUT", 31, "RPC recv timed out: $0"),
+  ("RPC_RECV_TIMEOUT", 31, "RPC recv timed out: dest address: $0, rpc: $1"),
 
   ("UDF_VERIFY_FAILED", 32,
    "Failed to verify function $0 from LLVM module $1, see log for more details."),
@@ -206,9 +206,7 @@ error_codes = (
 
   ("UDF_MEM_LIMIT_EXCEEDED", 64, "$0's allocations exceeded memory limits."),
 
-  ("BTS_BLOCK_OVERFLOW", 65, "Cannot process row that is bigger than the IO size "
-   "(row_size=$0, null_indicators_size=$1). To run this query, increase the IO size "
-   "(--read_size option)."),
+  ("UNUSED_65", 65, "No longer in use."),
 
   ("COMPRESSED_FILE_MULTIPLE_BLOCKS", 66,
    "For better performance, snappy-, gzip-, and bzip-compressed files "
@@ -226,8 +224,8 @@ error_codes = (
   ("COMPRESSED_FILE_TRUNCATED", 70,
    "Unexpected end of compressed file. File may be truncated. file=$0"),
 
-  ("DATASTREAM_SENDER_TIMEOUT", 71, "Sender timed out waiting for receiver fragment "
-   "instance: $0"),
+  ("DATASTREAM_SENDER_TIMEOUT", 71, "Sender$0 timed out waiting for receiver fragment "
+   "instance: $1, dest node: $2"),
 
   ("KUDU_IMPALA_TYPE_MISSING", 72, "Kudu type $0 is not available in Impala."),
 
@@ -240,11 +238,9 @@ error_codes = (
 
   ("PARTITIONED_HASH_JOIN_REPARTITION_FAILS", 76, "Cannot perform hash join at node with "
    "id $0. Repartitioning did not reduce the size of a spilled partition. Repartitioning "
-   "level $1. Number of rows $2."),
+   "level $1. Number of rows $2:\\n$3\\n$4"),
 
-  ("PARTITIONED_AGG_REPARTITION_FAILS", 77,  "Cannot perform aggregation at node with "
-   "id $0. Repartitioning did not reduce the size of a spilled partition. Repartitioning "
-   "level $1. Number of rows $2."),
+  ("UNUSED_77", 77,  "Not in use."),
 
   ("AVRO_TRUNCATED_BLOCK", 78, "File '$0' is corrupt: truncated data block at offset $1"),
 
@@ -279,9 +275,9 @@ error_codes = (
    "supported length of 2147483647 bytes."),
 
   ("SCRATCH_LIMIT_EXCEEDED", 90, "Scratch space limit of $0 bytes exceeded for query "
-   "while spilling data to disk."),
+   "while spilling data to disk on backend $1."),
 
-  ("BUFFER_ALLOCATION_FAILED", 91, "Unexpected error allocating $0 byte buffer."),
+  ("BUFFER_ALLOCATION_FAILED", 91, "Unexpected error allocating $0 byte buffer: $1"),
 
   ("PARQUET_ZERO_ROWS_IN_NON_EMPTY_FILE", 92, "File '$0' is corrupt: metadata indicates "
    "a zero row count but there is at least one non-empty row group."),
@@ -310,8 +306,55 @@ error_codes = (
   # TODO: IMPALA-4697: the merged errors do not show up in the query error log,
   # so we must point users to the impalad error log.
   ("SCRATCH_ALLOCATION_FAILED", 101, "Could not create files in any configured scratch "
-   "directories (--scratch_dirs). See logs for previous errors that may have prevented "
-   "creating or writing scratch files."),
+   "directories (--scratch_dirs=$0) on backend '$1'. See logs for previous errors that may "
+   "have prevented creating or writing scratch files."),
+
+  ("SCRATCH_READ_TRUNCATED", 102, "Error reading $0 bytes from scratch file '$1' "
+   "on backend $2 at offset $3: could only read $4 bytes"),
+
+  ("KUDU_TIMESTAMP_OUT_OF_RANGE", 103,
+   "Kudu table '$0' column '$1' contains an out of range timestamp. "
+   "The valid date range is 1400-01-01..9999-12-31."),
+
+  ("MAX_ROW_SIZE", 104, "Row of size $0 could not be materialized in plan node with "
+    "id $1. Increase the max_row_size query option (currently $2) to process larger rows."),
+
+  ("IR_VERIFY_FAILED", 105,
+   "Failed to verify generated IR function $0, see log for more details."),
+
+  ("MINIMUM_RESERVATION_UNAVAILABLE", 106, "Failed to get minimum memory reservation of "
+     "$0 on daemon $1:$2 for query $3 due to following error: $4Memory is likely "
+     "oversubscribed. Reducing query concurrency or configuring admission control may "
+     "help avoid this error."),
+
+  ("ADMISSION_REJECTED", 107, "Rejected query from pool $0: $1"),
+
+  ("ADMISSION_TIMED_OUT", 108, "Admission for query exceeded timeout $0ms in pool $1. "
+     "Queued reason: $2"),
+
+  ("THREAD_CREATION_FAILED", 109, "Failed to create thread $0 in category $1: $2"),
+
+  ("DISK_IO_ERROR", 110, "Disk I/O error: $0"),
+
+  ("DATASTREAM_RECVR_CLOSED", 111,
+   "DataStreamRecvr for fragment=$0, node=$1 is closed already"),
+
+  ("BAD_PRINCIPAL_FORMAT", 112,
+    "Kerberos principal should be of the form: <service>/<hostname>@<realm> - got: $0"),
+
+  ("LZ4_COMPRESSION_INPUT_TOO_LARGE", 113,
+   "The input size is too large for LZ4 compression: $0"),
+
+  ("SASL_APP_NAME_MISMATCH", 114,
+   "InitAuth() called multiple times with different names. Was called with $0. "
+   "Now using $1."),
+
+  ("PARQUET_BIT_PACKED_LEVELS", 115,
+      "Can not read Parquet file $0 with deprecated BIT_PACKED encoding for rep or "
+      "def levels. Support was removed in Impala 3.0 - see IMPALA-6077."),
+
+  ("ROW_BATCH_TOO_LARGE", 116,
+   "Row batch cannot be serialized: size of $0 bytes exceeds supported limit of $1"),
 )
 
 import sys

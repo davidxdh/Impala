@@ -32,6 +32,16 @@ class TestKuduOperations(CustomClusterTestSuite, KuduTestSuite):
     return 'functional-query'
 
   @pytest.mark.execute_serially
+  @CustomClusterTestSuite.with_args(impalad_args=\
+      "--use_local_tz_for_unix_timestamp_conversions=true")
+  def test_local_tz_conversion_ops(self, vector, unique_database):
+    """IMPALA-5539: Test Kudu timestamp reads/writes are correct with the
+       use_local_tz_for_unix_timestamp_conversions flag."""
+    # These tests provide enough coverage of queries with timestamps.
+    self.run_test_case('QueryTest/kudu-scan-node', vector, use_db=unique_database)
+    self.run_test_case('QueryTest/kudu_insert', vector, use_db=unique_database)
+
+  @pytest.mark.execute_serially
   @CustomClusterTestSuite.with_args(impalad_args="-kudu_master_hosts=")
   def test_kudu_master_hosts(self, cursor, kudu_client):
     """Check behavior when -kudu_master_hosts is not provided to catalogd."""
@@ -52,6 +62,24 @@ class TestKuduOperations(CustomClusterTestSuite, KuduTestSuite):
           """ % (table_name, KUDU_MASTER_HOSTS, kudu_table.name))
       cursor.execute("DROP TABLE %s" % table_name)
 
+  @pytest.mark.execute_serially
+  @CustomClusterTestSuite.with_args(impalad_args="-kudu_error_buffer_size=1024")
+  def test_error_buffer_size(self, cursor, unique_database):
+    """Check that queries fail if the size of the Kudu client errors they generate is
+    greater than kudu_error_buffer_size."""
+    table_name = "%s.test_error_buffer_size" % unique_database
+    cursor.execute("create table %s (a bigint primary key) stored as kudu" % table_name)
+    # Insert a large number of a constant value into the table to generate many "Key
+    # already present" errors. 50 errors should fit inside the 1024 byte limit.
+    cursor.execute(
+        "insert into %s select 1 from functional.alltypes limit 50" % table_name)
+    try:
+      # 200 errors should overflow the 1024 byte limit.
+      cursor.execute(
+          "insert into %s select 1 from functional.alltypes limit 200" % table_name)
+      assert False, "Expected: 'Error overflow in Kudu session.'"
+    except Exception as e:
+      assert "Error overflow in Kudu session." in str(e)
 
 class TestKuduClientTimeout(CustomClusterTestSuite, KuduTestSuite):
   """Kudu tests that set the Kudu client operation timeout to 1ms and expect
@@ -69,9 +97,3 @@ class TestKuduClientTimeout(CustomClusterTestSuite, KuduTestSuite):
   def test_impalad_timeout(self, vector):
     """Check impalad behavior when -kudu_operation_timeout_ms is too low."""
     self.run_test_case('QueryTest/kudu-timeouts-impalad', vector)
-
-  @pytest.mark.execute_serially
-  @CustomClusterTestSuite.with_args(catalogd_args="-kudu_operation_timeout_ms=1")
-  def test_catalogd_timeout(self, vector):
-    """Check catalogd behavior when -kudu_operation_timeout_ms is too low."""
-    self.run_test_case('QueryTest/kudu-timeouts-catalogd', vector)

@@ -17,6 +17,7 @@
 
 package org.apache.impala.analysis;
 
+import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.HADOOP_SECURITY_AUTH_TO_LOCAL;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.fail;
 
@@ -29,10 +30,35 @@ import java.util.Map;
 import java.util.UUID;
 
 import org.apache.hadoop.conf.Configuration;
-import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.HADOOP_SECURITY_AUTH_TO_LOCAL;
-import org.apache.hive.service.cli.thrift.TGetColumnsReq;
-import org.apache.hive.service.cli.thrift.TGetSchemasReq;
-import org.apache.hive.service.cli.thrift.TGetTablesReq;
+import org.apache.hive.service.rpc.thrift.TGetColumnsReq;
+import org.apache.hive.service.rpc.thrift.TGetSchemasReq;
+import org.apache.hive.service.rpc.thrift.TGetTablesReq;
+import org.apache.impala.authorization.AuthorizationConfig;
+import org.apache.impala.authorization.AuthorizeableTable;
+import org.apache.impala.authorization.User;
+import org.apache.impala.catalog.AuthorizationException;
+import org.apache.impala.catalog.Db;
+import org.apache.impala.catalog.ImpaladCatalog;
+import org.apache.impala.catalog.ScalarFunction;
+import org.apache.impala.catalog.Type;
+import org.apache.impala.common.AnalysisException;
+import org.apache.impala.common.FrontendTestBase;
+import org.apache.impala.common.ImpalaException;
+import org.apache.impala.common.InternalException;
+import org.apache.impala.common.RuntimeEnv;
+import org.apache.impala.service.Frontend;
+import org.apache.impala.testutil.ImpaladTestCatalog;
+import org.apache.impala.thrift.TFunctionBinaryType;
+import org.apache.impala.thrift.TMetadataOpRequest;
+import org.apache.impala.thrift.TMetadataOpcode;
+import org.apache.impala.thrift.TNetworkAddress;
+import org.apache.impala.thrift.TPrivilege;
+import org.apache.impala.thrift.TPrivilegeLevel;
+import org.apache.impala.thrift.TPrivilegeScope;
+import org.apache.impala.thrift.TResultSet;
+import org.apache.impala.thrift.TSessionState;
+import org.apache.impala.util.PatternMatcher;
+import org.apache.impala.util.SentryPolicyService;
 import org.apache.sentry.provider.common.ResourceAuthorizationProvider;
 import org.apache.sentry.provider.file.LocalGroupResourceAuthorizationProvider;
 import org.junit.After;
@@ -43,43 +69,13 @@ import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
 import org.junit.runners.Parameterized.Parameters;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
-import org.apache.impala.authorization.AuthorizationConfig;
-import org.apache.impala.authorization.AuthorizeableTable;
-import org.apache.impala.authorization.User;
-import org.apache.impala.catalog.AuthorizationException;
-import org.apache.impala.catalog.Catalog;
-import org.apache.impala.catalog.Db;
-import org.apache.impala.catalog.ImpaladCatalog;
-import org.apache.impala.catalog.ScalarFunction;
-import org.apache.impala.catalog.Type;
-import org.apache.impala.common.AnalysisException;
-import org.apache.impala.common.ImpalaException;
-import org.apache.impala.common.InternalException;
-import org.apache.impala.common.RuntimeEnv;
-import org.apache.impala.service.Frontend;
-import org.apache.impala.testutil.ImpaladTestCatalog;
-import org.apache.impala.testutil.TestUtils;
-import org.apache.impala.thrift.TFunctionBinaryType;
-import org.apache.impala.thrift.TMetadataOpRequest;
-import org.apache.impala.thrift.TMetadataOpcode;
-import org.apache.impala.thrift.TNetworkAddress;
-import org.apache.impala.thrift.TPrivilege;
-import org.apache.impala.thrift.TPrivilegeLevel;
-import org.apache.impala.thrift.TPrivilegeScope;
-import org.apache.impala.thrift.TQueryCtx;
-import org.apache.impala.thrift.TResultSet;
-import org.apache.impala.thrift.TSessionState;
-import org.apache.impala.util.PatternMatcher;
-import org.apache.impala.util.SentryPolicyService;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 
 @RunWith(Parameterized.class)
-public class AuthorizationTest {
+public class AuthorizationTest extends FrontendTestBase {
   // Policy file has defined current user and 'test_user' have:
   //   ALL permission on 'tpch' database and 'newdb' database
   //   ALL permission on 'functional_seq_snap' database
@@ -98,6 +94,8 @@ public class AuthorizationTest {
   //   INSERT permissions on 'functional.alltypes' (no SELECT permissions)
   //   INSERT permissions on all tables in 'functional_parquet' database
   //   No permissions on database 'functional_rc'
+  //   Only column level permissions in 'functional_avro':
+  //     SELECT permissions on columns ('id') on 'functional_avro.alltypessmall'
   public final static String AUTHZ_POLICY_FILE = "/test-warehouse/authz-policy.ini";
   public final static User USER = new User(System.getProperty("user.name"));
 
@@ -121,7 +119,6 @@ public class AuthorizationTest {
   }
 
   private final TestContext ctx_;
-  private final TQueryCtx queryCtx_;
   private final AnalysisContext analysisContext_;
   private final Frontend fe_;
 
@@ -175,8 +172,7 @@ public class AuthorizationTest {
 
   public AuthorizationTest(TestContext ctx) throws Exception {
     ctx_ = ctx;
-    queryCtx_ = TestUtils.createQueryContext(Catalog.DEFAULT_DB, USER.getName());
-    analysisContext_ = new AnalysisContext(ctx_.catalog, queryCtx_, ctx_.authzConfig);
+    analysisContext_ = createAnalysisCtx(ctx_.authzConfig, USER.getName());
     fe_ = new Frontend(ctx_.authzConfig, ctx_.catalog);
   }
 
@@ -388,6 +384,19 @@ public class AuthorizationTest {
       privileges.add(priv);
     }
     sentryService.grantRolePrivileges(USER, roleName, privileges);
+
+    // select_column_level_functional_avro
+    roleName = "select_column_level_functional_avro";
+    sentryService.createRole(USER, roleName, true);
+    sentryService.grantRoleToGroup(USER, roleName, USER.getName());
+
+    privilege = new TPrivilege("", TPrivilegeLevel.SELECT,
+        TPrivilegeScope.COLUMN, false);
+    privilege.setServer_name("server1");
+    privilege.setDb_name("functional_avro");
+    privilege.setTable_name("alltypessmall");
+    privilege.setColumn_name("id");
+    sentryService.grantRolePrivilege(USER, roleName, privilege);
   }
 
   @Test
@@ -757,6 +766,7 @@ public class AuthorizationTest {
   public void TestUseDb() throws ImpalaException {
     // Positive cases (user has privileges on these tables).
     AuthzOk("use functional");
+    AuthzOk("use functional_avro"); // Database with only column privileges.
     AuthzOk("use tpcds");
     AuthzOk("use tpch");
 
@@ -904,11 +914,14 @@ public class AuthorizationTest {
     AuthzError("create external table tpch.kudu_tbl stored as kudu " +
         "TBLPROPERTIES ('kudu.master_addresses'='127.0.0.1', 'kudu.table_name'='tbl')",
         "User '%s' does not have privileges to access: server1");
+    AuthzError("create table tpch.kudu_tbl (i int, j int, primary key (i))" +
+        " PARTITION BY HASH (i) PARTITIONS 9 stored as kudu TBLPROPERTIES " +
+        "('kudu.master_addresses'='127.0.0.1')",
+        "User '%s' does not have privileges to access: server1");
 
     // IMPALA-4000: ALL privileges on SERVER are not required to create managed tables.
     AuthzOk("create table tpch.kudu_tbl (i int, j int, primary key (i))" +
-        " PARTITION BY HASH (i) PARTITIONS 9 stored as kudu TBLPROPERTIES " +
-        "('kudu.master_addresses'='127.0.0.1')");
+        " PARTITION BY HASH (i) PARTITIONS 9 stored as kudu");
 
     // User does not have permission to create table at the specified location..
     AuthzError("create table tpch.new_table (i int) location " +
@@ -1514,6 +1527,7 @@ public class AuthorizationTest {
   @Test
   public void TestShowPermissions() throws ImpalaException {
     AuthzOk("show tables in functional");
+    AuthzOk("show tables in functional_avro"); // Database with only column privileges.
     AuthzOk("show databases");
     AuthzOk("show tables in _impala_builtins");
     AuthzOk("show functions in _impala_builtins");
@@ -1576,7 +1590,7 @@ public class AuthorizationTest {
     // These are the only dbs that should show up because they are the only
     // dbs the user has any permissions on.
     List<String> expectedDbs = Lists.newArrayList("default", "functional",
-        "functional_parquet", "functional_seq_snap", "tpcds", "tpch");
+        "functional_avro", "functional_parquet", "functional_seq_snap", "tpcds", "tpch");
 
     List<Db> dbs = fe_.getDbs(PatternMatcher.createHivePatternMatcher("*"), USER);
     assertEquals(expectedDbs, extractDbNames(dbs));
@@ -1722,10 +1736,11 @@ public class AuthorizationTest {
     }
 
     // Get all tables of tpcds
+    final int numTpcdsTables = 24;
     req.get_tables_req.setSchemaName("tpcds");
     req.get_tables_req.setTableName("%");
     resp = fe_.execHiveServer2MetadataOp(req);
-    assertEquals(11, resp.rows.size());
+    assertEquals(numTpcdsTables, resp.rows.size());
   }
 
   @Test
@@ -1738,7 +1753,7 @@ public class AuthorizationTest {
     req.get_schemas_req.setSchemaName("%");
     TResultSet resp = fe_.execHiveServer2MetadataOp(req);
     List<String> expectedDbs = Lists.newArrayList("default", "functional",
-        "functional_parquet", "functional_seq_snap", "tpcds", "tpch");
+        "functional_avro", "functional_parquet", "functional_seq_snap", "tpcds", "tpch");
     assertEquals(expectedDbs.size(), resp.rows.size());
     for (int i = 0; i < resp.rows.size(); ++i) {
       assertEquals(expectedDbs.get(i),
@@ -1839,17 +1854,14 @@ public class AuthorizationTest {
         new User(USER.getName() + "/abc.host.com@REAL.COM"),
         new User(USER.getName() + "@REAL.COM"));
     for (User user: users) {
-      AnalysisContext context = new AnalysisContext(ctx_.catalog,
-          TestUtils.createQueryContext(Catalog.DEFAULT_DB, user.getName()),
-          ctx_.authzConfig);
+      AnalysisContext ctx = createAnalysisCtx(ctx_.authzConfig, user.getName());
 
       // Can select from table that user has privileges on.
-      AuthzOk(context, "select * from functional.alltypesagg");
+      AuthzOk(ctx, "select * from functional.alltypesagg");
 
       // Unqualified table name.
-      AuthzError(context, "select * from alltypes",
-          "User '%s' does not have privileges to execute 'SELECT' on: default.alltypes",
-          user);
+      AuthzError(ctx, "select * from alltypes",
+          "User '%s' does not have privileges to execute 'SELECT' on: default.alltypes");
     }
     // If the first character is '/', the short username should be the same as
     // the full username.
@@ -1883,16 +1895,14 @@ public class AuthorizationTest {
     User.setRulesForTesting(
         new Configuration().get(HADOOP_SECURITY_AUTH_TO_LOCAL, "DEFAULT"));
     User user = new User("authtest/hostname@REALM.COM");
-    AnalysisContext context = new AnalysisContext(catalog,
-        TestUtils.createQueryContext(Catalog.DEFAULT_DB, user.getName()), authzConfig);
+    AnalysisContext ctx = createAnalysisCtx(authzConfig, user.getName());
     Frontend fe = new Frontend(authzConfig, catalog);
 
     // Can select from table that user has privileges on.
-    AuthzOk(fe, context, "select * from tpcds.customer");
+    AuthzOk(fe, ctx, "select * from tpcds.customer");
     // Does not have privileges to execute a query
-    AuthzError(fe, context, "select * from functional.alltypes",
-        "User '%s' does not have privileges to execute 'SELECT' on: functional.alltypes",
-        user);
+    AuthzError(fe, ctx, "select * from functional.alltypes",
+        "User '%s' does not have privileges to execute 'SELECT' on: functional.alltypes");
 
     // Unit tests for User#getShortName()
     // Different auth_to_local rules to apply on the username.
@@ -1930,31 +1940,28 @@ public class AuthorizationTest {
   @Test
   public void TestFunction() throws Exception {
     // First try with the less privileged user.
-    User currentUser = USER;
-    AnalysisContext context = new AnalysisContext(ctx_.catalog,
-        TestUtils.createQueryContext(Catalog.DEFAULT_DB, currentUser.getName()),
-        ctx_.authzConfig);
-    AuthzError(context, "show functions",
-        "User '%s' does not have privileges to access: default", currentUser);
-    AuthzOk(context, "show functions in tpch");
+    AnalysisContext ctx = createAnalysisCtx(ctx_.authzConfig, USER.getName());
+    AuthzError(ctx, "show functions",
+        "User '%s' does not have privileges to access: default");
+    AuthzOk(ctx, "show functions in tpch");
 
-    AuthzError(context, "create function f() returns int location " +
+    AuthzError(ctx, "create function f() returns int location " +
         "'/test-warehouse/libTestUdfs.so' symbol='NoArgs'",
-        "User '%s' does not have privileges to CREATE/DROP functions.", currentUser);
+        "User '%s' does not have privileges to CREATE/DROP functions.");
 
-    AuthzError(context, "create function tpch.f() returns int location " +
+    AuthzError(ctx, "create function tpch.f() returns int location " +
         "'/test-warehouse/libTestUdfs.so' symbol='NoArgs'",
-        "User '%s' does not have privileges to CREATE/DROP functions.", currentUser);
+        "User '%s' does not have privileges to CREATE/DROP functions.");
 
-    AuthzError(context, "create function notdb.f() returns int location " +
+    AuthzError(ctx, "create function notdb.f() returns int location " +
         "'/test-warehouse/libTestUdfs.so' symbol='NoArgs'",
-        "User '%s' does not have privileges to CREATE/DROP functions.", currentUser);
+        "User '%s' does not have privileges to CREATE/DROP functions.");
 
-    AuthzError(context, "drop function if exists f()",
-        "User '%s' does not have privileges to CREATE/DROP functions.", currentUser);
+    AuthzError(ctx, "drop function if exists f()",
+        "User '%s' does not have privileges to CREATE/DROP functions.");
 
-    AuthzError(context, "drop function notdb.f()",
-        "User '%s' does not have privileges to CREATE/DROP functions.", currentUser);
+    AuthzError(ctx, "drop function notdb.f()",
+        "User '%s' does not have privileges to CREATE/DROP functions.");
 
     // TODO: Add test support for dynamically changing privileges for
     // file-based policy.
@@ -1996,9 +2003,9 @@ public class AuthorizationTest {
       sentryService.revokeRoleFromGroup(USER, "admin", USER.getName());
       ctx_.catalog.reset();
 
-      AuthzError(context, "create function tpch.f() returns int location " +
+      AuthzError(ctx, "create function tpch.f() returns int location " +
           "'/test-warehouse/libTestUdfs.so' symbol='NoArgs'",
-          "User '%s' does not have privileges to CREATE/DROP functions.", currentUser);
+          "User '%s' does not have privileges to CREATE/DROP functions.");
 
       // Couldn't create tpch.f() but can run it.
       AuthzOk("select tpch.f()");
@@ -2015,8 +2022,7 @@ public class AuthorizationTest {
   }
 
   @Test
-  public void TestServerNameAuthorized()
-      throws AnalysisException, InternalException {
+  public void TestServerNameAuthorized() throws ImpalaException {
     if (ctx_.authzConfig.isFileBasedPolicy()) {
       // Authorization config that has a different server name from policy file.
       TestWithIncorrectConfig(AuthorizationConfig.createHadoopGroupAuthConfig(
@@ -2026,8 +2032,7 @@ public class AuthorizationTest {
   }
 
   @Test
-  public void TestNoPermissionsWhenPolicyFileDoesNotExist()
-      throws AnalysisException, InternalException {
+  public void TestNoPermissionsWhenPolicyFileDoesNotExist() throws ImpalaException {
     // Test doesn't make sense except for file based policies.
     if (!ctx_.authzConfig.isFileBasedPolicy()) return;
 
@@ -2151,47 +2156,42 @@ public class AuthorizationTest {
 
     // Create an analysis context + FE with the test user (as defined in the policy file)
     User user = new User("test_user");
-    AnalysisContext context = new AnalysisContext(catalog,
-        TestUtils.createQueryContext(Catalog.DEFAULT_DB, user.getName()), authzConfig);
+    AnalysisContext ctx = createAnalysisCtx(authzConfig, user.getName());
     Frontend fe = new Frontend(authzConfig, catalog);
 
     // Can select from table that user has privileges on.
-    AuthzOk(fe, context, "select * from functional.alltypesagg");
+    AuthzOk(fe, ctx, "select * from functional.alltypesagg");
     // Does not have privileges to execute a query
-    AuthzError(fe, context, "select * from functional.alltypes",
-        "User '%s' does not have privileges to execute 'SELECT' on: functional.alltypes",
-        user);
+    AuthzError(fe, ctx, "select * from functional.alltypes",
+        "User '%s' does not have privileges to execute 'SELECT' on: functional.alltypes");
 
     // Verify with the admin user
     user = new User("admin_user");
-    context = new AnalysisContext(catalog,
-        TestUtils.createQueryContext(Catalog.DEFAULT_DB, user.getName()), authzConfig);
+    ctx = createAnalysisCtx(authzConfig, user.getName());
     fe = new Frontend(authzConfig, catalog);
 
     // Admin user should have privileges to do anything
-    AuthzOk(fe, context, "select * from functional.alltypesagg");
-    AuthzOk(fe, context, "select * from functional.alltypes");
-    AuthzOk(fe, context, "invalidate metadata");
-    AuthzOk(fe, context, "create external table tpch.kudu_tbl stored as kudu " +
+    AuthzOk(fe, ctx, "select * from functional.alltypesagg");
+    AuthzOk(fe, ctx, "select * from functional.alltypes");
+    AuthzOk(fe, ctx, "invalidate metadata");
+    AuthzOk(fe, ctx, "create external table tpch.kudu_tbl stored as kudu " +
         "TBLPROPERTIES ('kudu.master_addresses'='127.0.0.1', 'kudu.table_name'='tbl')");
   }
 
   private void TestWithIncorrectConfig(AuthorizationConfig authzConfig, User user)
-      throws AnalysisException, InternalException {
+      throws ImpalaException {
     Frontend fe = new Frontend(authzConfig, ctx_.catalog);
-    AnalysisContext ac = new AnalysisContext(new ImpaladTestCatalog(),
-        TestUtils.createQueryContext(Catalog.DEFAULT_DB, user.getName()), authzConfig);
-    AuthzError(fe, ac, "select * from functional.alltypesagg",
+    AnalysisContext ctx = createAnalysisCtx(authzConfig, user.getName());
+    AuthzError(fe, ctx, "select * from functional.alltypesagg",
         "User '%s' does not have privileges to execute 'SELECT' on: " +
-        "functional.alltypesagg", user);
-    AuthzError(fe, ac, "ALTER TABLE functional_seq_snap.alltypes ADD COLUMNS (c1 int)",
+        "functional.alltypesagg");
+    AuthzError(fe, ctx, "ALTER TABLE functional_seq_snap.alltypes ADD COLUMNS (c1 int)",
         "User '%s' does not have privileges to execute 'ALTER' on: " +
-        "functional_seq_snap.alltypes", user);
-    AuthzError(fe, ac, "drop table tpch.lineitem",
-        "User '%s' does not have privileges to execute 'DROP' on: tpch.lineitem",
-        user);
-    AuthzError(fe, ac, "show tables in functional",
-        "User '%s' does not have privileges to access: functional.*", user);
+        "functional_seq_snap.alltypes");
+    AuthzError(fe, ctx, "drop table tpch.lineitem",
+        "User '%s' does not have privileges to execute 'DROP' on: tpch.lineitem");
+    AuthzError(fe, ctx, "show tables in functional",
+        "User '%s' does not have privileges to access: functional.*");
   }
 
   private void AuthzOk(String stmt) throws ImpalaException {
@@ -2202,10 +2202,9 @@ public class AuthorizationTest {
     AuthzOk(fe_, context, stmt);
   }
 
-  private static void AuthzOk(Frontend fe, AnalysisContext context, String stmt)
+  private void AuthzOk(Frontend fe, AnalysisContext context, String stmt)
       throws ImpalaException {
-    context.analyze(stmt);
-    context.authorize(fe.getAuthzChecker());
+    parseAndAnalyze(stmt, context, fe);
   }
 
   /**
@@ -2213,29 +2212,24 @@ public class AuthorizationTest {
    * string matches.
    */
   private void AuthzError(String stmt, String expectedErrorString)
-      throws AnalysisException, InternalException {
-    AuthzError(analysisContext_, stmt, expectedErrorString, USER);
+      throws ImpalaException {
+    AuthzError(analysisContext_, stmt, expectedErrorString);
   }
 
-  private void AuthzError(AnalysisContext analysisContext,
-      String stmt, String expectedErrorString, User user)
-      throws AnalysisException, InternalException {
-    AuthzError(fe_, analysisContext, stmt, expectedErrorString, user);
+  private void AuthzError(AnalysisContext ctx, String stmt, String expectedErrorString)
+      throws ImpalaException {
+    AuthzError(fe_, ctx, stmt, expectedErrorString);
   }
 
-  private static void AuthzError(Frontend fe, AnalysisContext analysisContext,
-      String stmt, String expectedErrorString, User user)
-      throws AnalysisException, InternalException {
+  private void AuthzError(Frontend fe, AnalysisContext ctx,
+      String stmt, String expectedErrorString)
+      throws ImpalaException {
     Preconditions.checkNotNull(expectedErrorString);
     try {
-      try {
-        analysisContext.analyze(stmt);
-      } finally {
-        analysisContext.authorize(fe.getAuthzChecker());
-      }
+      parseAndAnalyze(stmt, ctx, fe);
     } catch (AuthorizationException e) {
       // Insert the username into the error.
-      expectedErrorString = String.format(expectedErrorString, user.getName());
+      expectedErrorString = String.format(expectedErrorString, ctx.getUser());
       String errorString = e.getMessage();
       Assert.assertTrue(
           "got error:\n" + errorString + "\nexpected:\n" + expectedErrorString,

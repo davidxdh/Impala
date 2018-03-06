@@ -19,10 +19,10 @@
 #ifndef IMPALA_UTIL_BLOCKING_QUEUE_H
 #define IMPALA_UTIL_BLOCKING_QUEUE_H
 
-#include <boost/thread/condition_variable.hpp>
 #include <boost/thread/mutex.hpp>
 #include <boost/scoped_ptr.hpp>
 #include <deque>
+#include <memory>
 #include <unistd.h>
 
 #include "common/atomic.h"
@@ -92,7 +92,7 @@ class BlockingQueue : public CacheLineAligned {
     }
 
     DCHECK(!get_list_.empty());
-    *out = get_list_.front();
+    *out = std::move(get_list_.front());
     get_list_.pop_front();
     get_list_size_.Store(get_list_.size());
     read_lock.unlock();
@@ -105,9 +105,12 @@ class BlockingQueue : public CacheLineAligned {
     return true;
   }
 
-  /// Puts an element into the queue, waiting indefinitely until there is space.
-  /// If the queue is shut down, returns false.
-  bool BlockingPut(const T& val) {
+  /// Puts an element into the queue, waiting indefinitely until there is space. Rvalues
+  /// are moved into the queue, lvalues are copied. If the queue is shut down, returns
+  /// false. V is a type that is compatible with T; that is, objects of type V can be
+  /// inserted into the queue.
+  template <typename V>
+  bool BlockingPut(V&& val) {
     MonotonicStopWatch timer;
     boost::unique_lock<boost::mutex> write_lock(put_lock_);
 
@@ -120,7 +123,7 @@ class BlockingQueue : public CacheLineAligned {
     if (UNLIKELY(shutdown_)) return false;
 
     DCHECK_LT(put_list_.size(), max_elements_);
-    put_list_.push_back(val);
+    Put(std::forward<V>(val));
     write_lock.unlock();
     get_cv_.NotifyOne();
     return true;
@@ -128,18 +131,20 @@ class BlockingQueue : public CacheLineAligned {
 
   /// Puts an element into the queue, waiting until 'timeout_micros' elapses, if there is
   /// no space. If the queue is shut down, or if the timeout elapsed without being able to
-  /// put the element, returns false.
-  bool BlockingPutWithTimeout(const T& val, int64_t timeout_micros) {
+  /// put the element, returns false. Rvalues are moved into the queue, lvalues are
+  /// copied. V is a type that is compatible with T; that is, objects of type V can be
+  /// inserted into the queue.
+  template <typename V>
+  bool BlockingPutWithTimeout(V&& val, int64_t timeout_micros) {
     MonotonicStopWatch timer;
     boost::unique_lock<boost::mutex> write_lock(put_lock_);
-    boost::system_time wtime = boost::get_system_time() +
-        boost::posix_time::microseconds(timeout_micros);
-    const struct timespec timeout = boost::detail::to_timespec(wtime);
+    timespec abs_time;
+    TimeFromNowMicros(timeout_micros, &abs_time);
     bool notified = true;
     while (SizeLocked(write_lock) >= max_elements_ && !shutdown_ && notified) {
       timer.Start();
       // Wait until we're notified or until the timeout expires.
-      notified = put_cv_.TimedWait(write_lock, &timeout);
+      notified = put_cv_.WaitUntil(write_lock, abs_time);
       timer.Stop();
     }
     total_put_wait_time_ += timer.ElapsedTime();
@@ -149,7 +154,7 @@ class BlockingQueue : public CacheLineAligned {
     // another thread did in fact signal
     if (SizeLocked(write_lock) >= max_elements_ || shutdown_) return false;
     DCHECK_LT(put_list_.size(), max_elements_);
-    put_list_.push_back(val);
+    Put(std::forward<V>(val));
     write_lock.unlock();
     get_cv_.NotifyOne();
     return true;
@@ -192,6 +197,11 @@ class BlockingQueue : public CacheLineAligned {
     DCHECK(lock.mutex() == &put_lock_ && lock.owns_lock());
     return get_list_size_.Load() + put_list_.size();
   }
+
+  /// Overloads for inserting an item into the list, depending on whether it should be
+  /// moved or copied.
+  void Put(const T& val) { put_list_.push_back(val); }
+  void Put(T&& val) { put_list_.emplace_back(std::move(val)); }
 
   /// True if the BlockingQueue is being shut down. Guarded by 'put_lock_'.
   bool shutdown_;

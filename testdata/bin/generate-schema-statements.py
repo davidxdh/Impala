@@ -168,9 +168,10 @@ WITH SERDEPROPERTIES (
 KNOWN_EXPLORATION_STRATEGIES = ['core', 'pairwise', 'exhaustive', 'lzo']
 
 def build_create_statement(table_template, table_name, db_name, db_suffix,
-                           file_format, compression, hdfs_location):
+                           file_format, compression, hdfs_location,
+                           force_reload):
   create_stmt = 'CREATE DATABASE IF NOT EXISTS %s%s;\n' % (db_name, db_suffix)
-  if (options.force_reload):
+  if (force_reload):
     create_stmt += 'DROP TABLE IF EXISTS %s%s.%s;\n' % (db_name, db_suffix, table_name)
   if compression == 'lzo':
     file_format = '%s_%s' % (file_format, compression)
@@ -356,10 +357,14 @@ def build_codec_enabled_statement(codec):
 
 def build_insert_into_statement(insert, db_name, db_suffix, table_name, file_format,
                                 hdfs_path, for_impala=False):
+  insert_hint = "/* +shuffle, clustered */" \
+    if for_impala and file_format == 'parquet' else ""
   insert_statement = insert.format(db_name=db_name,
                                    db_suffix=db_suffix,
                                    table_name=table_name,
-                                   hdfs_location=hdfs_path)
+                                   hdfs_location=hdfs_path,
+                                   impala_home=os.getenv("IMPALA_HOME"),
+                                   hint=insert_hint)
 
   # Kudu tables are managed and don't support OVERWRITE, so we replace OVERWRITE
   # with INTO to make this a regular INSERT.
@@ -425,16 +430,6 @@ def build_hbase_create_stmt(db_name, table_name, column_families):
   create_stmt.append("create '%s', %s" % (hbase_table_name, column_families))
   return create_stmt
 
-def build_db_suffix(file_format, codec, compression_type):
-  if file_format == 'text' and codec == 'none':
-    return ''
-  elif codec == 'none':
-    return '_%s' % (file_format)
-  elif compression_type == 'record':
-    return '_%s_record_%s' % (file_format, codec)
-  else:
-    return '_%s_%s' % (file_format, codec)
-
 # Does a hdfs directory listing and returns array with all the subdir names.
 def get_hdfs_subdirs_with_data(path):
   tmp_file = tempfile.TemporaryFile("w+")
@@ -488,20 +483,21 @@ def generate_statements(output_name, test_vectors, sections,
   hive_output = Statements()
   hbase_output = Statements()
   hbase_post_load = Statements()
+  impala_invalidate = Statements()
 
   table_names = None
   if options.table_names:
     table_names = [name.lower() for name in options.table_names.split(',')]
   existing_tables = get_hdfs_subdirs_with_data(options.hive_warehouse_dir)
   for row in test_vectors:
-    impala_output = Statements()
+    impala_create = Statements()
     impala_load = Statements()
     file_format, data_set, codec, compression_type =\
         [row.file_format, row.dataset, row.compression_codec, row.compression_type]
     table_format = '%s/%s/%s' % (file_format, codec, compression_type)
     for section in sections:
       table_name = section['BASE_TABLE_NAME'].strip()
-      db_suffix = build_db_suffix(file_format, codec, compression_type)
+      db_suffix = row.db_suffix()
       db_name = '{0}{1}'.format(data_set, options.scale_factor)
       db = '{0}{1}'.format(db_name, db_suffix)
 
@@ -529,9 +525,13 @@ def generate_statements(output_name, test_vectors, sections,
       alter = section.get('ALTER')
       create = section['CREATE']
       create_hive = section['CREATE_HIVE']
+      assert not (create and create_hive), "Can't set both CREATE and CREATE_HIVE"
 
       table_properties = section['TABLE_PROPERTIES']
       insert = eval_section(section['DEPENDENT_LOAD'])
+      insert_hive = eval_section(section['DEPENDENT_LOAD_HIVE'])
+      assert not (insert and insert_hive),\
+          "Can't set both DEPENDENT_LOAD and DEPENDENT_LOAD_HIVE"
       load = eval_section(section['LOAD'])
 
       if file_format == 'kudu':
@@ -556,8 +556,12 @@ def generate_statements(output_name, test_vectors, sections,
       # ensure the partition metadata is always properly created. The ALTER section is
       # used to create partitions, so if that section exists there is no need to force
       # reload.
+      # IMPALA-6579: Also force reload all Kudu tables. The Kudu entity referenced
+      # by the table may or may not exist, so requiring a force reload guarantees
+      # that the Kudu entity is always created correctly.
       # TODO: Rename the ALTER section to ALTER_TABLE_ADD_PARTITION
-      force_reload = options.force_reload or (partition_columns and not alter)
+      force_reload = options.force_reload or (partition_columns and not alter) or \
+          file_format == 'kudu'
 
       hdfs_location = '{0}.{1}{2}'.format(db_name, table_name, db_suffix)
       # hdfs file names for hive-benchmark and functional datasets are stored
@@ -576,13 +580,14 @@ def generate_statements(output_name, test_vectors, sections,
       # HBASE we need to create these tables with a supported insert format.
       create_file_format = file_format
       create_codec = codec
-      if not (section['LOAD'] or section['LOAD_LOCAL'] or section['DEPENDENT_LOAD']):
+      if not (section['LOAD'] or section['LOAD_LOCAL'] or section['DEPENDENT_LOAD'] \
+              or section['DEPENDENT_LOAD_HIVE']):
         create_codec = 'none'
         create_file_format = file_format
         if file_format not in IMPALA_SUPPORTED_INSERT_FORMATS:
           create_file_format = 'text'
 
-      output = impala_output
+      output = impala_create
       if create_hive or file_format == 'hbase':
         output = hive_output
       elif codec == 'lzo':
@@ -625,7 +630,7 @@ def generate_statements(output_name, test_vectors, sections,
 
       if table_template:
         output.create.append(build_create_statement(table_template, table_name, db_name,
-            db_suffix, create_file_format, create_codec, data_path))
+            db_suffix, create_file_format, create_codec, data_path, force_reload))
       # HBASE create table
       if file_format == 'hbase':
         # If the HBASE_COLUMN_FAMILIES section does not exist, default to 'd'
@@ -633,6 +638,10 @@ def generate_statements(output_name, test_vectors, sections,
         hbase_output.create.extend(build_hbase_create_stmt(db_name, table_name,
             column_families))
         hbase_post_load.load.append("flush '%s_hbase.%s'\n" % (db_name, table_name))
+
+      # Need to emit an "invalidate metadata" for each individual table
+      invalidate_table_stmt = "INVALIDATE METADATA {0}.{1};\n".format(db, table_name)
+      impala_invalidate.create.append(invalidate_table_stmt)
 
       # The ALTER statement in hive does not accept fully qualified table names so
       # insert a use statement. The ALTER statement is skipped for HBASE as it's
@@ -671,23 +680,27 @@ def generate_statements(output_name, test_vectors, sections,
           else:
             print 'Empty base table load for %s. Skipping load generation' % table_name
         elif file_format in ['kudu', 'parquet']:
-          if insert:
+          if insert_hive:
+            hive_output.load.append(build_insert(insert_hive, db_name, db_suffix,
+                file_format, codec, compression_type, table_name, data_path))
+          elif insert:
             impala_load.load.append(build_insert_into_statement(insert, db_name,
                 db_suffix, table_name, file_format, data_path, for_impala=True))
           else:
             print 'Empty parquet/kudu load for table %s. Skipping insert generation' \
               % table_name
         else:
+          if insert_hive:
+            insert = insert_hive
           if insert:
             hive_output.load.append(build_insert(insert, db_name, db_suffix, file_format,
-                                        codec, compression_type, table_name, data_path,
-                                        create_hive=create_hive))
+                codec, compression_type, table_name, data_path, create_hive=create_hive))
           else:
-              print 'Empty insert for table %s. Skipping insert generation' % table_name
+            print 'Empty insert for table %s. Skipping insert generation' % table_name
 
-    impala_output.write_to_file("load-%s-impala-generated-%s-%s-%s.sql" %
+    impala_create.write_to_file("create-%s-impala-generated-%s-%s-%s.sql" %
         (output_name, file_format, codec, compression_type))
-    impala_load.write_to_file("load-%s-impala-load-generated-%s-%s-%s.sql" %
+    impala_load.write_to_file("load-%s-impala-generated-%s-%s-%s.sql" %
         (output_name, file_format, codec, compression_type))
 
 
@@ -696,12 +709,14 @@ def generate_statements(output_name, test_vectors, sections,
   hbase_output.write_to_file('load-' + output_name + '-hbase-generated.create')
   hbase_post_load.load.append("exit")
   hbase_post_load.write_to_file('post-load-' + output_name + '-hbase-generated.sql')
+  impala_invalidate.write_to_file('invalidate-' + output_name + '-impala-generated.sql')
 
 def parse_schema_template_file(file_name):
   VALID_SECTION_NAMES = ['DATASET', 'BASE_TABLE_NAME', 'COLUMNS', 'PARTITION_COLUMNS',
                          'ROW_FORMAT', 'CREATE', 'CREATE_HIVE', 'CREATE_KUDU',
-                         'DEPENDENT_LOAD', 'DEPENDENT_LOAD_KUDU', 'LOAD',
-                         'LOAD_LOCAL', 'ALTER', 'HBASE_COLUMN_FAMILIES', 'TABLE_PROPERTIES']
+                         'DEPENDENT_LOAD', 'DEPENDENT_LOAD_KUDU', 'DEPENDENT_LOAD_HIVE',
+                         'LOAD', 'LOAD_LOCAL', 'ALTER', 'HBASE_COLUMN_FAMILIES',
+                         'TABLE_PROPERTIES']
   return parse_test_file(file_name, VALID_SECTION_NAMES, skip_unknown_sections=False)
 
 if __name__ == "__main__":

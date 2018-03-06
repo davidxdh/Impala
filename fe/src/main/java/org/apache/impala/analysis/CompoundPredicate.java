@@ -89,9 +89,8 @@ public class CompoundPredicate extends Predicate {
   public Operator getOp() { return op_; }
 
   @Override
-  public boolean equals(Object obj) {
-    if (!super.equals(obj)) return false;
-    return ((CompoundPredicate) obj).op_ == op_;
+  public boolean localEquals(Expr that) {
+    return super.localEquals(that) && ((CompoundPredicate) that).op_ == op_;
   }
 
   @Override
@@ -134,7 +133,6 @@ public class CompoundPredicate extends Predicate {
     Preconditions.checkState(fn_ != null);
     Preconditions.checkState(fn_.getReturnType().isBoolean());
     castForFunctionCall(false);
-    if (hasChildCosts()) evalCost_ = getChildCosts() + COMPOUND_PREDICATE_COST;
 
     if (!getChild(0).hasSelectivity() ||
         (children_.size() == 2 && !getChild(1).hasSelectivity())) {
@@ -156,6 +154,11 @@ public class CompoundPredicate extends Predicate {
         break;
     }
     selectivity_ = Math.max(0.0, Math.min(1.0, selectivity_));
+  }
+
+  @Override
+  protected float computeEvalCost() {
+    return hasChildCosts() ? getChildCosts() + COMPOUND_PREDICATE_COST : UNKNOWN_COST;
   }
 
   /**

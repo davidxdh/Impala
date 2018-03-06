@@ -230,6 +230,36 @@
     "key": "catalog.num-tables"
   },
   {
+    "description": "Catalog topic update version.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Catalog topic update version",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "catalog.curr-version"
+  },
+  {
+    "description": "Statestore topic update version.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Statestore topic update version",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "catalog.curr-topic"
+  },
+  {
+    "description": "Catalog service id.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Catalog service id",
+    "units": "NONE",
+    "kind": "PROPERTY",
+    "key": "catalog.curr-serviceid"
+  },
+  {
     "description": "Indicates if the catalog is ready.",
     "contexts": [
       "IMPALAD"
@@ -470,6 +500,16 @@
     "key": "impala-server.num-queries"
   },
   {
+    "description": "The total number of queries registered on this Impala server instance. Includes queries that are in flight and waiting to be closed",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Queries Registered",
+    "units": "UNIT",
+    "kind": "GAUGE",
+    "key": "impala-server.num-queries-registered"
+  },
+  {
     "description": "Number of queries expired due to inactivity.",
     "contexts": [
       "IMPALAD"
@@ -550,14 +590,36 @@
     "key": "impala-server.scan-ranges.total"
   },
   {
-    "description": "The local start time of the Impala Server.",
+    "description": "The total number of hedged reads attempted over the life of the process",
     "contexts": [
       "IMPALAD"
     ],
-    "label": "Impala Server Start Time",
+    "label": "Hedged Read Operations",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "impala-server.hedged-read-ops"
+  },
+  {
+    "description": "The total number of times hedged reads were faster than regular read operations",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Hedged Read Operations Won",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "impala-server.hedged-read-ops-win"
+  },
+  {
+    "description": "The local start time of the process",
+    "contexts": [
+      "IMPALAD",
+      "CATALOGSERVER",
+      "STATESTORE"
+    ],
+    "label": "Process Start Time",
     "units": "NONE",
     "kind": "PROPERTY",
-    "key": "impala-server.start-time"
+    "key": "process-start-time"
   },
   {
     "description": "The full version string of the Impala Server.",
@@ -680,6 +742,16 @@
     "key": "impala.thrift-server.beeswax-frontend.total-connections"
   },
   {
+    "description": "The number of Beeswax API connections to this Impala Daemon that have been accepted and are waiting to be setup.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Beeswax API Connections Queued for Setup",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "impala.thrift-server.beeswax-frontend.connection-setup-queue-size"
+  },
+  {
     "description": "The number of active HiveServer2 API connections to this Impala Daemon.",
     "contexts": [
       "IMPALAD"
@@ -698,6 +770,16 @@
     "units": "UNIT",
     "kind": "COUNTER",
     "key": "impala.thrift-server.hiveserver2-frontend.total-connections"
+  },
+  {
+    "description": "The number of HiveServer2 API connections to this Impala Daemon that have been accepted and are waiting to be setup.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "HiveServer2 API Connections Queued for Setup",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "impala.thrift-server.hiveserver2-frontend.connection-setup-queue-size"
   },
   {
     "description": "The amount of memory freed by the last memory tracker garbage collection.",
@@ -830,7 +912,7 @@
       "IMPALAD"
     ],
     "label": "StateStore Subscriber Last Recovery Duration",
-    "units": "NONE",
+    "units": "TIME_S",
     "kind": "GAUGE",
     "key": "statestore-subscriber.last-recovery-duration"
   },
@@ -890,7 +972,18 @@
     "key": "statestore-subscriber.topic-$0.processing-time-s"
   },
   {
-    "description": "The time (sec) taken to process Statestore subcriber topic updates.",
+    "description": "Interval between topic updates for Topic $0",
+    "contexts": [
+      "CATALOGSERVER",
+      "IMPALAD"
+    ],
+    "label": "Statestore Subscriber Topic $0 Update Interval",
+    "units": "TIME_S",
+    "kind": "STATS",
+    "key": "statestore-subscriber.topic-$0.update-interval"
+  },
+  {
+    "description": "The time (sec) taken to process Statestore subscriber topic updates.",
     "contexts": [
       "CATALOGSERVER",
       "IMPALAD"
@@ -942,7 +1035,7 @@
     "key": "statestore.live-backends.list"
   },
   {
-    "description": "The time (sec) spent sending topic update RPCs. Includes subscriber-side processing time and network transmission time.",
+    "description": "The time (sec) spent sending non-priority topic update RPCs. Includes subscriber-side processing time and network transmission time.",
     "contexts": [
       "STATESTORE"
     ],
@@ -950,6 +1043,16 @@
     "units": "TIME_S",
     "kind": "STATS",
     "key": "statestore.topic-update-durations"
+  },
+  {
+    "description": "The time (sec) spent sending priority topic update RPCs. Includes subscriber-side processing time and network transmission time.",
+    "contexts": [
+      "STATESTORE"
+    ],
+    "label": "Statestore Priority Topic Update Durations",
+    "units": "TIME_S",
+    "kind": "STATS",
+    "key": "statestore.priority-topic-update-durations"
   },
   {
     "description": "The sum of the size of all keys for all topics tracked by the StateStore.",
@@ -1090,6 +1193,204 @@
     "units": "BYTES",
     "kind": "GAUGE",
     "key": "tcmalloc.total-bytes-reserved"
+  },
+  {
+    "description": "Bytes allocated from the sanitizer malloc (Sanitizer debug builds only)",
+    "contexts": [
+      "STATESTORE",
+      "CATALOGSERVER",
+      "IMPALAD"
+    ],
+    "label": "Sanitizer Malloc Bytes Allocated",
+    "units": "BYTES",
+    "kind": "GAUGE",
+    "key": "sanitizer-total-bytes-allocated"
+  },
+  {
+    "description": "Maximum allowed bytes allocated by the buffer pool.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Buffer Pool Allocated Memory Limit.",
+    "units": "BYTES",
+    "kind": "GAUGE",
+    "key": "buffer-pool.limit"
+  },
+  {
+    "description": "Total buffer memory currently allocated by the buffer pool.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Buffer Pool Total Allocated Memory.",
+    "units": "BYTES",
+    "kind": "GAUGE",
+    "key": "buffer-pool.system-allocated"
+  },
+  {
+    "description": "Total bytes of buffers reserved by Impala subsystems",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Buffer Pool Total Reserved Memory.",
+    "units": "BYTES",
+    "kind": "GAUGE",
+    "key": "buffer-pool.reserved"
+  },
+  {
+    "description": "Total bytes of buffer reservations by Impala subsystems that are currently unused",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Buffer Pool Unused Reservation Bytes.",
+    "units": "BYTES",
+    "kind": "GAUGE",
+    "key": "buffer-pool.unused-reservation-bytes"
+  },
+  {
+    "description": "Total number of free buffers cached in the buffer pool.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Buffer Pool Free Buffers.",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "buffer-pool.free-buffers"
+  },
+  {
+    "description": "Total bytes of free buffer memory cached in the buffer pool.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Buffer Pool Free Buffer Bytes.",
+    "units": "BYTES",
+    "kind": "GAUGE",
+    "key": "buffer-pool.free-buffer-bytes"
+  },
+  {
+    "description": "Limit on number of clean pages cached in the buffer pool.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Buffer Pool Clean Pages Limit.",
+    "units": "BYTES",
+    "kind": "GAUGE",
+    "key": "buffer-pool.clean-pages-limit"
+  },
+  {
+    "description": "Total number of clean pages cached in the buffer pool.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Buffer Pool Clean Pages.",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "buffer-pool.clean-pages"
+  },
+  {
+    "description": "Total bytes of clean page memory cached in the buffer pool.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Buffer Pool Clean Page Bytes.",
+    "units": "BYTES",
+    "kind": "GAUGE",
+    "key": "buffer-pool.clean-page-bytes"
+  },
+  {
+    "description": "Total memory currently used by TCMalloc and buffer pool.",
+    "contexts": [
+      "STATESTORE",
+      "CATALOGSERVER",
+      "IMPALAD"
+    ],
+    "label": "Total Used Memory.",
+    "units": "BYTES",
+    "kind": "GAUGE",
+    "key": "memory.total-used"
+  },
+  {
+    "description": "Total number of memory mappings in this process.",
+    "contexts": [
+      "STATESTORE",
+      "CATALOGSERVER",
+      "IMPALAD"
+    ],
+    "label": "Number of memory mappings.",
+    "units": "NONE",
+    "kind": "GAUGE",
+    "key": "memory.num-maps"
+  },
+  {
+    "description": "Total bytes of memory mappings in this process (the virtual memory size).",
+    "contexts": [
+      "STATESTORE",
+      "CATALOGSERVER",
+      "IMPALAD"
+    ],
+    "label": "Total Virtual Memory.",
+    "units": "BYTES",
+    "kind": "GAUGE",
+    "key": "memory.mapped-bytes"
+  },
+  {
+    "description": "Resident set size (RSS) of this process, including TCMalloc, buffer pool and Jvm.",
+    "contexts": [
+      "STATESTORE",
+      "CATALOGSERVER",
+      "IMPALAD"
+    ],
+    "label": "Resident set size.",
+    "units": "BYTES",
+    "kind": "GAUGE",
+    "key": "memory.rss"
+  },
+  {
+    "description": "Total bytes of anonymous (a.k.a. transparent) huge pages used by this process.",
+    "contexts": [
+      "STATESTORE",
+      "CATALOGSERVER",
+      "IMPALAD"
+    ],
+    "label": "Anonymous Huge Pages.",
+    "units": "BYTES",
+    "kind": "GAUGE",
+    "key": "memory.anon-huge-page-bytes"
+  },
+  {
+    "description": "The system-wide 'enabled' setting for Transparent Huge Pages.",
+    "contexts": [
+      "STATESTORE",
+      "CATALOGSERVER",
+      "IMPALAD"
+    ],
+    "label": "Transparent Huge Pages Enabled.",
+    "units": "NONE",
+    "kind": "PROPERTY",
+    "key": "memory.thp.enabled"
+  },
+  {
+    "description": "The system-wide 'defrag' setting for Transparent Huge Pages.",
+    "contexts": [
+      "STATESTORE",
+      "CATALOGSERVER",
+      "IMPALAD"
+    ],
+    "label": "Transparent Huge Pages Defrag Enabled.",
+    "units": "NONE",
+    "kind": "PROPERTY",
+    "key": "memory.thp.defrag"
+  },
+  {
+    "description": "The system-wide 'defrag' setting for khugepaged.",
+    "contexts": [
+      "STATESTORE",
+      "CATALOGSERVER",
+      "IMPALAD"
+    ],
+    "label": "Khugepaged Defrag Enabled.",
+    "units": "NONE",
+    "kind": "PROPERTY",
+    "key": "memory.thp.khugepaged-defrag"
   },
   {
     "description": "The number of running threads in this process.",
@@ -1274,6 +1575,16 @@
     "key": "impala-server.io.mgr.cached-file-handles-miss-count"
   },
   {
+    "description": "Number of cached HDFS file handles reopened",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "HDFS cached file handles reopened",
+    "units": "NONE",
+    "kind": "COUNTER",
+    "key": "impala-server.io.mgr.cached-file-handles-reopened"
+  },
+  {
     "description": "The number of active scratch directories for spilling to disk.",
     "contexts": [
       "IMPALAD"
@@ -1322,5 +1633,27 @@
     "units": "NONE",
     "kind": "COUNTER",
     "key": "total-senders-timedout-waiting-for-recvr-creation"
+  },
+  {
+    "description": "A version string identifying the Kudu client",
+    "contexts": [
+      "IMPALAD",
+      "CATALOGSERVER",
+      "STATESTORE"
+    ],
+    "label": "Kudu Client Version",
+    "units": "NONE",
+    "kind": "PROPERTY",
+    "key": "kudu-client.version"
+  },
+  {
+    "description": "Service $0: Total number of incoming RPCs that were rejected due to overflow of the service queue.",
+    "contexts": [
+      "IMPALAD"
+    ],
+    "label": "Service $0 Incoming RPC Queue Overflows",
+    "units": "UNIT",
+    "kind": "COUNTER",
+    "key": "rpc.$0.rpcs_queue_overflow"
   }
 ]

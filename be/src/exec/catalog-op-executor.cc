@@ -19,8 +19,9 @@
 
 #include <sstream>
 
-#include "exec/incr-stats-util.h"
 #include "common/status.h"
+#include "catalog/catalog-service-client-wrapper.h"
+#include "exec/incr-stats-util.h"
 #include "runtime/lib-cache.h"
 #include "runtime/client-cache-types.h"
 #include "runtime/exec-env.h"
@@ -59,8 +60,8 @@ Status CatalogOpExecutor::Exec(const TCatalogOpRequest& request) {
       DCHECK(request.ddl_params.ddl_type != TDdlType::COMPUTE_STATS);
 
       exec_response_.reset(new TDdlExecResponse());
-      RETURN_IF_ERROR(client.DoRpc(&CatalogServiceClient::ExecDdl, request.ddl_params,
-          exec_response_.get()));
+      RETURN_IF_ERROR(client.DoRpc(&CatalogServiceClientWrapper::ExecDdl,
+          request.ddl_params, exec_response_.get()));
       catalog_update_result_.reset(
           new TCatalogUpdateResult(exec_response_.get()->result));
       Status status(exec_response_->result.status);
@@ -75,7 +76,7 @@ Status CatalogOpExecutor::Exec(const TCatalogOpRequest& request) {
     }
     case TCatalogOpType::RESET_METADATA: {
       TResetMetadataResponse response;
-      RETURN_IF_ERROR(client.DoRpc(&CatalogServiceClient::ResetMetadata,
+      RETURN_IF_ERROR(client.DoRpc(&CatalogServiceClientWrapper::ResetMetadata,
           request.reset_metadata_params, &response));
       catalog_update_result_.reset(new TCatalogUpdateResult(response.result));
       return Status(response.result.status);
@@ -88,16 +89,20 @@ Status CatalogOpExecutor::Exec(const TCatalogOpRequest& request) {
 }
 
 Status CatalogOpExecutor::ExecComputeStats(
-    const TComputeStatsParams& compute_stats_params,
+    const TCatalogOpRequest& compute_stats_request,
     const TTableSchema& tbl_stats_schema, const TRowSet& tbl_stats_data,
     const TTableSchema& col_stats_schema, const TRowSet& col_stats_data) {
   // Create a new DDL request to alter the table's statistics.
   TCatalogOpRequest catalog_op_req;
   catalog_op_req.__isset.ddl_params = true;
   catalog_op_req.__set_op_type(TCatalogOpType::DDL);
+  catalog_op_req.__set_sync_ddl(compute_stats_request.sync_ddl);
   TDdlExecRequest& update_stats_req = catalog_op_req.ddl_params;
   update_stats_req.__set_ddl_type(TDdlType::ALTER_TABLE);
+  update_stats_req.__set_sync_ddl(compute_stats_request.sync_ddl);
 
+  const TComputeStatsParams& compute_stats_params =
+      compute_stats_request.ddl_params.compute_stats_params;
   TAlterTableUpdateStatsParams& update_stats_params =
       update_stats_req.alter_table_params.update_stats_params;
   update_stats_req.__isset.alter_table_params = true;
@@ -112,6 +117,10 @@ Status CatalogOpExecutor::ExecComputeStats(
   // Fill the alteration request based on the child-query results.
   SetTableStats(tbl_stats_schema, tbl_stats_data,
       compute_stats_params.existing_part_stats, &update_stats_params);
+  if (compute_stats_params.__isset.total_file_bytes) {
+    update_stats_params.table_stats.__set_total_file_bytes(
+        compute_stats_params.total_file_bytes);
+  }
   // col_stats_schema and col_stats_data will be empty if there was no column stats query.
   if (!col_stats_schema.columns.empty()) {
     if (compute_stats_params.is_incremental) {
@@ -195,7 +204,15 @@ void CatalogOpExecutor::HandleDropDataSource(const TDropDataSourceParams& reques
 void CatalogOpExecutor::SetTableStats(const TTableSchema& tbl_stats_schema,
     const TRowSet& tbl_stats_data, const vector<TPartitionStats>& existing_part_stats,
     TAlterTableUpdateStatsParams* params) {
-  // Accumulate total number of rows in the table.
+  if (tbl_stats_data.rows.size() == 1 && tbl_stats_data.rows[0].colVals.size() == 1) {
+    // Unpartitioned table. Only set table stats, but no partition stats.
+    // The first column is the COUNT(*) expr of the original query.
+    params->table_stats.__set_num_rows(tbl_stats_data.rows[0].colVals[0].i64Val.value);
+    params->__isset.table_stats = true;
+    return;
+  }
+
+  // Accumulate total number of rows in the partitioned table.
   long total_num_rows = 0;
   // Set per-partition stats.
   for (const TRow& row: tbl_stats_data.rows) {
@@ -214,12 +231,12 @@ void CatalogOpExecutor::SetTableStats(const TTableSchema& tbl_stats_schema,
     params->partition_stats[partition_key_vals].stats.__set_num_rows(num_rows);
     total_num_rows += num_rows;
   }
+  params->__isset.partition_stats = true;
 
+  // Add row counts of existing partitions that are not going to be modified.
   for (const TPartitionStats& existing_stats: existing_part_stats) {
     total_num_rows += existing_stats.stats.num_rows;
   }
-
-  params->__isset.partition_stats = true;
 
   // Set per-table stats.
   params->table_stats.__set_num_rows(total_num_rows);
@@ -260,7 +277,7 @@ Status CatalogOpExecutor::GetCatalogObject(const TCatalogObject& object_desc,
 
   TGetCatalogObjectResponse response;
   RETURN_IF_ERROR(
-      client.DoRpc(&CatalogServiceClient::GetCatalogObject, request, &response));
+      client.DoRpc(&CatalogServiceClientWrapper::GetCatalogObject, request, &response));
   *result = response.catalog_object;
   return Status::OK();
 }
@@ -272,7 +289,8 @@ Status CatalogOpExecutor::PrioritizeLoad(const TPrioritizeLoadRequest& req,
   Status status;
   CatalogServiceConnection client(env_->catalogd_client_cache(), address, &status);
   RETURN_IF_ERROR(status);
-  RETURN_IF_ERROR(client.DoRpc(&CatalogServiceClient::PrioritizeLoad, req, result));
+  RETURN_IF_ERROR(
+      client.DoRpc(&CatalogServiceClientWrapper::PrioritizeLoad, req, result));
   return Status::OK();
 }
 
@@ -283,6 +301,7 @@ Status CatalogOpExecutor::SentryAdminCheck(const TSentryAdminCheckRequest& req) 
   CatalogServiceConnection client(env_->catalogd_client_cache(), address, &cnxn_status);
   RETURN_IF_ERROR(cnxn_status);
   TSentryAdminCheckResponse resp;
-  RETURN_IF_ERROR(client.DoRpc(&CatalogServiceClient::SentryAdminCheck, req, &resp));
+  RETURN_IF_ERROR(
+      client.DoRpc(&CatalogServiceClientWrapper::SentryAdminCheck, req, &resp));
   return Status(resp.status);
 }

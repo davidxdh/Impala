@@ -71,8 +71,15 @@ class DecompressorTest : public ::testing::Test {
       CompressAndDecompressNoOutputAllocated(compressor.get(), decompressor.get(),
           0, NULL);
     } else {
-      CompressAndDecompress(compressor.get(), decompressor.get(), sizeof(input_),
+      CompressAndDecompress(compressor.get(), decompressor.get(), sizeof(input_), input_);
+      // Test with odd-length input (to test the calculation of block-sizes in
+      // SnappyBlockCompressor)
+      CompressAndDecompress(compressor.get(), decompressor.get(), sizeof(input_) - 1,
           input_);
+      // Test with input length of 1024 (to test SnappyBlockCompressor with a single
+      // block)
+      CompressAndDecompress(compressor.get(), decompressor.get(), 1024, input_);
+      // Test with empty input
       if (format != THdfsCompression::BZIP2) {
         CompressAndDecompress(compressor.get(), decompressor.get(), 0, NULL);
       } else {
@@ -80,7 +87,8 @@ class DecompressorTest : public ::testing::Test {
         CompressAndDecompress(compressor.get(), decompressor.get(), 0, input_);
       }
     }
-
+    DecompressOverUnderSizedOutputBuffer(compressor.get(), decompressor.get(),
+        sizeof(input_), input_);
     compressor->Close();
     decompressor->Close();
   }
@@ -138,6 +146,50 @@ class DecompressorTest : public ::testing::Test {
 
     EXPECT_EQ(output_len, input_len);
     EXPECT_EQ(memcmp(input, output, input_len), 0);
+  }
+
+  // Test the behavior when the decompressor is given too little / too much space.
+  // Verify that the decompressor returns an error when the space is not enough, gives
+  // the correct output size when the space is enough, and does not write beyond the
+  // output size it claims.
+  void DecompressOverUnderSizedOutputBuffer(Codec* compressor, Codec* decompressor,
+      int64_t input_len, uint8_t* input) {
+    uint8_t* compressed;
+    int64_t compressed_length;
+    bool compress_preallocated = false;
+    int64_t max_compressed_length = compressor->MaxOutputLen(input_len, input);
+
+    if (max_compressed_length > 0) {
+      compressed = mem_pool_.Allocate(max_compressed_length);
+      compressed_length = max_compressed_length;
+      compress_preallocated = true;
+    }
+    EXPECT_OK(compressor->ProcessBlock(compress_preallocated, input_len,
+        input, &compressed_length, &compressed));
+    int64_t output_len = decompressor->MaxOutputLen(compressed_length, compressed);
+    if (output_len == -1) output_len = input_len;
+    uint8_t* output = mem_pool_.Allocate(output_len);
+
+    // Check that the decompressor respects the output_len by passing in an
+    // output len that is 4 bytes too small and verifying that those 4 bytes
+    // are not touched. The decompressor should return a non-ok status, as it
+    // does not have space to decompress the full output.
+    output_len = output_len - 4;
+    u_int32_t *canary = (u_int32_t *) &output[output_len];
+    *canary = 0x66aa77bb;
+    Status status = decompressor->ProcessBlock(true, compressed_length, compressed,
+        &output_len, &output);
+    EXPECT_EQ(*canary, 0x66aa77bb);
+    EXPECT_FALSE(status.ok());
+    EXPECT_EQ(output_len, 0);
+
+    // Check that the output length is the same as input when the decompressor is provided
+    // with abundant space.
+    output_len = input_len * 2;
+    output = mem_pool_.Allocate(output_len);
+    EXPECT_TRUE(decompressor->ProcessBlock(true, compressed_length, compressed,
+        &output_len, &output).ok());
+    EXPECT_EQ(output_len, input_len);
   }
 
   void Compress(Codec* compressor, int64_t input_len, uint8_t* input,
@@ -199,6 +251,7 @@ class DecompressorTest : public ::testing::Test {
       Codec* decompressor, int64_t input_len, uint8_t* input) {
     // Preallocated output buffers for compressor
     int64_t max_compressed_length = compressor->MaxOutputLen(input_len, input);
+    ASSERT_GT(max_compressed_length, 0);
     uint8_t* compressed = mem_pool_.Allocate(max_compressed_length);
     int64_t compressed_length = max_compressed_length;
 
@@ -355,7 +408,8 @@ TEST_F(DecompressorTest, Impala1506) {
   MemTracker trax;
   MemPool pool(&trax);
   scoped_ptr<Codec> compressor;
-  Codec::CreateCompressor(&pool, true, impala::THdfsCompression::GZIP, &compressor);
+  EXPECT_OK(
+      Codec::CreateCompressor(&pool, true, impala::THdfsCompression::GZIP, &compressor));
 
   int64_t input_len = 3;
   const uint8_t input[3] = {1, 2, 3};
@@ -370,6 +424,47 @@ TEST_F(DecompressorTest, Impala1506) {
   EXPECT_GE(output_len, 0);
 
   pool.FreeAll();
+}
+
+TEST_F(DecompressorTest, Impala5250) {
+  // Regression test for IMPALA-5250. It tests that SnappyDecompressor handles an input
+  // buffer with a zero byte correctly. It should set the output_length to 0.
+  MemTracker trax;
+  MemPool pool(&trax);
+  scoped_ptr<Codec> decompressor;
+  EXPECT_OK(Codec::CreateDecompressor(&pool, true, impala::THdfsCompression::SNAPPY,
+      &decompressor));
+  uint8_t buf[1]{0};
+  uint8_t out_buf[1];
+  int64_t output_length = 1;
+  uint8_t* output = out_buf;
+  EXPECT_OK(decompressor->ProcessBlock(true, 1, buf, &output_length, &output));
+  EXPECT_EQ(output_length, 0);
+}
+
+TEST_F(DecompressorTest, LZ4Huge) {
+  // IMPALA-5987: When Lz4Compressor::MaxOutputLen() returns 0,
+  // it means that the input is too large to compress, therefore trying
+  // to compress it should fail.
+
+  // Generate a big random payload.
+  int payload_len = numeric_limits<int>::max();
+  uint8_t* payload = new uint8_t[payload_len];
+  for (int i = 0 ; i < payload_len; ++i) payload[i] = rand();
+
+  scoped_ptr<Codec> compressor;
+  EXPECT_OK(Codec::CreateCompressor(nullptr, true, impala::THdfsCompression::LZ4,
+      &compressor));
+
+  // The returned max_size is 0 because the payload is too big.
+  int64_t max_size = compressor->MaxOutputLen(payload_len);
+  ASSERT_EQ(max_size, 0);
+
+  // Trying to compress it should give an error
+  int64_t compressed_len = max_size;
+  uint8_t* compressed = new uint8_t[max_size];
+  EXPECT_ERROR(compressor->ProcessBlock(true, payload_len, payload,
+      &compressed_len, &compressed), TErrorCode::LZ4_COMPRESSION_INPUT_TOO_LARGE);
 }
 
 }
